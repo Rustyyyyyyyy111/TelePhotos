@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Tele Photos</string>
+    <string name="nav_photos">Ảnh</string>
+    <string name="nav_albums">Album</string>
+    <string name="nav_trash">Thùng rác</string>
+    <string name="nav_sync">Đồng bộ</string>
+    <string name="action_add_media">Thêm ảnh &amp; video</string>
+    <string name="status_read_only_upload">Chế độ Chỉ đọc + Tải lên an toàn</string>
+    <string name="status_manual_sync_only">Chế độ thủ công: Chỉ kết nối Telegram khi bạn bấm đồng bộ</string>
+    <string name="flood_wait_banner">Telegram đang giới hạn tốc độ. Hàng đợi tạm dừng %1$s để bảo vệ tài khoản.</string>
+    <string name="trash_topic_name">Đã xoá gần đây</string>
+</resources>

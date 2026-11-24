@@ -1,0 +1,438 @@
+package com.laughing.telephotos.ui.viewmodel
+
+import android.app.Application
+import android.net.Uri
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.laughing.telephotos.TelePhotosApplication
+import com.laughing.telephotos.core.AppSettings
+import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.ThemeMode
+import com.laughing.telephotos.data.local.AlbumEntity
+import com.laughing.telephotos.data.local.AlbumWithCount
+import com.laughing.telephotos.data.local.MediaEntity
+import com.laughing.telephotos.data.local.StorageStats
+import com.laughing.telephotos.data.local.SyncTargetEntity
+import com.laughing.telephotos.data.repository.ManualSyncProgressState
+import com.laughing.telephotos.data.telegram.FileDownloadProgress
+import com.laughing.telephotos.data.telegram.FloodWaitException
+import com.laughing.telephotos.data.telegram.TelegramAuthState
+import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
+import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+data class TimelineSection(
+  val headerTitle: String,
+  val monthLabel: String,
+  val items: List<MediaEntity>,
+)
+
+class TelePhotosViewModel(application: Application) : AndroidViewModel(application) {
+
+  private val app = application as TelePhotosApplication
+  private val repo = app.vaultRepository
+  private val prefs = app.settingsPreferences
+  private val tdLib = app.tdLibManager
+
+  val settings: StateFlow<AppSettings> = prefs.settingsFlow.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),
+    initialValue = AppSettings(),
+  )
+
+  val authState: StateFlow<TelegramAuthState> = repo.authState
+  val connectionStatus: StateFlow<TelegramConnectionStatus> = repo.connectionStatus
+
+  val lockedTarget: StateFlow<SyncTargetEntity?> = repo.lockedTargetFlow.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),
+    initialValue = null,
+  )
+
+  val photosTimelineSections: StateFlow<List<TimelineSection>> =
+    repo.photosTimelineFlow.map { items -> groupMediaByDay(items) }.stateIn(
+      scope = viewModelScope,
+      started = SharingStarted.WhileSubscribed(5000),
+      initialValue = emptyList(),
+    )
+
+  val videosTimelineSections: StateFlow<List<TimelineSection>> =
+    repo.videosTimelineFlow.map { items -> groupMediaByDay(items) }.stateIn(
+      scope = viewModelScope,
+      started = SharingStarted.WhileSubscribed(5000),
+      initialValue = emptyList(),
+    )
+
+  val albums: StateFlow<List<AlbumWithCount>> = repo.albumsWithCountFlow.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),
+    initialValue = emptyList(),
+  )
+
+  val trashedMedia: StateFlow<List<MediaEntity>> = repo.trashedMediaFlow.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),
+    initialValue = emptyList(),
+  )
+
+  val uploadQueue: StateFlow<List<MediaEntity>> = repo.uploadQueueFlow.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),
+    initialValue = emptyList(),
+  )
+
+  val storageStats: StateFlow<StorageStats> = repo.storageStatsFlow.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),
+    initialValue = StorageStats(0, 0, 0, 0, 0, 0L, 0L),
+  )
+
+  val manualSyncProgress: StateFlow<ManualSyncProgressState> =
+    repo.manualSyncProgressFlow.stateIn(
+      scope = viewModelScope,
+      started = SharingStarted.WhileSubscribed(5000),
+      initialValue = ManualSyncProgressState(),
+    )
+
+  private val _selectedIds = MutableStateFlow<Set<Long>>(emptySet())
+  val selectedIds: StateFlow<Set<Long>> = _selectedIds.asStateFlow()
+
+  private val _candidateTargets = MutableStateFlow<List<TelegramCandidateTarget>>(emptyList())
+  val candidateTargets: StateFlow<List<TelegramCandidateTarget>> = _candidateTargets.asStateFlow()
+
+  private val _isLoadingTargets = MutableStateFlow(false)
+  val isLoadingTargets: StateFlow<Boolean> = _isLoadingTargets.asStateFlow()
+
+  private val _isBusy = MutableStateFlow(false)
+  val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
+
+  private val _statusBanner = MutableStateFlow<String?>(null)
+  val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
+
+  private val _floodWaitRemainingSec = MutableStateFlow(0L)
+  val floodWaitRemainingSec: StateFlow<Long> = _floodWaitRemainingSec.asStateFlow()
+
+  init {
+    viewModelScope.launch {
+      settings.collect { appSettings ->
+        val until = appSettings.floodWaitUntilEpochMs
+        if (until > System.currentTimeMillis()) {
+          while (true) {
+            val rem = ((until - System.currentTimeMillis()) / 1000L).coerceAtLeast(0L)
+            _floodWaitRemainingSec.value = rem
+            if (rem <= 0L) {
+              prefs.clearFloodWait()
+              break
+            }
+            delay(1000L)
+          }
+        } else {
+          _floodWaitRemainingSec.value = 0L
+        }
+      }
+    }
+  }
+
+  fun dismissBanner() {
+    _statusBanner.value = null
+  }
+
+  fun toggleSelection(mediaId: Long) {
+    val current = _selectedIds.value
+    _selectedIds.value = if (mediaId in current) current - mediaId else current + mediaId
+  }
+
+  fun clearSelection() {
+    _selectedIds.value = emptySet()
+  }
+
+  fun ensureTelegramInitialized() {
+    viewModelScope.launch {
+      tdLib.ensureInitializedOnDemand()
+    }
+  }
+
+  fun closeTelegramIdle() {
+    viewModelScope.launch {
+      tdLib.closeConnectionIdle(preserveWaitApiState = false)
+    }
+  }
+
+  fun saveApiCredentials(apiId: String, apiHash: String) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      tdLib.saveAndApplyApiCredentials(apiId, apiHash)
+        .onFailure { err ->
+          _statusBanner.value = err.message ?: "Thông số API TDLib không hợp lệ"
+        }
+      _isBusy.value = false
+    }
+  }
+
+  fun switchApiCredentials() {
+    viewModelScope.launch {
+      tdLib.switchApiCredentials()
+    }
+  }
+
+  fun returnToPhoneNumberStep() {
+    tdLib.returnToPhoneNumberStep()
+  }
+
+  fun importSelectedMedia(uris: List<Uri>, targetAlbumId: Long? = null) {
+    if (uris.isEmpty()) return
+    viewModelScope.launch {
+      _isBusy.value = true
+      val summary = repo.importSelectedUris(uris, targetAlbumId)
+      _isBusy.value = false
+      val parts = buildList {
+        if (summary.addedCount > 0) {
+          add("Đã thêm ${summary.addedCount} mục ngoại tuyến (chờ bạn bấm Tải lên ngay)")
+        }
+        if (summary.duplicateSkippedCount > 0) {
+          add("Bỏ qua ${summary.duplicateSkippedCount} mục trùng (Đã tải lên)")
+        }
+      }
+      _statusBanner.value = parts.joinToString(" • ").ifBlank { "Không có mục mới nào được thêm" }
+    }
+  }
+
+  fun uploadSelectedItemsNow() {
+    val ids = _selectedIds.value.toList()
+    if (ids.isEmpty()) return
+    viewModelScope.launch {
+      repo.startManualUploadBatch(selectedOnlyIds = ids)
+        .onSuccess { count ->
+          _selectedIds.value = emptySet()
+          _statusBanner.value = "Đang kết nối ngắn hạn để tải lên $count mục đã chọn"
+        }
+        .onFailure { err ->
+          _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"
+        }
+    }
+  }
+
+  fun startManualUploadBatch() {
+    viewModelScope.launch {
+      repo.startManualUploadBatch(selectedOnlyIds = null)
+        .onSuccess { count ->
+          _statusBanner.value = "Đang kết nối Telegram để tải lên $count mục mới"
+        }
+        .onFailure { err ->
+          _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"
+        }
+    }
+  }
+
+  fun stopManualSync() {
+    viewModelScope.launch {
+      repo.stopManualSync()
+      _statusBanner.value = "Đã dừng đồng bộ — Đã ngắt kết nối Telegram"
+    }
+  }
+
+  fun moveSelectedToTrash() {
+    val ids = _selectedIds.value.toList()
+    if (ids.isEmpty()) return
+    viewModelScope.launch {
+      repo.moveMediaToRecentlyDeleted(ids)
+        .onSuccess { count ->
+          _selectedIds.value = emptySet()
+          _statusBanner.value = "Đã chuyển $count mục vào «Đã xoá gần đây» (không xoá trên Telegram)"
+        }
+        .onFailure { err ->
+          _statusBanner.value = err.message ?: "Không thể chuyển vào Đã xoá gần đây"
+        }
+    }
+  }
+
+  fun moveSingleToTrash(mediaId: Long) {
+    viewModelScope.launch {
+      repo.moveMediaToRecentlyDeleted(listOf(mediaId))
+        .onSuccess {
+          _statusBanner.value = "Đã chuyển vào «Đã xoá gần đây» (vẫn giữ bản gốc trên Telegram)"
+        }
+    }
+  }
+
+  fun restoreSingleFromTrash(mediaId: Long) {
+    viewModelScope.launch {
+      repo.restoreFromRecentlyDeleted(listOf(mediaId))
+      _statusBanner.value = "Đã khôi phục về thư viện và album trước đó"
+    }
+  }
+
+  fun assignSelectedToAlbum(albumId: Long) {
+    val ids = _selectedIds.value.toList()
+    if (ids.isEmpty()) return
+    viewModelScope.launch {
+      repo.assignMediaToAlbum(ids, albumId)
+      _selectedIds.value = emptySet()
+      _statusBanner.value = "Đã chuyển ${ids.size} mục vào album"
+    }
+  }
+
+  fun createAlbum(title: String, iconColor: Int) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      repo.createAlbum(title, iconColor)
+        .onSuccess { album ->
+          _statusBanner.value = "Đã tạo album «${album.title}» (đã ngắt kết nối Telegram)"
+        }
+        .onFailure { err ->
+          if (err is FloodWaitException) {
+            repo.handleFloodWait(err)
+            _statusBanner.value = "Telegram giới hạn tốc độ: ${err.message}"
+          } else {
+            _statusBanner.value = err.message ?: "Không thể tạo album"
+          }
+        }
+      _isBusy.value = false
+    }
+  }
+
+  fun refreshAllowedTargets() {
+    viewModelScope.launch {
+      _isLoadingTargets.value = true
+      runCatching { repo.loadAllowedTargetsShortLived() }
+        .onSuccess { list -> _candidateTargets.value = list }
+        .onFailure { err ->
+          if (err is FloodWaitException) {
+            repo.handleFloodWait(err)
+          }
+          _statusBanner.value = err.message ?: "Không thể tải danh sách đích lưu trữ"
+        }
+      _isLoadingTargets.value = false
+    }
+  }
+
+  fun lockSyncTarget(candidate: TelegramCandidateTarget, onSuccess: () -> Unit) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      repo.lockSyncTarget(candidate)
+        .onSuccess { target ->
+          _statusBanner.value = "Đã khoá đích lưu trữ: ${target.chatTitle}"
+          onSuccess()
+        }
+        .onFailure { err ->
+          if (err is FloodWaitException) {
+            repo.handleFloodWait(err)
+          }
+          _statusBanner.value = err.message ?: "Không thể khoá đích lưu trữ"
+        }
+      _isBusy.value = false
+    }
+  }
+
+  fun syncHistoryReadOnly() {
+    viewModelScope.launch {
+      _isBusy.value = true
+      repo.syncHistoryReadOnly()
+        .onSuccess { count ->
+          _statusBanner.value = if (count > 0) {
+            "Đã đồng bộ chỉ đọc $count mục — Đã ngắt kết nối Telegram"
+          } else {
+            "Thư viện đã khớp với Telegram — Đã ngắt kết nối Telegram"
+          }
+        }
+        .onFailure { err ->
+          if (err is FloodWaitException) {
+            repo.handleFloodWait(err)
+          }
+          _statusBanner.value = err.message ?: "Không thể quét lịch sử Telegram"
+        }
+      _isBusy.value = false
+    }
+  }
+
+  fun setThemeMode(mode: ThemeMode) {
+    viewModelScope.launch { prefs.setThemeMode(mode) }
+  }
+
+  fun setAdvancedBlurEnabled(enabled: Boolean) {
+    viewModelScope.launch { prefs.setAdvancedBlurEnabled(enabled) }
+  }
+
+  fun setWifiOnlyUpload(wifiOnly: Boolean) {
+    viewModelScope.launch { prefs.setWifiOnlyUpload(wifiOnly) }
+  }
+
+  fun submitPhoneNumber(phone: String) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      tdLib.sendPhoneNumber(phone)
+        .onFailure { _statusBanner.value = it.message ?: "Số điện thoại không hợp lệ" }
+      _isBusy.value = false
+    }
+  }
+
+  fun submitAuthCode(code: String) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      tdLib.sendAuthCode(code)
+        .onFailure { _statusBanner.value = it.message ?: "Mã xác nhận OTP không chính xác" }
+      _isBusy.value = false
+    }
+  }
+
+  fun submitPassword(password: String) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      tdLib.sendPassword(password)
+        .onFailure { _statusBanner.value = it.message ?: "Mật khẩu xác minh 2 bước không chính xác" }
+      _isBusy.value = false
+    }
+  }
+
+  fun logoutTelegram() {
+    viewModelScope.launch {
+      repo.stopManualSync()
+      tdLib.logOut()
+      _statusBanner.value = "Đã đăng xuất phiên Telegram khỏi thiết bị"
+    }
+  }
+
+  fun observeAlbum(albumId: Long): Flow<AlbumEntity?> = repo.observeAlbum(albumId)
+
+  fun observeAlbumPhotos(albumId: Long): Flow<List<MediaEntity>> = repo.observeAlbumPhotos(albumId)
+
+  fun observeAlbumVideos(albumId: Long): Flow<List<MediaEntity>> = repo.observeAlbumVideos(albumId)
+
+  fun observeMediaById(mediaId: Long): Flow<MediaEntity?> = repo.observeMediaById(mediaId)
+
+  fun downloadVideoOnDemand(fileId: Int): Flow<FileDownloadProgress> =
+    repo.downloadMediaOnDemand(fileId)
+
+  fun saveDownloadedVideoPath(mediaId: Long, path: String) {
+    viewModelScope.launch { repo.saveDownloadedVideoPath(mediaId, path) }
+  }
+
+  private fun groupMediaByDay(items: List<MediaEntity>): List<TimelineSection> {
+    if (items.isEmpty()) return emptyList()
+    val now = System.currentTimeMillis()
+    val grouped = LinkedHashMap<String, MutableList<MediaEntity>>()
+    val monthByHeader = mutableMapOf<String, String>()
+    for (item in items) {
+      val header = Formatters.formatTimelineDayHeader(item.takenAtEpochMs, now)
+      grouped.getOrPut(header) { mutableListOf() }.add(item)
+      if (!monthByHeader.containsKey(header)) {
+        monthByHeader[header] = Formatters.formatMonthYearLabel(item.takenAtEpochMs)
+      }
+    }
+    return grouped.map { (header, list) ->
+      TimelineSection(
+        headerTitle = header,
+        monthLabel = monthByHeader[header] ?: header,
+        items = list,
+      )
+    }
+  }
+}

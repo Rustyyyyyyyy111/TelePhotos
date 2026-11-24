@@ -1,0 +1,6 @@
+{
+  "name": "Tele Photos",
+  "description": "Thư viện ảnh & video phong cách Google Photos lưu trữ an toàn trên Telegram (TDLib) với chế độ Chỉ đọc + Tải lên, Đồng bộ thủ công 100%, chống trùng lặp và 3 giao diện Sáng / Tối / Liquid Glass.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
