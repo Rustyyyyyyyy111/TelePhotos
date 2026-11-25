@@ -50,6 +50,15 @@ class TelegramUploadWorker(
 
     val filterMediaType = inputData.getString(KEY_FILTER_MEDIA_TYPE)
       ?.let { raw -> runCatching { MediaType.valueOf(raw) }.getOrNull() }
+    val isSelectedBatch = inputData.getBoolean(KEY_IS_SELECTED_BATCH, false)
+    val selectedBatchIds = if (isSelectedBatch) {
+      prefs.getSelectedUploadBatchIds()
+    } else {
+      emptyList()
+    }
+    if (isSelectedBatch && selectedBatchIds.isEmpty()) {
+      return Result.success()
+    }
 
     tdLib.beginWorkLease()
 
@@ -81,17 +90,17 @@ class TelegramUploadWorker(
           )
           if (!unlocked || isStopped) return Result.success()
           tdLib.clearFloodWait()
-          requeueFloodWaitPaused(mediaDao, filterMediaType)
+          requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
         } else {
           hitFloodWaitRescheduled = true
-          repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+          repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
           return Result.success()
         }
       } else if (initialSettings.floodWaitUntilEpochMs > 0L || tdLib.floodWaitState.value != null) {
         tdLib.clearFloodWait()
-        requeueFloodWaitPaused(mediaDao, filterMediaType)
+        requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
       } else {
-        requeueFloodWaitPaused(mediaDao, filterMediaType)
+        requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
       }
 
       // 2. Ensure single-flight TDLib connection (retry 8s x 2 ONLY on transient network errors)
@@ -140,11 +149,11 @@ class TelegramUploadWorker(
             )
             if (!unlocked || isStopped) return Result.success()
             tdLib.clearFloodWait()
-            requeueFloodWaitPaused(mediaDao, filterMediaType)
+            requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
             continue
           } else {
             hitFloodWaitRescheduled = true
-            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
             return Result.success()
           }
         }
@@ -178,24 +187,26 @@ class TelegramUploadWorker(
         return Result.success()
       }
 
-      setProgress(
-        workDataOf(
-          KEY_CURRENT_FILE to "Đang kiểm tra chủ đề Telegram...",
-          KEY_COMPLETED_COUNT to 0,
-          KEY_TOTAL_COUNT to 1,
+      if (!isSelectedBatch) {
+        setProgress(
+          workDataOf(
+            KEY_CURRENT_FILE to "Đang kiểm tra chủ đề Telegram...",
+            KEY_COMPLETED_COUNT to 0,
+            KEY_TOTAL_COUNT to 1,
+          )
         )
-      )
-      runCatching {
-        repo.syncActiveTabHistoryWhileConnected(
-          target = syncTargetDao.getTarget() ?: initialTarget,
-          filterMediaType = filterMediaType,
-        )
+        runCatching {
+          repo.syncActiveTabHistoryWhileConnected(
+            target = syncTargetDao.getTarget() ?: initialTarget,
+            filterMediaType = filterMediaType,
+          )
+        }
       }
 
-      val initialTotal = (if (filterMediaType != null) {
-        mediaDao.countPendingUploadsByType(filterMediaType.name)
-      } else {
-        mediaDao.countPendingUploads()
+      val initialTotal = (when {
+        isSelectedBatch -> repo.countPendingUploadsScoped(selectedBatchIds, filterMediaType)
+        filterMediaType != null -> mediaDao.countPendingUploadsByType(filterMediaType.name)
+        else -> mediaDao.countPendingUploads()
       }).coerceAtLeast(1)
       var completed = 0
 
@@ -217,18 +228,18 @@ class TelegramUploadWorker(
             )
             if (!unlocked || isStopped) return Result.success()
             tdLib.clearFloodWait()
-            requeueFloodWaitPaused(mediaDao, filterMediaType)
+            requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
           } else {
             hitFloodWaitRescheduled = true
-            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
             return Result.success()
           }
         }
 
-        val nextItem = if (filterMediaType != null) {
-          mediaDao.getNextPendingUploadByType(filterMediaType.name)
-        } else {
-          mediaDao.getNextPendingUpload()
+        val nextItem = when {
+          isSelectedBatch -> repo.getNextPendingUploadScoped(selectedBatchIds, filterMediaType)
+          filterMediaType != null -> mediaDao.getNextPendingUploadByType(filterMediaType.name)
+          else -> mediaDao.getNextPendingUpload()
         } ?: break
         val currentTarget = syncTargetDao.getTarget() ?: initialTarget
 
@@ -402,12 +413,12 @@ class TelegramUploadWorker(
                   return Result.success()
                 }
                 tdLib.clearFloodWait()
-                requeueFloodWaitPaused(mediaDao, filterMediaType)
+                requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
                 mediaDao.updateUploadStatus(effectiveItem.id, UploadStatus.UPLOADING, null)
                 // Loop immediately resumes uploading this pending item first!
               } else {
                 hitFloodWaitRescheduled = true
-                repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+                repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
                 return Result.success()
               }
             } catch (t: Throwable) {
@@ -483,6 +494,9 @@ class TelegramUploadWorker(
       uploadedAnyOrClean = true
     } finally {
       withContext(NonCancellable) {
+        if (isSelectedBatch && !hitFloodWaitRescheduled) {
+          prefs.clearSelectedUploadBatchIds()
+        }
         if (isStopped) {
           mediaDao.resetInterruptedUploadsToQueued()
           prefs.setLastSyncStatusMessage(
@@ -531,13 +545,16 @@ class TelegramUploadWorker(
   }
 
   private suspend fun requeueFloodWaitPaused(
+    repo: com.laughing.telephotos.data.repository.VaultRepository,
     mediaDao: com.laughing.telephotos.data.local.MediaDao,
     filterMediaType: MediaType?,
+    isSelectedBatch: Boolean,
+    selectedBatchIds: List<Long>,
   ) {
-    if (filterMediaType != null) {
-      mediaDao.requeueFloodWaitPausedByType(filterMediaType.name)
-    } else {
-      mediaDao.requeueFloodWaitPaused()
+    when {
+      isSelectedBatch -> repo.requeueFloodWaitPausedScoped(selectedBatchIds, filterMediaType)
+      filterMediaType != null -> mediaDao.requeueFloodWaitPausedByType(filterMediaType.name)
+      else -> mediaDao.requeueFloodWaitPaused()
     }
   }
 
@@ -547,6 +564,7 @@ class TelegramUploadWorker(
     const val KEY_COMPLETED_COUNT = "completed_count"
     const val KEY_TOTAL_COUNT = "total_count"
     const val KEY_FILTER_MEDIA_TYPE = "filter_media_type"
+    const val KEY_IS_SELECTED_BATCH = "is_selected_batch"
     private const val SHORT_FLOOD_WAIT_MAX_SEC = 60
     private const val SHORT_FLOOD_WAIT_MAX_WAIT_MS = 65_000L
   }

@@ -62,6 +62,7 @@ class SettingsPreferences(private val context: Context) {
     val TG_DISPLAY_NAME = stringPreferencesKey("tg_display_name")
     val TG_PHONE_NUMBER = stringPreferencesKey("tg_phone_number")
     val LAST_SYNC_STATUS_MSG = stringPreferencesKey("last_sync_status_msg")
+    val SELECTED_UPLOAD_BATCH_IDS = stringPreferencesKey("selected_upload_batch_ids")
   }
 
   val settingsFlow: Flow<AppSettings> =
@@ -97,6 +98,32 @@ class SettingsPreferences(private val context: Context) {
 
   suspend fun getCurrentSettings(): AppSettings = settingsFlow.first()
 
+  suspend fun setSelectedUploadBatchIds(ids: List<Long>) {
+    val clean = ids.distinct().filter { it > 0L }
+    context.telePhotosDataStore.edit { prefs ->
+      if (clean.isEmpty()) {
+        prefs.remove(Keys.SELECTED_UPLOAD_BATCH_IDS)
+      } else {
+        prefs[Keys.SELECTED_UPLOAD_BATCH_IDS] = clean.joinToString(",")
+      }
+    }
+  }
+
+  suspend fun getSelectedUploadBatchIds(): List<Long> {
+    val raw = context.telePhotosDataStore.data.first()[Keys.SELECTED_UPLOAD_BATCH_IDS].orEmpty()
+    if (raw.isBlank()) return emptyList()
+    return raw.split(',')
+      .mapNotNull { it.trim().toLongOrNull() }
+      .filter { it > 0L }
+      .distinct()
+  }
+
+  suspend fun clearSelectedUploadBatchIds() {
+    context.telePhotosDataStore.edit { prefs ->
+      prefs.remove(Keys.SELECTED_UPLOAD_BATCH_IDS)
+    }
+  }
+
   suspend fun saveApiCredentials(apiId: Int, apiHash: String) {
     context.telePhotosDataStore.edit { prefs ->
       prefs[Keys.CUSTOM_API_ID] = apiId
@@ -131,6 +158,7 @@ class SettingsPreferences(private val context: Context) {
       prefs.remove(Keys.TG_DISPLAY_NAME)
       prefs.remove(Keys.TG_PHONE_NUMBER)
       prefs.remove(Keys.LAST_SYNC_STATUS_MSG)
+      prefs.remove(Keys.SELECTED_UPLOAD_BATCH_IDS)
     }
   }
 

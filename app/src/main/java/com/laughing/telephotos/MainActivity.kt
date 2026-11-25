@@ -29,7 +29,7 @@ class MainActivity : ComponentActivity() {
 
       LaunchedEffect(isColdProcessLaunch) {
         if (isColdProcessLaunch || effectiveSavedState == null) {
-          telePhotosViewModel.clearSelection()
+          telePhotosViewModel.clearAllSelections()
         }
       }
 

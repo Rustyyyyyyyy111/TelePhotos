@@ -162,6 +162,58 @@ interface MediaDao {
   )
   suspend fun countPendingUploadsByType(mediaTypeName: String): Int
 
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE id IN (:ids)
+      AND uploadStatus = 'QUEUED'
+      AND isTrashed = 0
+    ORDER BY takenAtEpochMs DESC, id ASC
+    LIMIT 1
+    """
+  )
+  suspend fun getNextPendingUploadInIds(ids: List<Long>): MediaEntity?
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE id IN (:ids)
+      AND uploadStatus = 'QUEUED'
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    ORDER BY takenAtEpochMs DESC, id ASC
+    LIMIT 1
+    """
+  )
+  suspend fun getNextPendingUploadByTypeInIds(
+    ids: List<Long>,
+    mediaTypeName: String,
+  ): MediaEntity?
+
+  @Query(
+    """
+    SELECT COUNT(*) FROM media_items
+    WHERE id IN (:ids)
+      AND uploadStatus IN ('QUEUED', 'UPLOADING')
+      AND isTrashed = 0
+    """
+  )
+  suspend fun countPendingUploadsInIds(ids: List<Long>): Int
+
+  @Query(
+    """
+    SELECT COUNT(*) FROM media_items
+    WHERE id IN (:ids)
+      AND uploadStatus IN ('QUEUED', 'UPLOADING')
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    """
+  )
+  suspend fun countPendingUploadsByTypeInIds(
+    ids: List<Long>,
+    mediaTypeName: String,
+  ): Int
+
   @Query("SELECT * FROM media_items WHERE id = :id LIMIT 1")
   fun observeById(id: Long): Flow<MediaEntity?>
 
@@ -482,6 +534,40 @@ interface MediaDao {
     updatedAt: Long = System.currentTimeMillis(),
   )
 
+  @Query(
+    """
+    UPDATE media_items
+    SET uploadStatus = 'QUEUED',
+        lastError = NULL,
+        updatedAtEpochMs = :updatedAt
+    WHERE id IN (:ids)
+      AND uploadStatus = 'PAUSED_FLOOD_WAIT'
+      AND isTrashed = 0
+    """
+  )
+  suspend fun requeueFloodWaitPausedInIds(
+    ids: List<Long>,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET uploadStatus = 'QUEUED',
+        lastError = NULL,
+        updatedAtEpochMs = :updatedAt
+    WHERE id IN (:ids)
+      AND uploadStatus = 'PAUSED_FLOOD_WAIT'
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    """
+  )
+  suspend fun requeueFloodWaitPausedByTypeInIds(
+    ids: List<Long>,
+    mediaTypeName: String,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
   @Query("UPDATE media_items SET contentHash = :contentHash WHERE id = :id")
   suspend fun updateContentHash(id: Long, contentHash: String)
 
@@ -503,6 +589,24 @@ interface MediaDao {
   )
   suspend fun markSelectedQueued(
     ids: List<Long>,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET uploadStatus = 'QUEUED',
+        lastError = NULL,
+        updatedAtEpochMs = :updatedAt
+    WHERE id IN (:ids)
+      AND uploadStatus != 'UPLOADED'
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    """
+  )
+  suspend fun markSelectedQueuedByType(
+    ids: List<Long>,
+    mediaTypeName: String,
     updatedAt: Long = System.currentTimeMillis(),
   )
 

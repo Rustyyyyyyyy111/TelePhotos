@@ -49,14 +49,14 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
     │   │   ├── MediaHashUtil.kt          # SHA-256 (lấy mẫu 16MB với tệp lớn), staging upload, thumbnail <=320px
     │   │   ├── MediaStoreScanner.kt      # Quét MediaStore, xin quyền, xoá hệ thống, lưu Pictures/Movies
     │   │   ├── NetworkRetryHelper.kt     # Retry mạng tạm thời (8s x 2 + 25s stall) & NetworkAlertCoordinator
-    │   │   ├── SettingsPreferences.kt    # DataStore lưu AppSettings, AppIconPreset & unlockAtEpochMs cho FLOOD_WAIT
+    │   │   ├── SettingsPreferences.kt    # DataStore lưu AppSettings, AppIconPreset, unlockAtEpochMs & selectedUploadBatchIds (lô chọn tay)
     │   │   ├── TelegramCaptionMetadata.kt# Tạo caption sạch 2 dòng & giải mã tương thích ngược JSON #tele_anh_meta cũ
     │   │   └── ThemeMode.kt              # Enum 3 chế độ giao diện: LIGHT, DARK, LIQUID_GLASS
     │   ├── data/
     │   │   ├── local/
     │   │   │   ├── TelePhotosDatabase.kt # Room v2 (entities + MIGRATION_1_2)
     │   │   │   ├── MediaEntity.kt        # Bảng media_items, MediaType, UploadStatus
-    │   │   │   ├── MediaDao.kt           # Truy vấn Timeline, Queue, FreeUpSpace, PAUSED_FLOOD_WAIT
+    │   │   │   ├── MediaDao.kt           # Truy vấn Timeline, Queue (toàn cục & *InIds theo lô chọn tay), FreeUpSpace, PAUSED_FLOOD_WAIT
     │   │   │   ├── AlbumEntity.kt        # Bảng albums ánh xạ 1-1 Forum Topic
     │   │   │   ├── AlbumDao.kt           # Truy vấn danh sách Album kèm số lượng mục
     │   │   │   ├── SyncTargetEntity.kt   # Bảng sync_targets lưu đích đã khoá + threadId 3 chủ đề lõi
@@ -105,6 +105,13 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
    - Nếu đích là Kênh/Nhóm thường (`!isForumEnabled`), `lockSyncTarget` / `syncAlbumsFromTelegram` tự tạo Album đại diện (`messageThreadId = 0L`) để hiển thị toàn bộ ảnh/video trên kênh/nhóm trong tab `Album`.
    - `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) kèm `InputThumbnail` (`<= 320px`) và caption sạch tối đa 2 dòng từ `TelegramCaptionMetadata.buildCaption()` (không nhúng chuỗi JSON thô). Nếu upload bị rớt mạng giữa chừng, giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` khi thử lại để **không gửi trùng tin nhắn**.
    - Giữa các tệp tuần tự có độ trễ chống khoá tài khoản `2.0–3.5 giây` (`uploadPacingMs + random(0..1500ms)`).
+3. **Cô lập Chọn nhiều & Đồng bộ theo Đúng Lựa chọn (`Ảnh` vs `Video`):**
+   - `TelePhotosViewModel` tách riêng trạng thái chọn theo từng loại media (`_selectedPhotoIds` cho tab `Ảnh`, `_selectedVideoIds` cho tab `Video`) và xoá sạch khi chuyển tab qua `clearAllSelections()`, tránh mọi trường hợp chọn nhầm chéo giữa ảnh và video.
+   - Khi người dùng chọn 1 hoặc nhiều mục (đặc biệt ở tab `Video`) và bấm tải lên (`uploadSelectedItemsNow(mediaType)`), `VaultRepository.startManualUploadBatch(selectedOnlyIds, filterMediaType)` -> `prepareManualUploadBatch()` thực hiện **chốt chặt phạm vi (fail-fast)**:
+     - Từ chối ngay nếu danh sách `selectedOnlyIds` rỗng hoặc không có mục hợp lệ đúng `filterMediaType` (tuyệt đối **không** rơi về `requeueAllPending()` / `requeueAllPendingByType()` để tránh quét nhầm toàn bộ thư viện ~13.380 ảnh + video).
+     - Lưu danh sách ID được chọn vào `SettingsPreferences` (`selectedUploadBatchIds`), đặt `KEY_IS_SELECTED_BATCH = true` + `KEY_FILTER_MEDIA_TYPE` cho `TelegramUploadWorker`, và xếp hàng bằng `ExistingWorkPolicy.REPLACE` (sau khi chặn nếu Worker đang `RUNNING`).
+     - Trong chế độ `isSelectedBatch == true`, `TelegramUploadWorker` **bỏ qua** `requeueFloodWaitPaused` toàn cục và `syncActiveTabHistoryWhileConnected`, chỉ đếm/lấy mục kế tiếp qua `countPendingUploadsScoped` / `getNextPendingUploadScoped` (`MediaDao.*InIds` chia chunk `500` để không vượt giới hạn bind SQLite), phớt lờ hoàn toàn các mục `QUEUED` / `PAUSED_FLOOD_WAIT` cũ còn tồn đọng trong Room, và bảo toàn cờ `isSelectedBatch` nếu phải hẹn lại qua `FLOOD_WAIT`.
+   - Khi bấm nút **Đồng bộ** trên `TopAppBar` của tab `Video` lúc không chọn mục nào (`selectedOnlyIds == null`), `filterMediaType = MediaType.VIDEO` giới hạn chặt cả upload lẫn quét lịch sử chỉ trong chủ đề **«Video»** (không chạm tới `PHOTO`).
 
 ### C. Xử lý `FLOOD_WAIT` Động vs. Lỗi mạng tạm thời (`8s x 2`)
 Hệ thống tách bạch hoàn toàn hai cơ chế này:
@@ -159,11 +166,12 @@ Hệ thống tách bạch hoàn toàn hai cơ chế này:
 ## 5. Hướng dẫn Chỉnh sửa & Mở rộng An toàn
 
 - **Thêm hàm TDLib mới:** Thêm phương thức trong `TdLibManager.kt` và gọi thông qua `sendFunction(...)` bên trong `withActiveSession { ... }`. Điều này tự động hưởng single-flight reconnect, timeout, tracking trong `inFlightRequests`, `TelegramPolicyGuard` và cập nhật trạng thái `FLOOD_WAIT` động.
-- **Thay đổi hành vi hàng đợi Upload:** Cập nhật `MediaDao.kt` (giữ thứ tự ưu tiên `QUEUED`), `VaultRepository.startManualUploadBatch()` và `TelegramUploadWorker.kt` đồng thời; luôn bảo đảm giữ `PendingUploadInterruptedException` (`pendingMessageId`) để không gửi trùng tin nhắn Telegram.
+- **Thay đổi hành vi hàng đợi Upload:** Cập nhật `MediaDao.kt` (giữ thứ tự ưu tiên `QUEUED` và các truy vấn `*InIds`), `VaultRepository.prepareManualUploadBatch()` / `startManualUploadBatch()` và `TelegramUploadWorker.kt` đồng thời; luôn bảo đảm giữ `KEY_IS_SELECTED_BATCH` + `selectedUploadBatchIds` để chọn tay không bao giờ rơi về đồng bộ toàn thư viện và giữ `PendingUploadInterruptedException` (`pendingMessageId`) để không gửi trùng tin nhắn Telegram.
 - **Cạm bẫy cần tránh:**
   - Không gọi `tdLibManager.closeConnectionIdle()` ngay sau mỗi tác vụ khi app đang ở foreground (`appInForeground == true`), vì sẽ phá vỡ kiến trúc phiên tái sử dụng.
   - Không bỏ kiểm tra `activity.isChangingConfigurations` trong `TelePhotosApplication` nếu không muốn xoay màn hình đóng nhầm TDLib.
   - Không thay `InputMessageDocument` bằng `InputMessagePhoto`/`InputMessageVideo` vì Telegram sẽ nén giảm chất lượng ảnh/video gốc.
+  - Không để nhánh `selectedOnlyIds != null` trong `VaultRepository` rơi về `requeueAllPending()` khi rỗng hoặc không khớp `filterMediaType`, và không dùng chung một `StateFlow<Set<Long>>` cho cả tab `Ảnh` lẫn tab `Video`.
 
 ---
 

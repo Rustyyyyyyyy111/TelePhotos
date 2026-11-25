@@ -11,6 +11,7 @@ import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.TelePhotosDatabase
 import com.laughing.telephotos.data.local.UploadStatus
+import com.laughing.telephotos.data.repository.VaultRepository
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
@@ -277,6 +278,214 @@ class ExampleRobolectricTest {
       assertEquals("remote_ref_888", refreshed.telegramRemoteFileId)
       assertEquals(889, refreshed.telegramThumbFileId)
     } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `selected video batch isolates single video and ignores pre-existing queued photos and videos`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    val db = Room.inMemoryDatabaseBuilder(app, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    val prefs = app.settingsPreferences
+    try {
+      val mediaDao = db.mediaDao()
+      val repo = VaultRepository(
+        context = app,
+        mediaDao = mediaDao,
+        albumDao = db.albumDao(),
+        syncTargetDao = db.syncTargetDao(),
+        tdLibManager = app.tdLibManager,
+        settingsPreferences = prefs,
+        networkAlertCoordinator = app.networkAlertCoordinator,
+      )
+
+      val queuedPhotoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "batch_queued_photo",
+          fileName = "queued_photo.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 1024L,
+          takenAtEpochMs = 9000L,
+          uploadStatus = UploadStatus.QUEUED,
+        )
+      )
+      val pausedPhotoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "batch_paused_photo",
+          fileName = "paused_photo.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 1024L,
+          takenAtEpochMs = 8500L,
+          uploadStatus = UploadStatus.PAUSED_FLOOD_WAIT,
+        )
+      )
+      val queuedOtherVideoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "batch_other_queued_video",
+          fileName = "other_queued.mp4",
+          mimeType = "video/mp4",
+          mediaType = MediaType.VIDEO,
+          durationSec = 20,
+          sizeBytes = 2048L,
+          takenAtEpochMs = 9500L,
+          uploadStatus = UploadStatus.QUEUED,
+        )
+      )
+      val pausedOtherVideoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "batch_other_paused_video",
+          fileName = "other_paused.mp4",
+          mimeType = "video/mp4",
+          mediaType = MediaType.VIDEO,
+          durationSec = 25,
+          sizeBytes = 2048L,
+          takenAtEpochMs = 8000L,
+          uploadStatus = UploadStatus.PAUSED_FLOOD_WAIT,
+        )
+      )
+      val selectedVideoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "batch_selected_video",
+          fileName = "selected_only.mp4",
+          mimeType = "video/mp4",
+          mediaType = MediaType.VIDEO,
+          durationSec = 12,
+          sizeBytes = 4096L,
+          takenAtEpochMs = 1000L,
+          uploadStatus = UploadStatus.LOCAL_ONLY,
+        )
+      )
+
+      val prepared = repo.prepareManualUploadBatch(
+        selectedOnlyIds = listOf(selectedVideoId),
+        filterMediaType = MediaType.VIDEO,
+      )
+
+      assertTrue(prepared.isSelectedBatch)
+      assertEquals(MediaType.VIDEO, prepared.filterMediaType)
+      assertEquals(listOf(selectedVideoId), prepared.selectedBatchIds)
+      assertEquals(1, prepared.pendingCount)
+      assertEquals(listOf(selectedVideoId), prefs.getSelectedUploadBatchIds())
+
+      // Scoped queue returns ONLY the selected video, even though other QUEUED items have newer timestamps
+      val next = repo.getNextPendingUploadScoped(prepared.selectedBatchIds, MediaType.VIDEO)
+      assertEquals(selectedVideoId, next?.id)
+
+      // Scoped FLOOD_WAIT requeue leaves unrelated paused photos/videos untouched
+      repo.requeueFloodWaitPausedScoped(prepared.selectedBatchIds, MediaType.VIDEO)
+      assertEquals(UploadStatus.PAUSED_FLOOD_WAIT, mediaDao.getById(pausedPhotoId)?.uploadStatus)
+      assertEquals(UploadStatus.PAUSED_FLOOD_WAIT, mediaDao.getById(pausedOtherVideoId)?.uploadStatus)
+      assertEquals(UploadStatus.QUEUED, mediaDao.getById(queuedPhotoId)?.uploadStatus)
+      assertEquals(UploadStatus.QUEUED, mediaDao.getById(queuedOtherVideoId)?.uploadStatus)
+
+      // Completing the selected video drains the scoped batch completely without touching other queued items
+      mediaDao.markUploaded(
+        id = selectedVideoId,
+        chatId = -1001L,
+        messageId = 55L,
+        fileId = 10,
+        remoteFileId = "remote_10",
+        thumbFileId = null,
+        albumId = null,
+        topicId = 102L,
+      )
+      assertEquals(0, repo.countPendingUploadsScoped(prepared.selectedBatchIds, MediaType.VIDEO))
+      assertNull(repo.getNextPendingUploadScoped(prepared.selectedBatchIds, MediaType.VIDEO))
+    } finally {
+      prefs.clearSelectedUploadBatchIds()
+      db.close()
+    }
+  }
+
+  @Test
+  fun `empty or cross-type selection fails fast and Video tab sync excludes photos`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    val db = Room.inMemoryDatabaseBuilder(app, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    val prefs = app.settingsPreferences
+    try {
+      val mediaDao = db.mediaDao()
+      val repo = VaultRepository(
+        context = app,
+        mediaDao = mediaDao,
+        albumDao = db.albumDao(),
+        syncTargetDao = db.syncTargetDao(),
+        tdLibManager = app.tdLibManager,
+        settingsPreferences = prefs,
+        networkAlertCoordinator = app.networkAlertCoordinator,
+      )
+
+      val localPhotoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "scope_local_photo",
+          fileName = "local_photo.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 1024L,
+          takenAtEpochMs = 2000L,
+          uploadStatus = UploadStatus.LOCAL_ONLY,
+        )
+      )
+      val pausedPhotoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "scope_paused_photo",
+          fileName = "paused_photo.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 1024L,
+          takenAtEpochMs = 2100L,
+          uploadStatus = UploadStatus.PAUSED_FLOOD_WAIT,
+        )
+      )
+      val localVideoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "scope_local_video",
+          fileName = "local_video.mp4",
+          mimeType = "video/mp4",
+          mediaType = MediaType.VIDEO,
+          durationSec = 18,
+          sizeBytes = 4096L,
+          takenAtEpochMs = 2200L,
+          uploadStatus = UploadStatus.LOCAL_ONLY,
+        )
+      )
+
+      // 1. Empty selection must never fall back to full library sync
+      val emptyError = runCatching {
+        repo.prepareManualUploadBatch(selectedOnlyIds = emptyList(), filterMediaType = MediaType.VIDEO)
+      }.exceptionOrNull()
+      assertNotNull(emptyError)
+      assertEquals(UploadStatus.LOCAL_ONLY, mediaDao.getById(localPhotoId)?.uploadStatus)
+      assertEquals(UploadStatus.PAUSED_FLOOD_WAIT, mediaDao.getById(pausedPhotoId)?.uploadStatus)
+      assertEquals(UploadStatus.LOCAL_ONLY, mediaDao.getById(localVideoId)?.uploadStatus)
+
+      // 2. Selecting a PHOTO ID while inside VIDEO tab scope must fail without queuing the photo
+      val crossTypeError = runCatching {
+        repo.prepareManualUploadBatch(selectedOnlyIds = listOf(localPhotoId), filterMediaType = MediaType.VIDEO)
+      }.exceptionOrNull()
+      assertNotNull(crossTypeError)
+      assertEquals(UploadStatus.LOCAL_ONLY, mediaDao.getById(localPhotoId)?.uploadStatus)
+
+      // 3. Video-tab full sync (selectedOnlyIds = null, filterMediaType = VIDEO) queues ONLY videos
+      prefs.setSelectedUploadBatchIds(listOf(999L))
+      val videoTabBatch = repo.prepareManualUploadBatch(
+        selectedOnlyIds = null,
+        filterMediaType = MediaType.VIDEO,
+      )
+      assertFalse(videoTabBatch.isSelectedBatch)
+      assertEquals(MediaType.VIDEO, videoTabBatch.filterMediaType)
+      assertEquals(1, videoTabBatch.pendingCount)
+      assertTrue(prefs.getSelectedUploadBatchIds().isEmpty())
+      assertEquals(UploadStatus.QUEUED, mediaDao.getById(localVideoId)?.uploadStatus)
+      assertEquals(UploadStatus.LOCAL_ONLY, mediaDao.getById(localPhotoId)?.uploadStatus)
+      assertEquals(UploadStatus.PAUSED_FLOOD_WAIT, mediaDao.getById(pausedPhotoId)?.uploadStatus)
+    } finally {
+      prefs.clearSelectedUploadBatchIds()
       db.close()
     }
   }

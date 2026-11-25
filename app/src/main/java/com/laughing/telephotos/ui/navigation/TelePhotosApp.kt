@@ -139,7 +139,8 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
   val albums by viewModel.albums.collectAsStateWithLifecycle()
   val trashedMedia by viewModel.trashedMedia.collectAsStateWithLifecycle()
   val storageStats by viewModel.storageStats.collectAsStateWithLifecycle()
-  val selectedIds by viewModel.selectedIds.collectAsStateWithLifecycle()
+  val selectedPhotoIds by viewModel.selectedPhotoIds.collectAsStateWithLifecycle()
+  val selectedVideoIds by viewModel.selectedVideoIds.collectAsStateWithLifecycle()
   val candidateTargets by viewModel.candidateTargets.collectAsStateWithLifecycle()
   val isLoadingTargets by viewModel.isLoadingTargets.collectAsStateWithLifecycle()
   val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
@@ -214,7 +215,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
               NavigationBarItem(
                 selected = selected,
                 onClick = {
-                  viewModel.clearSelection()
+                  viewModel.clearAllSelections()
                   navController.navigate(dest.route) {
                     popUpTo(navController.graph.findStartDestination().id) {
                       saveState = true
@@ -251,7 +252,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
               NavigationRailItem(
                 selected = selected,
                 onClick = {
-                  viewModel.clearSelection()
+                  viewModel.clearAllSelections()
                   navController.navigate(dest.route) {
                     popUpTo(navController.graph.findStartDestination().id) {
                       saveState = true
@@ -287,7 +288,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
               val hasPhotoPerm = MediaStoreScanner.hasMediaReadPermission(context, MediaType.PHOTO)
               TimelineScreen(
                 sections = photoSections,
-                selectedIds = selectedIds,
+                selectedIds = selectedPhotoIds,
                 albums = albums,
                 lockedTarget = lockedTarget,
                 settings = settings,
@@ -302,14 +303,14 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onMediaClick = { media ->
                   navController.navigate(MediaViewerRoute(media.id, MediaCollectionScope.PHOTOS))
                 },
-                onToggleSelection = viewModel::toggleSelection,
-                onToggleDateGroup = viewModel::toggleDateGroupSelection,
-                onClearSelection = viewModel::clearSelection,
+                onToggleSelection = { id -> viewModel.toggleSelection(MediaType.PHOTO, id) },
+                onToggleDateGroup = { ids -> viewModel.toggleDateGroupSelection(MediaType.PHOTO, ids) },
+                onClearSelection = { viewModel.clearSelection(MediaType.PHOTO) },
                 onImportPickedPhotos = { uris -> viewModel.importSelectedMedia(uris, null) },
-                onUploadSelectedItems = viewModel::uploadSelectedItemsNow,
-                onFreeUpSelectedSpace = viewModel::requestFreeUpSpaceSelected,
-                onMoveSelectedToTrash = viewModel::moveSelectedToTrash,
-                onAssignSelectedToAlbum = viewModel::assignSelectedToAlbum,
+                onUploadSelectedItems = { viewModel.uploadSelectedItemsNow(MediaType.PHOTO) },
+                onFreeUpSelectedSpace = { viewModel.requestFreeUpSpaceSelected(MediaType.PHOTO) },
+                onMoveSelectedToTrash = { viewModel.moveSelectedToTrash(MediaType.PHOTO) },
+                onAssignSelectedToAlbum = { albumId -> viewModel.assignSelectedToAlbum(MediaType.PHOTO, albumId) },
                 onStopManualSync = viewModel::stopManualSync,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
                 onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },
@@ -338,7 +339,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
               val hasVideoPerm = MediaStoreScanner.hasMediaReadPermission(context, MediaType.VIDEO)
               VideosScreen(
                 sections = videoSections,
-                selectedIds = selectedIds,
+                selectedIds = selectedVideoIds,
                 albums = albums,
                 lockedTarget = lockedTarget,
                 settings = settings,
@@ -352,14 +353,14 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onMediaClick = { media ->
                   navController.navigate(MediaViewerRoute(media.id, MediaCollectionScope.VIDEOS))
                 },
-                onToggleSelection = viewModel::toggleSelection,
-                onToggleDateGroup = viewModel::toggleDateGroupSelection,
-                onClearSelection = viewModel::clearSelection,
+                onToggleSelection = { id -> viewModel.toggleSelection(MediaType.VIDEO, id) },
+                onToggleDateGroup = { ids -> viewModel.toggleDateGroupSelection(MediaType.VIDEO, ids) },
+                onClearSelection = { viewModel.clearSelection(MediaType.VIDEO) },
                 onImportPickedVideos = { uris -> viewModel.importSelectedMedia(uris, null) },
-                onUploadSelectedItems = viewModel::uploadSelectedItemsNow,
-                onFreeUpSelectedSpace = viewModel::requestFreeUpSpaceSelected,
-                onMoveSelectedToTrash = viewModel::moveSelectedToTrash,
-                onAssignSelectedToAlbum = viewModel::assignSelectedToAlbum,
+                onUploadSelectedItems = { viewModel.uploadSelectedItemsNow(MediaType.VIDEO) },
+                onFreeUpSelectedSpace = { viewModel.requestFreeUpSpaceSelected(MediaType.VIDEO) },
+                onMoveSelectedToTrash = { viewModel.moveSelectedToTrash(MediaType.VIDEO) },
+                onAssignSelectedToAlbum = { albumId -> viewModel.assignSelectedToAlbum(MediaType.VIDEO, albumId) },
                 onStopManualSync = viewModel::stopManualSync,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
                 onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },

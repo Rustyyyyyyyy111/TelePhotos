@@ -47,6 +47,7 @@ import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import com.laughing.telephotos.worker.TelegramUploadWorker
 import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -54,6 +55,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 data class ImportSummary(
   val addedCount: Int,
@@ -86,6 +88,13 @@ data class ManualSyncProgressState(
   val fraction: Float
     get() = if (totalCount > 0) (completedCount.toFloat() / totalCount.toFloat()).coerceIn(0f, 1f) else 0f
 }
+
+data class PreparedUploadBatch(
+  val isSelectedBatch: Boolean,
+  val selectedBatchIds: List<Long>,
+  val filterMediaType: MediaType?,
+  val pendingCount: Int,
+)
 
 class VaultRepository(
   private val context: Context,
@@ -1512,8 +1521,139 @@ class VaultRepository(
   }
 
   /**
+   * Prepares an explicit upload batch in Room + SettingsPreferences without launching WorkManager.
+   * - When selectedOnlyIds != null: strictly queues and scopes ONLY the valid matching IDs (never falls
+   *   back to requeueAllPending or requeueAllPendingByType, even if selectedOnlyIds is empty).
+   * - When selectedOnlyIds == null: clears any prior selected-batch scope and queues either the single
+   *   filterMediaType tab or all pending items.
+   */
+  suspend fun prepareManualUploadBatch(
+    selectedOnlyIds: List<Long>? = null,
+    filterMediaType: MediaType? = null,
+  ): PreparedUploadBatch {
+    if (selectedOnlyIds != null) {
+      val distinctIds = selectedOnlyIds.distinct().filter { it > 0L }
+      if (distinctIds.isEmpty()) {
+        error("Vui lòng chọn ít nhất 1 mục trước khi tải lên")
+      }
+      val matchedItems = distinctIds.chunked(SQLITE_BIND_CHUNK_SIZE).flatMap { chunk ->
+        mediaDao.getByIds(chunk)
+      }
+      val scopedItems = matchedItems.filter { item ->
+        !item.isTrashed &&
+          item.uploadStatus != UploadStatus.UPLOADED &&
+          (filterMediaType == null || item.mediaType == filterMediaType)
+      }
+      val scopedIds = scopedItems.map { it.id }.distinct()
+      if (scopedIds.isEmpty()) {
+        val allAlreadyUploaded = matchedItems.any { item ->
+          !item.isTrashed &&
+            item.uploadStatus == UploadStatus.UPLOADED &&
+            (filterMediaType == null || item.mediaType == filterMediaType)
+        }
+        if (allAlreadyUploaded) {
+          error("Các mục đã chọn đều đã được sao lưu lên Telegram")
+        } else {
+          error("Không có mục hợp lệ nào trong lựa chọn để tải lên")
+        }
+      }
+
+      scopedIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+        if (filterMediaType != null) {
+          mediaDao.markSelectedQueuedByType(chunk, filterMediaType.name)
+        } else {
+          mediaDao.markSelectedQueued(chunk)
+        }
+      }
+      settingsPreferences.setSelectedUploadBatchIds(scopedIds)
+      val pendingCount = countPendingUploadsScoped(
+        selectedBatchIds = scopedIds,
+        filterMediaType = filterMediaType,
+      )
+      return PreparedUploadBatch(
+        isSelectedBatch = true,
+        selectedBatchIds = scopedIds,
+        filterMediaType = filterMediaType,
+        pendingCount = pendingCount,
+      )
+    }
+
+    settingsPreferences.clearSelectedUploadBatchIds()
+    if (filterMediaType != null) {
+      mediaDao.requeueAllPendingByType(filterMediaType.name)
+    } else {
+      mediaDao.requeueAllPending()
+    }
+
+    val pendingCount = if (filterMediaType != null) {
+      mediaDao.countPendingUploadsByType(filterMediaType.name)
+    } else {
+      mediaDao.countPendingUploads()
+    }
+
+    // For Settings "Tải lên ngay", fail fast if queue is empty.
+    // For Ảnh / Video tab Sync button, still launch Worker so it pulls latest cloud items from that Topic too.
+    if (filterMediaType == null && pendingCount <= 0) {
+      error("Không có ảnh hoặc video mới nào cần tải lên")
+    }
+
+    return PreparedUploadBatch(
+      isSelectedBatch = false,
+      selectedBatchIds = emptyList(),
+      filterMediaType = filterMediaType,
+      pendingCount = pendingCount,
+    )
+  }
+
+  suspend fun countPendingUploadsScoped(
+    selectedBatchIds: List<Long>,
+    filterMediaType: MediaType?,
+  ): Int {
+    if (selectedBatchIds.isEmpty()) return 0
+    return selectedBatchIds.chunked(SQLITE_BIND_CHUNK_SIZE).sumOf { chunk ->
+      if (filterMediaType != null) {
+        mediaDao.countPendingUploadsByTypeInIds(chunk, filterMediaType.name)
+      } else {
+        mediaDao.countPendingUploadsInIds(chunk)
+      }
+    }
+  }
+
+  suspend fun getNextPendingUploadScoped(
+    selectedBatchIds: List<Long>,
+    filterMediaType: MediaType?,
+  ): MediaEntity? {
+    if (selectedBatchIds.isEmpty()) return null
+    val candidates = selectedBatchIds.chunked(SQLITE_BIND_CHUNK_SIZE).mapNotNull { chunk ->
+      if (filterMediaType != null) {
+        mediaDao.getNextPendingUploadByTypeInIds(chunk, filterMediaType.name)
+      } else {
+        mediaDao.getNextPendingUploadInIds(chunk)
+      }
+    }
+    return candidates.maxWithOrNull(
+      compareBy<MediaEntity> { it.takenAtEpochMs }.thenByDescending { it.id }
+    )
+  }
+
+  suspend fun requeueFloodWaitPausedScoped(
+    selectedBatchIds: List<Long>,
+    filterMediaType: MediaType?,
+  ) {
+    if (selectedBatchIds.isEmpty()) return
+    selectedBatchIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+      if (filterMediaType != null) {
+        mediaDao.requeueFloodWaitPausedByTypeInIds(chunk, filterMediaType.name)
+      } else {
+        mediaDao.requeueFloodWaitPausedInIds(chunk)
+      }
+    }
+  }
+
+  /**
    * Starts a manual on-demand WorkManager upload batch ONLY when explicitly invoked by user tap.
-   * When filterMediaType is non-null (from Ảnh or Video top bar), queues and uploads ONLY that type.
+   * When selectedOnlyIds is non-null, strictly processes ONLY those IDs (never touches other queued items).
+   * When filterMediaType is non-null (from Ảnh or Video), scopes strictly to that MediaType.
    */
   suspend fun startManualUploadBatch(
     selectedOnlyIds: List<Long>? = null,
@@ -1544,29 +1684,18 @@ class VaultRepository(
       error("Đang bật «Chỉ cho phép tải lên khi dùng Wi-Fi». Hãy kết nối Wi-Fi để bắt đầu.")
     }
 
-    when {
-      selectedOnlyIds != null && selectedOnlyIds.isNotEmpty() -> {
-        mediaDao.markSelectedQueued(selectedOnlyIds)
-      }
-      filterMediaType != null -> {
-        mediaDao.requeueAllPendingByType(filterMediaType.name)
-      }
-      else -> {
-        mediaDao.requeueAllPending()
-      }
+    val workManager = WorkManager.getInstance(context)
+    val existingInfos = withContext(Dispatchers.IO) {
+      workManager.getWorkInfosForUniqueWork(TelegramUploadWorker.UNIQUE_WORK_NAME).get()
+    }
+    if (existingInfos.any { it.state == WorkInfo.State.RUNNING }) {
+      error("Đang có tác vụ đồng bộ chạy. Vui lòng bấm Dừng trước khi bắt đầu lô mới.")
     }
 
-    val pendingCount = if (filterMediaType != null) {
-      mediaDao.countPendingUploadsByType(filterMediaType.name)
-    } else {
-      mediaDao.countPendingUploads()
-    }
-
-    // For Settings "Tải lên ngay", fail fast if queue is empty.
-    // For Ảnh / Video tab Sync button, still launch Worker so it pulls latest cloud items from that Topic too.
-    if (filterMediaType == null && pendingCount <= 0) {
-      error("Không có ảnh hoặc video mới nào cần tải lên")
-    }
+    val prepared = prepareManualUploadBatch(
+      selectedOnlyIds = selectedOnlyIds,
+      filterMediaType = filterMediaType,
+    )
 
     settingsPreferences.setLastSyncStatusMessage("")
 
@@ -1576,7 +1705,8 @@ class VaultRepository(
       .build()
 
     val inputData = workDataOf(
-      TelegramUploadWorker.KEY_FILTER_MEDIA_TYPE to filterMediaType?.name,
+      TelegramUploadWorker.KEY_FILTER_MEDIA_TYPE to prepared.filterMediaType?.name,
+      TelegramUploadWorker.KEY_IS_SELECTED_BATCH to prepared.isSelectedBatch,
     )
 
     val request = OneTimeWorkRequestBuilder<TelegramUploadWorker>()
@@ -1584,12 +1714,12 @@ class VaultRepository(
       .setInputData(inputData)
       .build()
 
-    WorkManager.getInstance(context).enqueueUniqueWork(
+    workManager.enqueueUniqueWork(
       TelegramUploadWorker.UNIQUE_WORK_NAME,
-      ExistingWorkPolicy.KEEP,
+      ExistingWorkPolicy.REPLACE,
       request,
     )
-    pendingCount
+    prepared.pendingCount
   }
 
   /**
@@ -1599,6 +1729,7 @@ class VaultRepository(
   suspend fun scheduleUploadAfterFloodWait(
     delayMs: Long,
     filterMediaType: MediaType?,
+    isSelectedBatch: Boolean = false,
   ) {
     val settings = settingsPreferences.getCurrentSettings()
     val networkType = if (settings.wifiOnlyUpload) NetworkType.UNMETERED else NetworkType.CONNECTED
@@ -1608,6 +1739,7 @@ class VaultRepository(
 
     val inputData = workDataOf(
       TelegramUploadWorker.KEY_FILTER_MEDIA_TYPE to filterMediaType?.name,
+      TelegramUploadWorker.KEY_IS_SELECTED_BATCH to isSelectedBatch,
     )
 
     val request = OneTimeWorkRequestBuilder<TelegramUploadWorker>()
@@ -1624,11 +1756,12 @@ class VaultRepository(
   }
 
   /**
-   * Immediately cancels the running manual WorkManager batch, resets interrupted items,
-   * trims TDLib cache, and keeps the foreground session alive (or closes if backgrounded).
+   * Immediately cancels the running manual WorkManager batch, clears any active selection batch,
+   * resets interrupted items, trims TDLib cache, and keeps the foreground session alive.
    */
   suspend fun stopManualSync() {
     WorkManager.getInstance(context).cancelUniqueWork(TelegramUploadWorker.UNIQUE_WORK_NAME)
+    settingsPreferences.clearSelectedUploadBatchIds()
     mediaDao.resetInterruptedUploadsToQueued()
     tdLibManager.optimizeStorageLightweight()
     if (!tdLibManager.isAppInForeground()) {
@@ -1686,5 +1819,9 @@ class VaultRepository(
     val caps = cm.getNetworkCapabilities(network) ?: return false
     return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
       caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+  }
+
+  companion object {
+    private const val SQLITE_BIND_CHUNK_SIZE = 500
   }
 }

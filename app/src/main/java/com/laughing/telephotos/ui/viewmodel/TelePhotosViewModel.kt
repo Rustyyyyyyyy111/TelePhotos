@@ -76,6 +76,7 @@ data class PendingSystemUriRequest(
   val targetUris: Set<String>,
   val thumbOverrides: Map<Long, String>,
   val skippedUnsyncedCount: Int = 0,
+  val selectionScopeType: MediaType? = null,
 )
 
 class TelePhotosViewModel(application: Application) : AndroidViewModel(application) {
@@ -160,8 +161,17 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       initialValue = ManualSyncProgressState(),
     )
 
-  private val _selectedIds = MutableStateFlow<Set<Long>>(emptySet())
-  val selectedIds: StateFlow<Set<Long>> = _selectedIds.asStateFlow()
+  private val _selectedPhotoIds = MutableStateFlow<Set<Long>>(emptySet())
+  val selectedPhotoIds: StateFlow<Set<Long>> = _selectedPhotoIds.asStateFlow()
+
+  private val _selectedVideoIds = MutableStateFlow<Set<Long>>(emptySet())
+  val selectedVideoIds: StateFlow<Set<Long>> = _selectedVideoIds.asStateFlow()
+
+  private fun selectionFlowFor(mediaType: MediaType): MutableStateFlow<Set<Long>> =
+    when (mediaType) {
+      MediaType.PHOTO -> _selectedPhotoIds
+      MediaType.VIDEO -> _selectedVideoIds
+    }
 
   private val _candidateTargets = MutableStateFlow<List<TelegramCandidateTarget>>(emptyList())
   val candidateTargets: StateFlow<List<TelegramCandidateTarget>> = _candidateTargets.asStateFlow()
@@ -285,24 +295,31 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun toggleSelection(mediaId: Long) {
-    val current = _selectedIds.value
-    _selectedIds.value = if (mediaId in current) current - mediaId else current + mediaId
+  fun toggleSelection(mediaType: MediaType, mediaId: Long) {
+    val flow = selectionFlowFor(mediaType)
+    val current = flow.value
+    flow.value = if (mediaId in current) current - mediaId else current + mediaId
   }
 
-  fun toggleDateGroupSelection(itemIds: List<Long>) {
+  fun toggleDateGroupSelection(mediaType: MediaType, itemIds: List<Long>) {
     if (itemIds.isEmpty()) return
-    val current = _selectedIds.value
+    val flow = selectionFlowFor(mediaType)
+    val current = flow.value
     val allSelected = itemIds.all { it in current }
-    _selectedIds.value = if (allSelected) {
+    flow.value = if (allSelected) {
       current - itemIds.toSet()
     } else {
       current + itemIds
     }
   }
 
-  fun clearSelection() {
-    _selectedIds.value = emptySet()
+  fun clearSelection(mediaType: MediaType) {
+    selectionFlowFor(mediaType).value = emptySet()
+  }
+
+  fun clearAllSelections() {
+    _selectedPhotoIds.value = emptySet()
+    _selectedVideoIds.value = emptySet()
   }
 
   fun ensureTelegramInitialized() {
@@ -356,14 +373,19 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun uploadSelectedItemsNow() {
-    val ids = _selectedIds.value.toList()
-    if (ids.isEmpty()) return
+  fun uploadSelectedItemsNow(mediaType: MediaType) {
+    val flow = selectionFlowFor(mediaType)
+    val ids = flow.value.toList()
+    if (ids.isEmpty()) {
+      _statusBanner.value = "Vui lòng chọn ít nhất 1 mục để tải lên"
+      return
+    }
     viewModelScope.launch {
-      repo.startManualUploadBatch(selectedOnlyIds = ids)
+      repo.startManualUploadBatch(selectedOnlyIds = ids, filterMediaType = mediaType)
         .onSuccess { count ->
-          _selectedIds.value = emptySet()
-          _statusBanner.value = "Đang tải lên $count mục đã chọn"
+          flow.value = emptySet()
+          val label = if (mediaType == MediaType.VIDEO) "video" else "ảnh"
+          _statusBanner.value = "Đang tải lên $count $label đã chọn"
         }
         .onFailure { err ->
           _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"
@@ -413,22 +435,25 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun moveSelectedToTrash() {
-    val ids = _selectedIds.value.toList()
+  fun moveSelectedToTrash(mediaType: MediaType) {
+    val ids = selectionFlowFor(mediaType).value.toList()
     if (ids.isEmpty()) return
-    requestMoveToTrash(ids)
+    requestMoveToTrash(ids, selectionScopeType = mediaType)
   }
 
   fun moveSingleToTrash(mediaId: Long) {
-    requestMoveToTrash(listOf(mediaId))
+    requestMoveToTrash(listOf(mediaId), selectionScopeType = null)
   }
 
   fun moveMediaIdsToTrash(ids: List<Long>) {
     if (ids.isEmpty()) return
-    requestMoveToTrash(ids)
+    requestMoveToTrash(ids, selectionScopeType = null)
   }
 
-  private fun requestMoveToTrash(ids: List<Long>) {
+  private fun requestMoveToTrash(
+    ids: List<Long>,
+    selectionScopeType: MediaType?,
+  ) {
     viewModelScope.launch {
       _isBusy.value = true
       val prep = repo.prepareSystemDelete(ids)
@@ -441,6 +466,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
             intentSender = result.intentSender,
             targetUris = result.targetUris,
             thumbOverrides = prep.thumbPathOverrides,
+            selectionScopeType = selectionScopeType,
           )
         }
         is LocalDeletePrepResult.NoSystemPromptNeeded -> {
@@ -450,7 +476,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
             thumbOverrides = prep.thumbPathOverrides,
           )
             .onSuccess { msg ->
-              _selectedIds.value = _selectedIds.value - prep.mediaIds.toSet()
+              removeIdsFromSelection(prep.mediaIds.toSet(), selectionScopeType)
               _statusBanner.value = msg
             }
             .onFailure { err ->
@@ -464,27 +490,30 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   /**
    * "Giải phóng dung lượng máy" for selected items in Ảnh/Video multi-select mode.
    */
-  fun requestFreeUpSpaceSelected() {
-    val ids = _selectedIds.value.toList()
+  fun requestFreeUpSpaceSelected(mediaType: MediaType) {
+    val ids = selectionFlowFor(mediaType).value.toList()
     if (ids.isEmpty()) return
-    requestFreeUpSpaceInternal(ids)
+    requestFreeUpSpaceInternal(ids, selectionScopeType = mediaType)
   }
 
   /**
    * "Giải phóng dung lượng máy" for a single synced item inside MediaViewerScreen.
    */
   fun requestFreeUpSpaceSingle(mediaId: Long) {
-    requestFreeUpSpaceInternal(listOf(mediaId))
+    requestFreeUpSpaceInternal(listOf(mediaId), selectionScopeType = null)
   }
 
   /**
    * "Giải phóng dung lượng đã đồng bộ" bulk action in Setting.
    */
   fun requestFreeUpAllSynced() {
-    requestFreeUpSpaceInternal(null)
+    requestFreeUpSpaceInternal(null, selectionScopeType = null)
   }
 
-  private fun requestFreeUpSpaceInternal(mediaIds: List<Long>?) {
+  private fun requestFreeUpSpaceInternal(
+    mediaIds: List<Long>?,
+    selectionScopeType: MediaType?,
+  ) {
     viewModelScope.launch {
       _isBusy.value = true
       val prep = repo.prepareFreeUpSpace(mediaIds)
@@ -508,6 +537,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
             targetUris = result.targetUris,
             thumbOverrides = prep.thumbPathOverrides,
             skippedUnsyncedCount = prep.skippedUnsyncedCount,
+            selectionScopeType = selectionScopeType,
           )
         }
         is LocalDeletePrepResult.NoSystemPromptNeeded -> {
@@ -517,7 +547,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
             thumbOverrides = prep.thumbPathOverrides,
           )
             .onSuccess { freedCount ->
-              _selectedIds.value = _selectedIds.value - prep.eligibleMediaIds.toSet()
+              removeIdsFromSelection(prep.eligibleMediaIds.toSet(), selectionScopeType)
               _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
               _statusBanner.value = buildFreeUpSuccessBanner(freedCount, prep.skippedUnsyncedCount)
             }
@@ -541,7 +571,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
             thumbOverrides = pending.thumbOverrides,
           )
             .onSuccess { msg ->
-              _selectedIds.value = _selectedIds.value - pending.mediaIds.toSet()
+              removeIdsFromSelection(pending.mediaIds.toSet(), pending.selectionScopeType)
               _statusBanner.value = msg
             }
             .onFailure { err ->
@@ -555,7 +585,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
             thumbOverrides = pending.thumbOverrides,
           )
             .onSuccess { freedCount ->
-              _selectedIds.value = _selectedIds.value - pending.mediaIds.toSet()
+              removeIdsFromSelection(pending.mediaIds.toSet(), pending.selectionScopeType)
               _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
               _statusBanner.value = buildFreeUpSuccessBanner(freedCount, pending.skippedUnsyncedCount)
             }
@@ -565,6 +595,16 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
         }
       }
       _isBusy.value = false
+    }
+  }
+
+  private fun removeIdsFromSelection(idsToRemove: Set<Long>, selectionScopeType: MediaType?) {
+    if (selectionScopeType != null) {
+      val flow = selectionFlowFor(selectionScopeType)
+      flow.value = flow.value - idsToRemove
+    } else {
+      _selectedPhotoIds.value = _selectedPhotoIds.value - idsToRemove
+      _selectedVideoIds.value = _selectedVideoIds.value - idsToRemove
     }
   }
 
@@ -611,12 +651,13 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun assignSelectedToAlbum(albumId: Long) {
-    val ids = _selectedIds.value.toList()
+  fun assignSelectedToAlbum(mediaType: MediaType, albumId: Long) {
+    val flow = selectionFlowFor(mediaType)
+    val ids = flow.value.toList()
     if (ids.isEmpty()) return
     viewModelScope.launch {
       repo.assignMediaToAlbum(ids, albumId)
-      _selectedIds.value = emptySet()
+      flow.value = emptySet()
       _statusBanner.value = "Đã chuyển ${ids.size} mục vào album"
     }
   }
