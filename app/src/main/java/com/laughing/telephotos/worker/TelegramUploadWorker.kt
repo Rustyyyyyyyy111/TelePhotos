@@ -15,6 +15,7 @@ import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.UploadStatus
 import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.PendingUploadInterruptedException
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import kotlin.random.Random
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -51,6 +52,9 @@ class TelegramUploadWorker(
     val filterMediaType = inputData.getString(KEY_FILTER_MEDIA_TYPE)
       ?.let { raw -> runCatching { MediaType.valueOf(raw) }.getOrNull() }
     val isSelectedBatch = inputData.getBoolean(KEY_IS_SELECTED_BATCH, false)
+    val uploadMode = inputData.getString(KEY_UPLOAD_MODE)
+      ?.let { TelegramUploadMode.fromWireName(it) }
+      ?: prefs.getActiveUploadBatchMode()
     val selectedBatchIds = if (isSelectedBatch) {
       prefs.getSelectedUploadBatchIds()
     } else {
@@ -93,7 +97,7 @@ class TelegramUploadWorker(
           requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
         } else {
           hitFloodWaitRescheduled = true
-          repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
+          repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch, uploadMode)
           return Result.success()
         }
       } else if (initialSettings.floodWaitUntilEpochMs > 0L || tdLib.floodWaitState.value != null) {
@@ -153,7 +157,7 @@ class TelegramUploadWorker(
             continue
           } else {
             hitFloodWaitRescheduled = true
-            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch, uploadMode)
             return Result.success()
           }
         }
@@ -231,7 +235,7 @@ class TelegramUploadWorker(
             requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
           } else {
             hitFloodWaitRescheduled = true
-            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch, uploadMode)
             return Result.success()
           }
         }
@@ -364,17 +368,48 @@ class TelegramUploadWorker(
                 effectiveItem.copy(topicId = resolvedTopicId, albumId = resolvedAlbumId)
               )
 
-              val sent = tdLib.sendDocumentOriginal(
-                chatId = refreshedTarget.chatId,
-                messageThreadId = resolvedTopicId,
-                localFilePath = stagingFile.absolutePath,
-                caption = caption,
-                thumbnailPath = uploadThumb?.file?.absolutePath,
-                thumbnailWidth = uploadThumb?.width ?: 0,
-                thumbnailHeight = uploadThumb?.height ?: 0,
-                existingPendingMessageId = pendingMessageId,
-                onProgressMade = { retryTracker.reset() },
-              )
+              val sent = when (uploadMode) {
+                TelegramUploadMode.AS_FILE -> {
+                  tdLib.sendDocumentOriginal(
+                    chatId = refreshedTarget.chatId,
+                    messageThreadId = resolvedTopicId,
+                    localFilePath = stagingFile.absolutePath,
+                    caption = caption,
+                    thumbnailPath = uploadThumb?.file?.absolutePath,
+                    thumbnailWidth = uploadThumb?.width ?: 0,
+                    thumbnailHeight = uploadThumb?.height ?: 0,
+                    existingPendingMessageId = pendingMessageId,
+                    onProgressMade = { retryTracker.reset() },
+                  )
+                }
+                TelegramUploadMode.HD_MEDIA -> {
+                  val needsDimProbe = effectiveItem.width <= 0 || effectiveItem.height <= 0 ||
+                    (effectiveItem.mediaType == MediaType.VIDEO && effectiveItem.durationSec <= 0)
+                  val probedDims = if (needsDimProbe) {
+                    MediaHashUtil.extractLocalMediaDimensions(stagingFile, effectiveItem.mediaType)
+                  } else {
+                    null
+                  }
+                  val resolvedW = effectiveItem.width.takeIf { it > 0 } ?: (probedDims?.width ?: 0)
+                  val resolvedH = effectiveItem.height.takeIf { it > 0 } ?: (probedDims?.height ?: 0)
+                  val resolvedDur = effectiveItem.durationSec.takeIf { it > 0 } ?: (probedDims?.durationSec ?: 0)
+                  tdLib.sendMediaHd(
+                    chatId = refreshedTarget.chatId,
+                    messageThreadId = resolvedTopicId,
+                    mediaType = effectiveItem.mediaType,
+                    localFilePath = stagingFile.absolutePath,
+                    caption = caption,
+                    width = resolvedW,
+                    height = resolvedH,
+                    durationSec = resolvedDur,
+                    thumbnailPath = uploadThumb?.file?.absolutePath,
+                    thumbnailWidth = uploadThumb?.width ?: 0,
+                    thumbnailHeight = uploadThumb?.height ?: 0,
+                    existingPendingMessageId = pendingMessageId,
+                    onProgressMade = { retryTracker.reset() },
+                  )
+                }
+              }
 
               val finalTopicId = sent.messageThreadId ?: resolvedTopicId
               mediaDao.markUploaded(
@@ -418,7 +453,7 @@ class TelegramUploadWorker(
                 // Loop immediately resumes uploading this pending item first!
               } else {
                 hitFloodWaitRescheduled = true
-                repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch)
+                repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch, uploadMode)
                 return Result.success()
               }
             } catch (t: Throwable) {
@@ -494,8 +529,11 @@ class TelegramUploadWorker(
       uploadedAnyOrClean = true
     } finally {
       withContext(NonCancellable) {
-        if (isSelectedBatch && !hitFloodWaitRescheduled) {
-          prefs.clearSelectedUploadBatchIds()
+        if (!hitFloodWaitRescheduled) {
+          if (isSelectedBatch) {
+            prefs.clearSelectedUploadBatchIds()
+          }
+          prefs.clearActiveUploadBatchMode()
         }
         if (isStopped) {
           mediaDao.resetInterruptedUploadsToQueued()
@@ -565,6 +603,7 @@ class TelegramUploadWorker(
     const val KEY_TOTAL_COUNT = "total_count"
     const val KEY_FILTER_MEDIA_TYPE = "filter_media_type"
     const val KEY_IS_SELECTED_BATCH = "is_selected_batch"
+    const val KEY_UPLOAD_MODE = "upload_mode"
     private const val SHORT_FLOOD_WAIT_MAX_SEC = 60
     private const val SHORT_FLOOD_WAIT_MAX_WAIT_MS = 65_000L
   }

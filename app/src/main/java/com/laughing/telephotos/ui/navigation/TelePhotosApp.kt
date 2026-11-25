@@ -307,14 +307,14 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onToggleDateGroup = { ids -> viewModel.toggleDateGroupSelection(MediaType.PHOTO, ids) },
                 onClearSelection = { viewModel.clearSelection(MediaType.PHOTO) },
                 onImportPickedPhotos = { uris -> viewModel.importSelectedMedia(uris, null) },
-                onUploadSelectedItems = { viewModel.uploadSelectedItemsNow(MediaType.PHOTO) },
+                onUploadSelectedItems = { mode -> viewModel.uploadSelectedItemsNow(MediaType.PHOTO, mode) },
                 onFreeUpSelectedSpace = { viewModel.requestFreeUpSpaceSelected(MediaType.PHOTO) },
                 onMoveSelectedToTrash = { viewModel.moveSelectedToTrash(MediaType.PHOTO) },
                 onAssignSelectedToAlbum = { albumId -> viewModel.assignSelectedToAlbum(MediaType.PHOTO, albumId) },
                 onStopManualSync = viewModel::stopManualSync,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
                 onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },
-                onSyncTab = { viewModel.startTabSync(MediaType.PHOTO) },
+                onSyncTab = { mode -> viewModel.startTabSync(MediaType.PHOTO, mode) },
                 onGridColumnsChange = viewModel::setPhotoGridColumns,
               )
             }
@@ -357,14 +357,14 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onToggleDateGroup = { ids -> viewModel.toggleDateGroupSelection(MediaType.VIDEO, ids) },
                 onClearSelection = { viewModel.clearSelection(MediaType.VIDEO) },
                 onImportPickedVideos = { uris -> viewModel.importSelectedMedia(uris, null) },
-                onUploadSelectedItems = { viewModel.uploadSelectedItemsNow(MediaType.VIDEO) },
+                onUploadSelectedItems = { mode -> viewModel.uploadSelectedItemsNow(MediaType.VIDEO, mode) },
                 onFreeUpSelectedSpace = { viewModel.requestFreeUpSpaceSelected(MediaType.VIDEO) },
                 onMoveSelectedToTrash = { viewModel.moveSelectedToTrash(MediaType.VIDEO) },
                 onAssignSelectedToAlbum = { albumId -> viewModel.assignSelectedToAlbum(MediaType.VIDEO, albumId) },
                 onStopManualSync = viewModel::stopManualSync,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
                 onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },
-                onSyncTab = { viewModel.startTabSync(MediaType.VIDEO) },
+                onSyncTab = { mode -> viewModel.startTabSync(MediaType.VIDEO, mode) },
               )
             }
 
@@ -436,7 +436,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 },
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
                 onSyncHistoryReadOnly = viewModel::syncHistoryReadOnly,
-                onStartManualUploadBatch = viewModel::startManualUploadBatch,
+                onStartManualUploadBatch = { viewModel.startManualUploadBatch() },
                 onStopManualSync = viewModel::stopManualSync,
                 onFreeUpAllSynced = viewModel::requestFreeUpAllSynced,
                 onClearCache = viewModel::clearTemporaryCache,

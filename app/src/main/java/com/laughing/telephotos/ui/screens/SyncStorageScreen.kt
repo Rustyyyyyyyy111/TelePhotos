@@ -627,7 +627,7 @@ fun SyncStorageScreen(
                 Column {
                   Text("Chỉ cho phép tải lên khi dùng Wi-Fi", style = MaterialTheme.typography.titleSmall)
                   Text(
-                    text = "WorkManager tuần tự 1 luồng theo yêu cầu, giãn nhịp 2.0–3.5 giây/tệp dưới dạng Document gốc",
+                    text = "WorkManager tuần tự 1 luồng theo yêu cầu, giãn nhịp 2.0–3.5 giây/tệp (Document gốc hoặc Media HD)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )

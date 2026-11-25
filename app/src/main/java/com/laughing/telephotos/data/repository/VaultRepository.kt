@@ -44,6 +44,7 @@ import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import com.laughing.telephotos.worker.TelegramUploadWorker
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -1658,6 +1659,7 @@ class VaultRepository(
   suspend fun startManualUploadBatch(
     selectedOnlyIds: List<Long>? = null,
     filterMediaType: MediaType? = null,
+    uploadMode: TelegramUploadMode = TelegramUploadMode.AS_FILE,
   ): Result<Int> = runCatching {
     val target = syncTargetDao.getTarget()
       ?: error("Vui lòng chọn và khoá đích lưu trữ Telegram trong Setting trước")
@@ -1697,6 +1699,7 @@ class VaultRepository(
       filterMediaType = filterMediaType,
     )
 
+    settingsPreferences.setActiveUploadBatchMode(uploadMode)
     settingsPreferences.setLastSyncStatusMessage("")
 
     val networkType = if (settings.wifiOnlyUpload) NetworkType.UNMETERED else NetworkType.CONNECTED
@@ -1707,6 +1710,7 @@ class VaultRepository(
     val inputData = workDataOf(
       TelegramUploadWorker.KEY_FILTER_MEDIA_TYPE to prepared.filterMediaType?.name,
       TelegramUploadWorker.KEY_IS_SELECTED_BATCH to prepared.isSelectedBatch,
+      TelegramUploadWorker.KEY_UPLOAD_MODE to uploadMode.name,
     )
 
     val request = OneTimeWorkRequestBuilder<TelegramUploadWorker>()
@@ -1730,6 +1734,7 @@ class VaultRepository(
     delayMs: Long,
     filterMediaType: MediaType?,
     isSelectedBatch: Boolean = false,
+    uploadMode: TelegramUploadMode = TelegramUploadMode.AS_FILE,
   ) {
     val settings = settingsPreferences.getCurrentSettings()
     val networkType = if (settings.wifiOnlyUpload) NetworkType.UNMETERED else NetworkType.CONNECTED
@@ -1740,6 +1745,7 @@ class VaultRepository(
     val inputData = workDataOf(
       TelegramUploadWorker.KEY_FILTER_MEDIA_TYPE to filterMediaType?.name,
       TelegramUploadWorker.KEY_IS_SELECTED_BATCH to isSelectedBatch,
+      TelegramUploadWorker.KEY_UPLOAD_MODE to uploadMode.name,
     )
 
     val request = OneTimeWorkRequestBuilder<TelegramUploadWorker>()
@@ -1762,6 +1768,7 @@ class VaultRepository(
   suspend fun stopManualSync() {
     WorkManager.getInstance(context).cancelUniqueWork(TelegramUploadWorker.UNIQUE_WORK_NAME)
     settingsPreferences.clearSelectedUploadBatchIds()
+    settingsPreferences.clearActiveUploadBatchMode()
     mediaDao.resetInterruptedUploadsToQueued()
     tdLibManager.optimizeStorageLightweight()
     if (!tdLibManager.isAppInForeground()) {

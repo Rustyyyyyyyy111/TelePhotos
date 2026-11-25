@@ -20,6 +20,7 @@ import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import org.drinkless.tdlib.TdApi
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -279,5 +280,15 @@ class ExampleUnitTest {
       tempEmpty.delete()
       tempValid.delete()
     }
+  }
+
+  @Test
+  fun telegramUploadMode_fromWireName_resolvesModesAndDefaultsToAsFile() {
+    assertEquals(TelegramUploadMode.AS_FILE, TelegramUploadMode.fromWireName("AS_FILE"))
+    assertEquals(TelegramUploadMode.HD_MEDIA, TelegramUploadMode.fromWireName("HD_MEDIA"))
+    assertEquals(TelegramUploadMode.AS_FILE, TelegramUploadMode.fromWireName(null))
+    assertEquals(TelegramUploadMode.AS_FILE, TelegramUploadMode.fromWireName("UNKNOWN_MODE"))
+    assertTrue(TelegramUploadMode.AS_FILE.labelVi.contains("Send as File"))
+    assertTrue(TelegramUploadMode.HD_MEDIA.labelVi.contains("Send HD"))
   }
 }

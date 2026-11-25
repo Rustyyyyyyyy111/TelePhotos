@@ -1059,6 +1059,99 @@ class TdLibManager(
     existingPendingMessageId: Long? = null,
     onProgressMade: () -> Unit = {},
   ): SentDocumentResult {
+    val content = TdApi.InputMessageDocument().apply {
+      document = TdApi.InputFileLocal(localFilePath)
+      thumbnail = buildInputThumbnail(thumbnailPath, thumbnailWidth, thumbnailHeight)
+      this.caption = TdApi.FormattedText(caption, emptyArray())
+      disableContentTypeDetection = true
+    }
+    return sendMessageWithResume(
+      chatId = chatId,
+      messageThreadId = messageThreadId,
+      inputMessageContent = content,
+      existingPendingMessageId = existingPendingMessageId,
+      onProgressMade = onProgressMade,
+    )
+  }
+
+  /**
+   * Sends a photo or video as native high-quality Telegram media (InputMessagePhoto / InputMessageVideo)
+   * without client-side downscaling, supporting streaming for videos and preserving resume/no-duplicate semantics.
+   */
+  suspend fun sendMediaHd(
+    chatId: Long,
+    messageThreadId: Long?,
+    mediaType: MediaType,
+    localFilePath: String,
+    caption: String,
+    width: Int = 0,
+    height: Int = 0,
+    durationSec: Int = 0,
+    thumbnailPath: String? = null,
+    thumbnailWidth: Int = 0,
+    thumbnailHeight: Int = 0,
+    existingPendingMessageId: Long? = null,
+    onProgressMade: () -> Unit = {},
+  ): SentDocumentResult {
+    val thumb = buildInputThumbnail(thumbnailPath, thumbnailWidth, thumbnailHeight)
+    val formattedCaption = TdApi.FormattedText(caption, emptyArray())
+    val content: TdApi.InputMessageContent = when (mediaType) {
+      MediaType.PHOTO -> TdApi.InputMessagePhoto().apply {
+        photo = TdApi.InputFileLocal(localFilePath)
+        thumbnail = thumb
+        addedStickerFileIds = intArrayOf()
+        this.width = width.coerceAtLeast(0)
+        this.height = height.coerceAtLeast(0)
+        this.caption = formattedCaption
+        showCaptionAboveMedia = false
+        selfDestructType = null
+        hasSpoiler = false
+      }
+      MediaType.VIDEO -> TdApi.InputMessageVideo().apply {
+        video = TdApi.InputFileLocal(localFilePath)
+        thumbnail = thumb
+        cover = null
+        startTimestamp = 0
+        addedStickerFileIds = intArrayOf()
+        this.duration = durationSec.coerceAtLeast(0)
+        this.width = width.coerceAtLeast(0)
+        this.height = height.coerceAtLeast(0)
+        supportsStreaming = true
+        this.caption = formattedCaption
+        showCaptionAboveMedia = false
+        selfDestructType = null
+        hasSpoiler = false
+      }
+    }
+    return sendMessageWithResume(
+      chatId = chatId,
+      messageThreadId = messageThreadId,
+      inputMessageContent = content,
+      existingPendingMessageId = existingPendingMessageId,
+      onProgressMade = onProgressMade,
+    )
+  }
+
+  private fun buildInputThumbnail(
+    thumbnailPath: String?,
+    thumbnailWidth: Int,
+    thumbnailHeight: Int,
+  ): TdApi.InputThumbnail? {
+    if (thumbnailPath.isNullOrBlank() || !File(thumbnailPath).exists()) return null
+    return TdApi.InputThumbnail(
+      TdApi.InputFileLocal(thumbnailPath),
+      thumbnailWidth.coerceAtLeast(0),
+      thumbnailHeight.coerceAtLeast(0),
+    )
+  }
+
+  private suspend fun sendMessageWithResume(
+    chatId: Long,
+    messageThreadId: Long?,
+    inputMessageContent: TdApi.InputMessageContent,
+    existingPendingMessageId: Long?,
+    onProgressMade: () -> Unit,
+  ): SentDocumentResult {
     if (!NetworkRetryPolicy.isNetworkAvailable(context) ||
       tdConnectionState is TdApi.ConnectionStateWaitingForNetwork
     ) {
@@ -1100,21 +1193,6 @@ class TdLibManager(
     }
 
     val initialMsg = targetPendingMsg ?: run {
-      val content = TdApi.InputMessageDocument().apply {
-        document = TdApi.InputFileLocal(localFilePath)
-        thumbnail = if (!thumbnailPath.isNullOrBlank() && File(thumbnailPath).exists()) {
-          TdApi.InputThumbnail(
-            TdApi.InputFileLocal(thumbnailPath),
-            thumbnailWidth.coerceAtLeast(0),
-            thumbnailHeight.coerceAtLeast(0),
-          )
-        } else {
-          null
-        }
-        this.caption = TdApi.FormattedText(caption, emptyArray())
-        disableContentTypeDetection = true
-      }
-
       val options = TdApi.MessageSendOptions().apply {
         disableNotification = true
         fromBackground = false
@@ -1126,7 +1204,7 @@ class TdLibManager(
           TdApi.MessageTopicForum(it.toInt())
         }
         this.options = options
-        this.inputMessageContent = content
+        this.inputMessageContent = inputMessageContent
       }
       sendFunction(req) as TdApi.Message
     }
@@ -1142,25 +1220,75 @@ class TdLibManager(
   }
 
   private fun messageToSentResult(msg: TdApi.Message): SentDocumentResult {
-    val doc = (msg.content as? TdApi.MessageDocument)?.document
     val resolvedTopicId = (msg.topicId as? TdApi.MessageTopicForum)?.forumTopicId?.toLong()
-    return SentDocumentResult(
-      chatId = msg.chatId,
-      messageId = msg.id,
-      fileId = doc?.document?.id,
-      remoteFileId = doc?.document?.remote?.id,
-      messageThreadId = resolvedTopicId,
-      thumbFileId = doc?.thumbnail?.file?.id,
-    )
+    return when (val content = msg.content) {
+      is TdApi.MessageDocument -> {
+        val doc = content.document
+        SentDocumentResult(
+          chatId = msg.chatId,
+          messageId = msg.id,
+          fileId = doc?.document?.id,
+          remoteFileId = doc?.document?.remote?.id,
+          messageThreadId = resolvedTopicId,
+          thumbFileId = doc?.thumbnail?.file?.id,
+        )
+      }
+      is TdApi.MessagePhoto -> {
+        val sizes = content.photo?.sizes
+        val largest = sizes?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        val compactThumb = sizes
+          ?.filter { maxOf(it.width, it.height) in 90..360 }
+          ?.minByOrNull { it.width.toLong() * it.height.toLong() }
+          ?: sizes?.minByOrNull { it.width.toLong() * it.height.toLong() }
+        SentDocumentResult(
+          chatId = msg.chatId,
+          messageId = msg.id,
+          fileId = largest?.photo?.id,
+          remoteFileId = largest?.photo?.remote?.id,
+          messageThreadId = resolvedTopicId,
+          thumbFileId = compactThumb?.photo?.id ?: largest?.photo?.id,
+        )
+      }
+      is TdApi.MessageVideo -> {
+        val video = content.video
+        SentDocumentResult(
+          chatId = msg.chatId,
+          messageId = msg.id,
+          fileId = video?.video?.id,
+          remoteFileId = video?.video?.remote?.id,
+          messageThreadId = resolvedTopicId,
+          thumbFileId = video?.thumbnail?.file?.id,
+        )
+      }
+      else -> SentDocumentResult(
+        chatId = msg.chatId,
+        messageId = msg.id,
+        fileId = null,
+        remoteFileId = null,
+        messageThreadId = resolvedTopicId,
+        thumbFileId = null,
+      )
+    }
+  }
+
+  private fun extractUploadProgressFile(msg: TdApi.Message): TdApi.File? {
+    return when (val content = msg.content) {
+      is TdApi.MessageDocument -> content.document?.document
+      is TdApi.MessagePhoto -> content.photo?.sizes
+        ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        ?.photo
+      is TdApi.MessageVideo -> content.video?.video
+      else -> null
+    }
   }
 
   private suspend fun awaitPendingMessageUpload(
     initialMsg: TdApi.Message,
     onProgressMade: () -> Unit,
   ): SentDocumentResult = coroutineScope {
-    val doc = (initialMsg.content as? TdApi.MessageDocument)?.document
-    val fileId = doc?.document?.id
-    var lastUploadedBytes = doc?.document?.remote?.uploadedSize ?: 0L
+    val uploadFile = extractUploadProgressFile(initialMsg)
+    val fileId = uploadFile?.id
+    var lastUploadedBytes = uploadFile?.remote?.uploadedSize ?: 0L
     var lastProgressAtMs = System.currentTimeMillis()
     val resultChannel = Channel<Result<SentDocumentResult>>(Channel.BUFFERED)
 

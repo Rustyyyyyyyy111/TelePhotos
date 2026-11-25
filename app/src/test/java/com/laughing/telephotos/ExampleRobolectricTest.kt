@@ -13,6 +13,7 @@ import com.laughing.telephotos.data.local.TelePhotosDatabase
 import com.laughing.telephotos.data.local.UploadStatus
 import com.laughing.telephotos.data.repository.VaultRepository
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -487,6 +488,24 @@ class ExampleRobolectricTest {
     } finally {
       prefs.clearSelectedUploadBatchIds()
       db.close()
+    }
+  }
+
+  @Test
+  fun `active upload batch mode persists and resets cleanly`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    val prefs = app.settingsPreferences
+    try {
+      prefs.clearActiveUploadBatchMode()
+      assertEquals(TelegramUploadMode.AS_FILE, prefs.getActiveUploadBatchMode())
+
+      prefs.setActiveUploadBatchMode(TelegramUploadMode.HD_MEDIA)
+      assertEquals(TelegramUploadMode.HD_MEDIA, prefs.getActiveUploadBatchMode())
+
+      prefs.clearActiveUploadBatchMode()
+      assertEquals(TelegramUploadMode.AS_FILE, prefs.getActiveUploadBatchMode())
+    } finally {
+      prefs.clearActiveUploadBatchMode()
     }
   }
 }

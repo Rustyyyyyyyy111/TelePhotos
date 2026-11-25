@@ -76,11 +76,18 @@ import com.laughing.telephotos.data.local.SyncTargetEntity
 import com.laughing.telephotos.data.repository.ManualSyncProgressState
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import com.laughing.telephotos.ui.components.ChronologicalMediaGrid
+import com.laughing.telephotos.ui.components.SyncUploadModeBottomSheet
 import com.laughing.telephotos.ui.components.TelePhotosGlassCard
 import com.laughing.telephotos.ui.theme.StatusUploadedGreen
 import com.laughing.telephotos.ui.theme.StatusWarningAmber
 import com.laughing.telephotos.ui.viewmodel.TimelineSection
+
+private enum class PhotoSyncPromptAction {
+  SELECTED_UPLOAD,
+  TAB_SYNC,
+}
 
 /**
  * "Ảnh" tab: displays PHOTOS ONLY (unified local MediaStore + Telegram "Ảnh" Topic).
@@ -106,20 +113,21 @@ fun TimelineScreen(
   onToggleDateGroup: (List<Long>) -> Unit,
   onClearSelection: () -> Unit,
   onImportPickedPhotos: (List<android.net.Uri>) -> Unit,
-  onUploadSelectedItems: () -> Unit,
+  onUploadSelectedItems: (TelegramUploadMode) -> Unit,
   onFreeUpSelectedSpace: () -> Unit,
   onMoveSelectedToTrash: () -> Unit,
   onAssignSelectedToAlbum: (Long) -> Unit,
   onStopManualSync: () -> Unit,
   onOpenTargetSelector: () -> Unit,
   onOpenTelegramAuth: () -> Unit,
-  onSyncTab: () -> Unit,
+  onSyncTab: (TelegramUploadMode) -> Unit,
   onGridColumnsChange: (Int) -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val isSelectionMode = selectedIds.isNotEmpty()
   val isLoggedIn = settings.isTelegramLoggedIn || authState is TelegramAuthState.Ready
   var showAlbumPickerDialog by remember { mutableStateOf(false) }
+  var pendingSyncAction by remember { mutableStateOf<PhotoSyncPromptAction?>(null) }
 
   if (isSelectionMode) {
     BackHandler { onClearSelection() }
@@ -172,7 +180,7 @@ fun TimelineScreen(
           },
           actions = {
             IconButton(
-              onClick = onUploadSelectedItems,
+              onClick = { pendingSyncAction = PhotoSyncPromptAction.SELECTED_UPLOAD },
               modifier = Modifier.testTag("upload_selected_button"),
             ) {
               Icon(Icons.Filled.CloudUpload, contentDescription = "Tải lên mục đã chọn")
@@ -259,7 +267,7 @@ fun TimelineScreen(
                   manualSyncProgress.isRunning -> onStopManualSync()
                   !isLoggedIn -> onOpenTelegramAuth()
                   lockedTarget == null -> onOpenTargetSelector()
-                  else -> onSyncTab()
+                  else -> pendingSyncAction = PhotoSyncPromptAction.TAB_SYNC
                 }
               },
               modifier = Modifier.testTag("timeline_sync_button"),
@@ -477,7 +485,7 @@ fun TimelineScreen(
               if (isLoggedIn && lockedTarget != null) {
                 Spacer(modifier = Modifier.height(8.dp))
                 OutlinedButton(
-                  onClick = onSyncTab,
+                  onClick = { pendingSyncAction = PhotoSyncPromptAction.TAB_SYNC },
                   modifier = Modifier.fillMaxWidth(),
                 ) {
                   Text("Đồng bộ ảnh với Telegram")
@@ -536,6 +544,29 @@ fun TimelineScreen(
         onAssignSelectedToAlbum(albumId)
         showAlbumPickerDialog = false
       },
+    )
+  }
+
+  pendingSyncAction?.let { action ->
+    val sheetTitle = when (action) {
+      PhotoSyncPromptAction.SELECTED_UPLOAD -> "Tải lên ${selectedIds.size} ảnh đã chọn"
+      PhotoSyncPromptAction.TAB_SYNC -> "Đồng bộ Ảnh lên Telegram"
+    }
+    val sheetSubtitle = when (action) {
+      PhotoSyncPromptAction.SELECTED_UPLOAD -> "Chọn định dạng tải lên cho các ảnh bạn đã chọn"
+      PhotoSyncPromptAction.TAB_SYNC -> "Chọn định dạng tải lên cho các ảnh chưa sao lưu"
+    }
+    SyncUploadModeBottomSheet(
+      title = sheetTitle,
+      subtitle = sheetSubtitle,
+      onSelectMode = { mode ->
+        pendingSyncAction = null
+        when (action) {
+          PhotoSyncPromptAction.SELECTED_UPLOAD -> onUploadSelectedItems(mode)
+          PhotoSyncPromptAction.TAB_SYNC -> onSyncTab(mode)
+        }
+      },
+      onDismiss = { pendingSyncAction = null },
     )
   }
 }

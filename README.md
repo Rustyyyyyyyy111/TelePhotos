@@ -10,8 +10,11 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
 
 ### Mục tiêu cốt lõi
 - Gộp danh sách ảnh (`Ảnh`) và video (`Video`) từ thiết bị (`MediaStore`) và lịch sử đã sao lưu trên Telegram (chống trùng lặp theo `localUri`, `(mediaType, fileName, sizeBytes)`, `(chatId, messageId)` và prefix SHA-256).
-- Tải lên thủ công theo hàng đợi tuần tự 1 luồng dưới dạng **Tệp gốc (`TdApi.InputMessageDocument`)** kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và caption tối giản 2 dòng (`🖼️/🎞️ <fileName>\n📅 dd/MM/yyyy HH:mm • #tele_anh [#h_<16hex>] [#trash]`), đọc kích thước/loại tệp/thời lượng/chủ đề trực tiếp từ đối tượng `MessageDocument`/`MessagePhoto`/`MessageVideo` của Telegram và vẫn tương thích ngược hoàn toàn với caption JSON `#tele_anh_meta` cũ.
-- Quét và hiển thị cả ảnh/video có sẵn từ trước trên nhóm/kênh Telegram (`TdApi.MessagePhoto`, `TdApi.MessageVideo`, `TdApi.MessageDocument` kể cả khi không có caption metadata) vào cả tab `Ảnh` và tab `Album` (bao gồm cả chủ đề Forum **«Ảnh»** và **«Video»** bên cạnh các Album tuỳ chỉnh).
+- Tải lên thủ công theo hàng đợi tuần tự 1 luồng với **menu chọn chế độ mỗi lần bấm Sync / Upload (`SyncUploadModeBottomSheet`)**:
+  - **Gửi dạng Tệp (`Send as File` — `TdApi.InputMessageDocument`, `disableContentTypeDetection = true`)**: giữ nguyên tệp gốc, không nén hay chuyển mã.
+  - **Gửi HD (`Send HD` — `TdApi.InputMessagePhoto` / `TdApi.InputMessageVideo` với `supportsStreaming = true`)**: gửi dưới dạng Ảnh/Video chất lượng cao theo kích thước thật (`MediaHashUtil.extractLocalMediaDimensions`), không hạ độ phân giải thấp.
+  - Cả hai chế độ đều đính kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và caption tối giản 2 dòng (`🖼️/🎞️ <fileName>\n📅 dd/MM/yyyy HH:mm • #tele_anh [#h_<16hex>] [#trash]`), đồng thời **giữ nguyên hoàn toàn luồng xem trực tuyến tệp `document` và xem ảnh/video thông thường** cho cả dữ liệu đã đồng bộ trước đó lẫn dữ liệu mới tải lên.
+- Quét và hiển thị cả ảnh/video có sẵn từ trước trên nhóm/kênh Telegram (`TdApi.MessagePhoto`, `TdApi.MessageVideo`, `TdApi.MessageDocument` kể cả khi không có caption metadata) vào cả tab `Ảnh`, tab `Video` và tab `Album` (bao gồm cả chủ đề Forum **«Ảnh»** và **«Video»** bên cạnh các Album tuỳ chỉnh).
 - Quản lý vòng đời kết nối **TDLib tái sử dụng theo Foreground/Background**: giữ một phiên `TdLibManager` duy nhất sống khi người dùng mở ứng dụng (loại bỏ chi phí kết nối lại liên tục), và tự động chạy `TdApi.OptimizeStorage` + `TdApi.Close()` khi ứng dụng chuyển sang chạy nền (sau khi mọi tác vụ/worker hoàn tất).
 - Tự phục hồi lỗi `File not found` sau khi bị force-close / kill khỏi Recents: xác thực trạng thái `Ready` của TDLib và dung lượng tệp vật lý trên đĩa (> 0 byte), tự động dọn handle cache lỗi (`TdApi.DeleteFile`), truy xuất lại tin nhắn Telegram (`GetMessage` / lịch sử Topic) hoặc `GetRemoteFile` để làm mới `fileId`, cập nhật Room và tải lại sạch sẽ.
 - Tối ưu hiệu năng cho máy cấu hình thấp (Dimensity giá rẻ), hỗ trợ chọn nhiều theo nhóm ngày kiểu Google Photos, zoom lưới tab `Ảnh` (`2–5` cột bằng chụm/mở 2 ngón hoặc nút chuyển mật độ), trình xem toàn màn hình hỗ trợ vuốt ngang theo đúng ngữ cảnh (`HorizontalPager`) kèm pinch-zoom / chạm đúp, reset trạng thái giao diện khi bị đóng hẳn khỏi Recents, và biểu tượng launcher 4 cánh chong chóng tối giản (hỗ trợ đổi 3 preset qua `<activity-alias>`).
@@ -62,15 +65,15 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
     │   │   │   ├── SyncTargetEntity.kt   # Bảng sync_targets lưu đích đã khoá + threadId 3 chủ đề lõi
     │   │   │   └── SyncTargetDao.kt      # Lưu/cập nhật đích đồng bộ
     │   │   ├── telegram/
-    │   │   │   ├── TdLibModels.kt        # Enum TelegramConnectionStatus, TdLibLifecycleState, FloodWaitState, FloodWaitException
+    │   │   │   ├── TdLibModels.kt        # Enum TelegramConnectionStatus, TdLibLifecycleState, TelegramUploadMode (AS_FILE / HD_MEDIA), FloodWaitState, FloodWaitException
     │   │   │   ├── TelegramPolicyGuard.kt# Chặn hàm Delete* trên Telegram, phân loại đích, tính buffer FLOOD_WAIT
-    │   │   │   └── TdLibManager.kt       # Quản lý client TDLib đơn lệ, single-flight recovery, in-flight map
+    │   │   │   └── TdLibManager.kt       # Quản lý client TDLib đơn lệ, single-flight recovery, in-flight map, sendDocumentOriginal & sendMediaHd
     │   │   └── repository/
     │   │       └── VaultRepository.kt    # Điều phối trung tâm Room <-> MediaStore <-> TdLibManager <-> WorkManager
     │   ├── worker/
-    │   │   └── TelegramUploadWorker.kt   # Worker upload tuần tự 1 luồng + xử lý FLOOD_WAIT động
+    │   │   └── TelegramUploadWorker.kt   # Worker upload tuần tự 1 luồng (AS_FILE / HD_MEDIA) + xử lý FLOOD_WAIT động
     │   └── ui/
-    │       ├── components/               # MediaGridComponents.kt, TelePhotosSurfaces.kt
+    │       ├── components/               # MediaGridComponents.kt, TelePhotosSurfaces.kt, SyncUploadModeBottomSheet.kt
     │       ├── navigation/TelePhotosApp.kt # Bottom Bar / NavigationRail + điều hướng 4 tab & sub-screens
     │       ├── screens/                  # TimelineScreen, VideosScreen, AlbumsScreen, TrashScreen, SyncStorageScreen, TargetSelectorScreen, TelegramAuthScreen, MediaViewerScreen
     │       ├── theme/                    # Color.kt, Theme.kt, Type.kt
@@ -103,7 +106,11 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
    - Nếu đích là Forum Group, `VaultRepository.resolveUploadDestination()` tự định tuyến: mục đã gán Album (`media.albumId`) -> ưu tiên `album.messageThreadId`; nếu chưa gán -> dùng **Đích tải lên mặc định** (`defaultUploadAlbumId` trong tab `Setting` nếu đã chọn); nếu để mặc định `0L` -> tự định tuyến ảnh vào topic **"Ảnh"** và video vào topic **"Video"** (tạo an toàn qua `topicMutexFor(chatId)` chuẩn hoá dấu tiếng Việt và tự tạo thẻ Album tương ứng để đếm `COUNT(DISTINCT m.id)` ngay lập tức trong tab `Album`).
    - `AlbumDao.observeAlbumsWithCount()` và `MediaDao.observeAlbumPhotos` / `observeAlbumVideos` hiển thị cả hai thẻ chủ đề **"Ảnh"** và **"Video"** bên cạnh các Album tuỳ chỉnh (chỉ ẩn **"Đã Xoá Gần Đây"** xuống thẻ footer thùng rác), khớp cả `albumId` lẫn `topicId`.
    - Nếu đích là Kênh/Nhóm thường (`!isForumEnabled`), `lockSyncTarget` / `syncAlbumsFromTelegram` tự tạo Album đại diện (`messageThreadId = 0L`) để hiển thị toàn bộ ảnh/video trên kênh/nhóm trong tab `Album`.
-   - `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) kèm `InputThumbnail` (`<= 320px`) và caption sạch tối đa 2 dòng từ `TelegramCaptionMetadata.buildCaption()` (không nhúng chuỗi JSON thô). Nếu upload bị rớt mạng giữa chừng, giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` khi thử lại để **không gửi trùng tin nhắn**.
+   - Khi chạm nút **Đồng bộ** (TopAppBar) hoặc biểu tượng **Tải lên** khi đang chọn nhiều mục ở tab `Ảnh` / `Video`, ứng dụng mở `SyncUploadModeBottomSheet` để chọn mới mỗi lần thao tác:
+     - **Gửi dạng Tệp (Send as File)** (`TelegramUploadMode.AS_FILE`): gọi `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) không nén, không chuyển mã; giữ nguyên hoàn toàn khả năng xem/đọc trực tuyến tệp `MessageDocument` qua `downloadMediaOnDemand` và `MediaViewerScreen`.
+     - **Gửi HD (Send HD)** (`TelegramUploadMode.HD_MEDIA`): đọc kích thước/xoay EXIF/thời lượng thật qua `MediaHashUtil.extractLocalMediaDimensions()` và gọi `TdLibManager.sendMediaHd()` gửi `TdApi.InputMessagePhoto` hoặc `TdApi.InputMessageVideo` (`supportsStreaming = true`) mà không hạ độ phân giải thấp; kết quả `MessagePhoto` / `MessageVideo` được parse đồng nhất qua `messageToSentResult()` / `extractFileFromMessage()` để xem ảnh/video bình thường.
+     - Cả hai chế độ đều đính kèm `InputThumbnail` (`<= 320px`) và caption sạch tối đa 2 dòng từ `TelegramCaptionMetadata.buildCaption()` (không nhúng chuỗi JSON thô), đồng thời giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` nếu rớt mạng để **không gửi trùng tin nhắn**.
+   - Chế độ đã chọn (`TelegramUploadMode`) được truyền qua `WorkManager` (`KEY_UPLOAD_MODE`) và lưu tạm trong `SettingsPreferences` (`ACTIVE_UPLOAD_BATCH_MODE`) để tự động giữ đúng chế độ nếu lô tải lên bị gián đoạn bởi `FLOOD_WAIT` dài.
    - Giữa các tệp tuần tự có độ trễ chống khoá tài khoản `2.0–3.5 giây` (`uploadPacingMs + random(0..1500ms)`).
 3. **Cô lập Chọn nhiều & Đồng bộ theo Đúng Lựa chọn (`Ảnh` vs `Video`):**
    - `TelePhotosViewModel` tách riêng trạng thái chọn theo từng loại media (`_selectedPhotoIds` cho tab `Ảnh`, `_selectedVideoIds` cho tab `Video`) và xoá sạch khi chuyển tab qua `clearAllSelections()`, tránh mọi trường hợp chọn nhầm chéo giữa ảnh và video.
@@ -170,7 +177,7 @@ Hệ thống tách bạch hoàn toàn hai cơ chế này:
 - **Cạm bẫy cần tránh:**
   - Không gọi `tdLibManager.closeConnectionIdle()` ngay sau mỗi tác vụ khi app đang ở foreground (`appInForeground == true`), vì sẽ phá vỡ kiến trúc phiên tái sử dụng.
   - Không bỏ kiểm tra `activity.isChangingConfigurations` trong `TelePhotosApplication` nếu không muốn xoay màn hình đóng nhầm TDLib.
-  - Không thay `InputMessageDocument` bằng `InputMessagePhoto`/`InputMessageVideo` vì Telegram sẽ nén giảm chất lượng ảnh/video gốc.
+  - Không bỏ `InputMessageDocument` cho chế độ **Gửi dạng Tệp (`AS_FILE`)**, và khi dùng `InputMessagePhoto`/`InputMessageVideo` cho **Gửi HD (`HD_MEDIA`)** phải giữ kích thước thật (`extractLocalMediaDimensions`) + `supportsStreaming = true` để tránh nén hạ chất lượng thấp; đồng thời giữ nguyên nhánh đọc `MessageDocument` / `MessagePhoto` / `MessageVideo` trong `extractFileFromMessage`, `refreshMediaSourceFromMessage` và `downloadMediaOnDemand` để không làm gãy trình xem trực tuyến.
   - Không để nhánh `selectedOnlyIds != null` trong `VaultRepository` rơi về `requeueAllPending()` khi rỗng hoặc không khớp `filterMediaType`, và không dùng chung một `StateFlow<Set<Long>>` cho cả tab `Ảnh` lẫn tab `Video`.
 
 ---

@@ -116,3 +116,14 @@ class FloodWaitException(
   val unlockAtEpochMs: Long,
   override val message: String,
 ) : Exception(message)
+
+enum class TelegramUploadMode(val labelVi: String) {
+  AS_FILE("Gửi dạng Tệp (Send as File)"),
+  HD_MEDIA("Gửi HD (Send HD)");
+
+  companion object {
+    fun fromWireName(raw: String?): TelegramUploadMode {
+      return entries.firstOrNull { it.name == raw } ?: AS_FILE
+    }
+  }
+}

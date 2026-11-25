@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -63,6 +64,7 @@ class SettingsPreferences(private val context: Context) {
     val TG_PHONE_NUMBER = stringPreferencesKey("tg_phone_number")
     val LAST_SYNC_STATUS_MSG = stringPreferencesKey("last_sync_status_msg")
     val SELECTED_UPLOAD_BATCH_IDS = stringPreferencesKey("selected_upload_batch_ids")
+    val ACTIVE_UPLOAD_BATCH_MODE = stringPreferencesKey("active_upload_batch_mode")
   }
 
   val settingsFlow: Flow<AppSettings> =
@@ -124,6 +126,23 @@ class SettingsPreferences(private val context: Context) {
     }
   }
 
+  suspend fun setActiveUploadBatchMode(mode: TelegramUploadMode) {
+    context.telePhotosDataStore.edit { prefs ->
+      prefs[Keys.ACTIVE_UPLOAD_BATCH_MODE] = mode.name
+    }
+  }
+
+  suspend fun getActiveUploadBatchMode(): TelegramUploadMode {
+    val raw = context.telePhotosDataStore.data.first()[Keys.ACTIVE_UPLOAD_BATCH_MODE]
+    return TelegramUploadMode.fromWireName(raw)
+  }
+
+  suspend fun clearActiveUploadBatchMode() {
+    context.telePhotosDataStore.edit { prefs ->
+      prefs.remove(Keys.ACTIVE_UPLOAD_BATCH_MODE)
+    }
+  }
+
   suspend fun saveApiCredentials(apiId: Int, apiHash: String) {
     context.telePhotosDataStore.edit { prefs ->
       prefs[Keys.CUSTOM_API_ID] = apiId
@@ -159,6 +178,7 @@ class SettingsPreferences(private val context: Context) {
       prefs.remove(Keys.TG_PHONE_NUMBER)
       prefs.remove(Keys.LAST_SYNC_STATUS_MSG)
       prefs.remove(Keys.SELECTED_UPLOAD_BATCH_IDS)
+      prefs.remove(Keys.ACTIVE_UPLOAD_BATCH_MODE)
     }
   }
 

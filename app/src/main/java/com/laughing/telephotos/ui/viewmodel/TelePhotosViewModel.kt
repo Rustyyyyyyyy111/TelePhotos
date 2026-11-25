@@ -29,6 +29,7 @@ import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
+import com.laughing.telephotos.data.telegram.TelegramUploadMode
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -373,7 +374,10 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun uploadSelectedItemsNow(mediaType: MediaType) {
+  fun uploadSelectedItemsNow(
+    mediaType: MediaType,
+    uploadMode: TelegramUploadMode = TelegramUploadMode.AS_FILE,
+  ) {
     val flow = selectionFlowFor(mediaType)
     val ids = flow.value.toList()
     if (ids.isEmpty()) {
@@ -381,11 +385,15 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       return
     }
     viewModelScope.launch {
-      repo.startManualUploadBatch(selectedOnlyIds = ids, filterMediaType = mediaType)
+      repo.startManualUploadBatch(
+        selectedOnlyIds = ids,
+        filterMediaType = mediaType,
+        uploadMode = uploadMode,
+      )
         .onSuccess { count ->
           flow.value = emptySet()
           val label = if (mediaType == MediaType.VIDEO) "video" else "ảnh"
-          _statusBanner.value = "Đang tải lên $count $label đã chọn"
+          _statusBanner.value = "Đang tải lên $count $label đã chọn • ${uploadMode.labelVi}"
         }
         .onFailure { err ->
           _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"
@@ -393,17 +401,24 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun startTabSync(mediaType: MediaType) {
+  fun startTabSync(
+    mediaType: MediaType,
+    uploadMode: TelegramUploadMode = TelegramUploadMode.AS_FILE,
+  ) {
     viewModelScope.launch {
       repo.syncDeviceMediaStore(
         scanPhotos = mediaType == MediaType.PHOTO,
         scanVideos = mediaType == MediaType.VIDEO,
       )
-      repo.startManualUploadBatch(selectedOnlyIds = null, filterMediaType = mediaType)
+      repo.startManualUploadBatch(
+        selectedOnlyIds = null,
+        filterMediaType = mediaType,
+        uploadMode = uploadMode,
+      )
         .onSuccess { count ->
           val label = if (mediaType == MediaType.VIDEO) "video" else "ảnh"
           _statusBanner.value = if (count > 0) {
-            "Đang tải lên $count $label chưa sao lưu"
+            "Đang tải lên $count $label chưa sao lưu • ${uploadMode.labelVi}"
           } else {
             "Đang đối chiếu $label với chủ đề Telegram..."
           }
@@ -414,12 +429,14 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
-  fun startManualUploadBatch() {
+  fun startManualUploadBatch(
+    uploadMode: TelegramUploadMode = TelegramUploadMode.AS_FILE,
+  ) {
     viewModelScope.launch {
       repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true)
-      repo.startManualUploadBatch(selectedOnlyIds = null)
+      repo.startManualUploadBatch(selectedOnlyIds = null, uploadMode = uploadMode)
         .onSuccess { count ->
-          _statusBanner.value = "Đang tải lên $count mục mới"
+          _statusBanner.value = "Đang tải lên $count mục mới • ${uploadMode.labelVi}"
         }
         .onFailure { err ->
           _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"

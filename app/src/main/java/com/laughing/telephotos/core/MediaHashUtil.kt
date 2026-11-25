@@ -34,6 +34,12 @@ data class ExtractedMediaMetadata(
   val takenAtEpochMs: Long,
 )
 
+data class LocalMediaDimensions(
+  val width: Int,
+  val height: Int,
+  val durationSec: Int = 0,
+)
+
 object MediaHashUtil {
 
   private const val SAMPLED_THRESHOLD_BYTES = 16L * 1024L * 1024L
@@ -326,6 +332,56 @@ object MediaHashUtil {
       }
       digest.digest().toHexString()
     }
+
+  suspend fun extractLocalMediaDimensions(
+    localFile: File,
+    mediaType: MediaType,
+  ): LocalMediaDimensions = withContext(Dispatchers.IO) {
+    if (!localFile.exists()) return@withContext LocalMediaDimensions(0, 0, 0)
+    if (mediaType == MediaType.VIDEO) {
+      val retriever = MediaMetadataRetriever()
+      return@withContext try {
+        retriever.setDataSource(localFile.absolutePath)
+        val rawW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+          ?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+        val rawH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+          ?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+        val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+          ?.toIntOrNull() ?: 0
+        val durMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+          ?.toLongOrNull() ?: 0L
+        val durSec = if (durMs > 0L) ((durMs + 500L) / 1000L).toInt().coerceAtLeast(1) else 0
+        val swapped = rotation == 90 || rotation == 270
+        LocalMediaDimensions(
+          width = if (swapped) rawH else rawW,
+          height = if (swapped) rawW else rawH,
+          durationSec = durSec,
+        )
+      } catch (_: Throwable) {
+        LocalMediaDimensions(0, 0, 0)
+      } finally {
+        runCatching { retriever.release() }
+      }
+    }
+
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(localFile.absolutePath, bounds)
+    val rawW = bounds.outWidth.coerceAtLeast(0)
+    val rawH = bounds.outHeight.coerceAtLeast(0)
+    val orientation = runCatching {
+      ExifInterface(localFile.absolutePath)
+        .getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+    val swapped = orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+      orientation == ExifInterface.ORIENTATION_ROTATE_270 ||
+      orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+      orientation == ExifInterface.ORIENTATION_TRANSVERSE
+    LocalMediaDimensions(
+      width = if (swapped) rawH else rawW,
+      height = if (swapped) rawW else rawH,
+      durationSec = 0,
+    )
+  }
 
   private fun ByteArray.toHexString(): String =
     joinToString(separator = "") { byte -> "%02x".format(byte) }
