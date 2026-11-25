@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PauseCircleFilled
 import androidx.compose.material.icons.filled.PermMedia
@@ -113,6 +114,7 @@ fun TimelineScreen(
   onOpenTargetSelector: () -> Unit,
   onOpenTelegramAuth: () -> Unit,
   onSyncTab: () -> Unit,
+  onGridColumnsChange: (Int) -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val isSelectionMode = selectedIds.isNotEmpty()
@@ -231,6 +233,26 @@ fun TimelineScreen(
             }
           },
           actions = {
+            val nextGridColumns = remember(settings.photoGridColumns) {
+              when (settings.photoGridColumns) {
+                2 -> 3
+                3 -> 4
+                4 -> 5
+                else -> 2
+              }
+            }
+            TextButton(
+              onClick = { onGridColumnsChange(nextGridColumns) },
+              modifier = Modifier.testTag("timeline_grid_density_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.GridView,
+                contentDescription = "Đổi số cột lưới ảnh (${settings.photoGridColumns} cột)",
+                modifier = Modifier.size(18.dp),
+              )
+              Spacer(modifier = Modifier.width(3.dp))
+              Text("${settings.photoGridColumns}")
+            }
             TextButton(
               onClick = {
                 when {
@@ -480,6 +502,8 @@ fun TimelineScreen(
             onToggleSelection(media.id)
           },
           onToggleDateGroup = onToggleDateGroup,
+          columnsCount = settings.photoGridColumns,
+          onPinchColumnsChange = onGridColumnsChange,
           modifier = Modifier.weight(1f),
         )
       }

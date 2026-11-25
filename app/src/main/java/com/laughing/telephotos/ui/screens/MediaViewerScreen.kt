@@ -4,6 +4,11 @@ import android.net.Uri
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +18,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -40,17 +47,28 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
@@ -72,12 +90,14 @@ import kotlinx.coroutines.launch
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MediaViewerScreen(
-  media: MediaEntity?,
+  mediaCollection: List<MediaEntity>,
+  initialMediaId: Long,
   onBack: () -> Unit,
   onMoveToTrash: (Long) -> Unit,
   onRestoreFromTrash: (Long) -> Unit,
-  onDownloadVideoOnDemand: (Int) -> Flow<FileDownloadProgress>,
+  onDownloadMediaOnDemand: (MediaEntity) -> Flow<FileDownloadProgress>,
   onSaveDownloadedVideoPath: (Long, String) -> Unit,
+  onClearStaleCachedPath: (Long) -> Unit = {},
   onSaveToDevice: (MediaEntity) -> Flow<SaveToDeviceProgress>,
   onFreeUpSpace: (Long) -> Unit,
   onNotifyMessage: (String) -> Unit,
@@ -88,11 +108,58 @@ fun MediaViewerScreen(
   var showInfoPanel by remember { mutableStateOf(false) }
   var showFreeUpConfirmDialog by remember { mutableStateOf(false) }
   var isSavingToDevice by remember { mutableStateOf(false) }
-  var saveProgressFraction by remember { mutableStateOf(0f) }
+  var saveProgressFraction by remember { mutableFloatStateOf(0f) }
   var saveProgressText by remember { mutableStateOf<String?>(null) }
+  var isCurrentPageZoomed by remember { mutableStateOf(false) }
 
-  val hasLocalDeviceCopy = remember(media?.id, media?.localUri) {
-    media != null && MediaStoreScanner.isLocalUriAccessible(context, media.localUri)
+  var hasSnappedToInitial by remember(initialMediaId) { mutableStateOf(false) }
+  var activeMediaId by remember(initialMediaId) { mutableLongStateOf(initialMediaId) }
+
+  val pagerState = rememberPagerState(
+    initialPage = 0,
+    pageCount = { mediaCollection.size },
+  )
+
+  LaunchedEffect(mediaCollection, initialMediaId) {
+    if (mediaCollection.isEmpty()) return@LaunchedEffect
+    if (!hasSnappedToInitial) {
+      val initialIdx = mediaCollection.indexOfFirst { it.id == initialMediaId }.coerceAtLeast(0)
+      pagerState.scrollToPage(initialIdx)
+      activeMediaId = mediaCollection[initialIdx].id
+      hasSnappedToInitial = true
+    } else {
+      val sameIdx = mediaCollection.indexOfFirst { it.id == activeMediaId }
+      if (sameIdx >= 0 && sameIdx != pagerState.currentPage && !pagerState.isScrollInProgress) {
+        pagerState.scrollToPage(sameIdx)
+      }
+    }
+  }
+
+  LaunchedEffect(pagerState.currentPage, mediaCollection) {
+    isCurrentPageZoomed = false
+    mediaCollection.getOrNull(pagerState.currentPage)?.let { item ->
+      if (hasSnappedToInitial) {
+        activeMediaId = item.id
+      }
+    }
+  }
+
+  val currentMedia = mediaCollection.getOrNull(pagerState.currentPage)
+  val hasLocalDeviceCopy = remember(currentMedia?.id, currentMedia?.localUri) {
+    currentMedia != null && MediaStoreScanner.isLocalUriAccessible(context, currentMedia.localUri)
+  }
+  val hasTelegramSource = remember(
+    currentMedia?.id,
+    currentMedia?.telegramFileId,
+    currentMedia?.telegramRemoteFileId,
+    currentMedia?.telegramChatId,
+    currentMedia?.telegramMessageId,
+  ) {
+    currentMedia != null && (
+      currentMedia.telegramFileId != null ||
+        !currentMedia.telegramRemoteFileId.isNullOrBlank() ||
+        (currentMedia.telegramChatId != null && currentMedia.telegramMessageId != null)
+      )
   }
 
   Box(
@@ -100,40 +167,43 @@ fun MediaViewerScreen(
       .fillMaxSize()
       .background(Color.Black),
   ) {
-    if (media == null) {
+    if (mediaCollection.isEmpty() || currentMedia == null) {
       CircularProgressIndicator(
         modifier = Modifier.align(Alignment.Center),
         color = Color.White,
       )
     } else {
-      if (media.mediaType == MediaType.VIDEO) {
-        OnDemandVideoPlayerContent(
-          media = media,
-          onDownloadVideoOnDemand = onDownloadVideoOnDemand,
-          onSaveDownloadedVideoPath = onSaveDownloadedVideoPath,
-          modifier = Modifier.fillMaxSize(),
-        )
-      } else {
-        val localFullPhotoModel = remember(media.id, media.localUri, media.cachedLocalVideoPath) {
-          val localReadable = media.localUri?.takeIf {
-            MediaStoreScanner.isLocalUriAccessible(context, it)
-          }
-          localReadable ?: media.cachedLocalVideoPath
-            ?.takeIf { it.isNotBlank() && File(it).exists() }
-            ?.let { File(it) }
-        }
-        if (localFullPhotoModel != null) {
-          AsyncImage(
-            model = localFullPhotoModel,
-            contentDescription = media.fileName,
-            contentScale = ContentScale.Fit,
+      HorizontalPager(
+        state = pagerState,
+        userScrollEnabled = !isCurrentPageZoomed,
+        key = { page -> mediaCollection[page].id },
+        modifier = Modifier
+          .fillMaxSize()
+          .testTag("media_viewer_pager"),
+      ) { page ->
+        val pageMedia = mediaCollection[page]
+        val isActivePage = page == pagerState.currentPage
+        if (pageMedia.mediaType == MediaType.VIDEO) {
+          OnDemandVideoPlayerContent(
+            media = pageMedia,
+            isActivePage = isActivePage,
+            onDownloadMediaOnDemand = onDownloadMediaOnDemand,
+            onSaveDownloadedVideoPath = onSaveDownloadedVideoPath,
+            onClearStaleCachedPath = onClearStaleCachedPath,
             modifier = Modifier.fillMaxSize(),
           )
         } else {
-          OnDemandPhotoDownloadFallback(
-            media = media,
-            onDownloadOnDemand = onDownloadVideoOnDemand,
+          PhotoViewerPage(
+            media = pageMedia,
+            isActivePage = isActivePage,
+            onZoomChanged = { zoomed ->
+              if (isActivePage) {
+                isCurrentPageZoomed = zoomed
+              }
+            },
+            onDownloadMediaOnDemand = onDownloadMediaOnDemand,
             onSaveDownloadedPath = onSaveDownloadedVideoPath,
+            onClearStaleCachedPath = onClearStaleCachedPath,
             modifier = Modifier.fillMaxSize(),
           )
         }
@@ -141,13 +211,22 @@ fun MediaViewerScreen(
 
       TopAppBar(
         title = {
-          Text(
-            text = media.fileName,
-            style = MaterialTheme.typography.titleSmall,
-            color = Color.White,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-          )
+          Column {
+            Text(
+              text = currentMedia.fileName,
+              style = MaterialTheme.typography.titleSmall,
+              color = Color.White,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+            )
+            if (mediaCollection.size > 1) {
+              Text(
+                text = "${pagerState.currentPage + 1}/${mediaCollection.size}",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White.copy(alpha = 0.72f),
+              )
+            }
+          }
         },
         navigationIcon = {
           IconButton(onClick = onBack, modifier = Modifier.testTag("viewer_back_button")) {
@@ -155,15 +234,16 @@ fun MediaViewerScreen(
           }
         },
         actions = {
-          if (!hasLocalDeviceCopy && media.telegramFileId != null) {
+          if (!hasLocalDeviceCopy && hasTelegramSource) {
             IconButton(
               enabled = !isSavingToDevice,
               onClick = {
+                val targetMedia = currentMedia
                 isSavingToDevice = true
                 saveProgressFraction = 0.05f
                 saveProgressText = "Đang tải tệp gốc về máy..."
                 coroutineScope.launch {
-                  onSaveToDevice(media)
+                  onSaveToDevice(targetMedia)
                     .catch { err ->
                       isSavingToDevice = false
                       saveProgressText = null
@@ -178,12 +258,12 @@ fun MediaViewerScreen(
                         is SaveToDeviceProgress.Completed -> {
                           isSavingToDevice = false
                           saveProgressText = null
-                          val folder = if (media.mediaType == MediaType.VIDEO) {
+                          val folder = if (targetMedia.mediaType == MediaType.VIDEO) {
                             "Movies/Tele Photos"
                           } else {
                             "Pictures/Tele Photos"
                           }
-                          onNotifyMessage("Đã lưu «${media.fileName}» vào $folder")
+                          onNotifyMessage("Đã lưu «${targetMedia.fileName}» vào $folder")
                         }
                       }
                     }
@@ -199,7 +279,7 @@ fun MediaViewerScreen(
             }
           }
 
-          if (hasLocalDeviceCopy && media.uploadStatus == UploadStatus.UPLOADED && !media.isTrashed) {
+          if (hasLocalDeviceCopy && currentMedia.uploadStatus == UploadStatus.UPLOADED && !currentMedia.isTrashed) {
             IconButton(
               onClick = { showFreeUpConfirmDialog = true },
               modifier = Modifier.testTag("viewer_free_up_space_button"),
@@ -219,11 +299,11 @@ fun MediaViewerScreen(
             Icon(Icons.Filled.Info, contentDescription = "Thông tin tệp", tint = Color.White)
           }
 
-          if (media.isTrashed) {
+          if (currentMedia.isTrashed) {
             IconButton(
               onClick = {
-                onRestoreFromTrash(media.id)
-                onBack()
+                onRestoreFromTrash(currentMedia.id)
+                if (mediaCollection.size <= 1) onBack()
               },
               modifier = Modifier.testTag("viewer_restore_button"),
             ) {
@@ -232,8 +312,8 @@ fun MediaViewerScreen(
           } else {
             IconButton(
               onClick = {
-                onMoveToTrash(media.id)
-                onBack()
+                onMoveToTrash(currentMedia.id)
+                if (mediaCollection.size <= 1) onBack()
               },
               modifier = Modifier.testTag("viewer_trash_button"),
             ) {
@@ -281,12 +361,12 @@ fun MediaViewerScreen(
             .testTag("viewer_metadata_panel"),
         ) {
           Column(modifier = Modifier.padding(20.dp)) {
-            Text(media.fileName, style = MaterialTheme.typography.titleMedium, color = Color.White)
+            Text(currentMedia.fileName, style = MaterialTheme.typography.titleMedium, color = Color.White)
             Spacer(modifier = Modifier.height(6.dp))
             val sourceLabel = when {
-              hasLocalDeviceCopy && media.uploadStatus == UploadStatus.UPLOADED ->
+              hasLocalDeviceCopy && currentMedia.uploadStatus == UploadStatus.UPLOADED ->
                 "Có bản trên máy & Telegram"
-              !hasLocalDeviceCopy && media.uploadStatus == UploadStatus.UPLOADED ->
+              !hasLocalDeviceCopy && currentMedia.uploadStatus == UploadStatus.UPLOADED ->
                 "Chỉ trực tuyến (Telegram)"
               else ->
                 "Chỉ có trên máy"
@@ -297,31 +377,31 @@ fun MediaViewerScreen(
               color = Color(0xFF4ADE80),
             )
             Text(
-              text = "Thời gian: ${Formatters.formatFullDateTime(media.takenAtEpochMs)}",
+              text = "Thời gian: ${Formatters.formatFullDateTime(currentMedia.takenAtEpochMs)}",
               style = MaterialTheme.typography.bodySmall,
               color = Color.White.copy(alpha = 0.8f),
             )
             Text(
-              text = "Dung lượng: ${Formatters.formatFileSize(media.sizeBytes)} • Trạng thái: ${media.uploadStatus.labelVi}",
+              text = "Dung lượng: ${Formatters.formatFileSize(currentMedia.sizeBytes)} • Trạng thái: ${currentMedia.uploadStatus.labelVi}",
               style = MaterialTheme.typography.bodySmall,
               color = Color.White.copy(alpha = 0.8f),
             )
             Text(
-              text = "SHA-256: ${media.contentHash.take(24)}...",
+              text = "SHA-256: ${currentMedia.contentHash.take(24)}...",
               style = MaterialTheme.typography.labelSmall,
               color = Color(0xFF38BDF8),
             )
-            if (media.telegramMessageId != null) {
+            if (currentMedia.telegramMessageId != null) {
               Text(
-                text = "Telegram Chat: ${media.telegramChatId} • Msg #${media.telegramMessageId} • Topic: ${media.topicId ?: "Chung"}",
+                text = "Telegram Chat: ${currentMedia.telegramChatId} • Msg #${currentMedia.telegramMessageId} • Topic: ${currentMedia.topicId ?: "Chung"}",
                 style = MaterialTheme.typography.labelSmall,
                 color = Color.White.copy(alpha = 0.7f),
               )
             }
-            if (media.isTrashed) {
+            if (currentMedia.isTrashed) {
               Spacer(modifier = Modifier.height(4.dp))
               Text(
-                text = "Trong Đã xóa gần đây • ${Formatters.formatRemainingTrashDays(media.trashedAtEpochMs)}",
+                text = "Trong Đã xóa gần đây • ${Formatters.formatRemainingTrashDays(currentMedia.trashedAtEpochMs)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = Color(0xFFFBBF24),
               )
@@ -336,7 +416,7 @@ fun MediaViewerScreen(
           title = { Text("Giải phóng dung lượng máy?") },
           text = {
             Text(
-              text = "Bản gốc trên bộ nhớ máy (${Formatters.formatFileSize(media.sizeBytes)}) sẽ bị xoá để tiết kiệm dung lượng. Bản sao lưu trên Telegram vẫn được giữ nguyên để bạn xem trực tuyến hoặc tải lại bất cứ lúc nào.",
+              text = "Bản gốc trên bộ nhớ máy (${Formatters.formatFileSize(currentMedia.sizeBytes)}) sẽ bị xoá để tiết kiệm dung lượng. Bản sao lưu trên Telegram vẫn được giữ nguyên để bạn xem trực tuyến hoặc tải lại bất cứ lúc nào.",
               style = MaterialTheme.typography.bodyMedium,
             )
           },
@@ -344,7 +424,7 @@ fun MediaViewerScreen(
             Button(
               onClick = {
                 showFreeUpConfirmDialog = false
-                onFreeUpSpace(media.id)
+                onFreeUpSpace(currentMedia.id)
               },
               modifier = Modifier.testTag("confirm_viewer_free_up_button"),
             ) {
@@ -363,41 +443,208 @@ fun MediaViewerScreen(
 }
 
 @Composable
-private fun OnDemandVideoPlayerContent(
+private fun PhotoViewerPage(
   media: MediaEntity,
-  onDownloadVideoOnDemand: (Int) -> Flow<FileDownloadProgress>,
-  onSaveDownloadedVideoPath: (Long, String) -> Unit,
+  isActivePage: Boolean,
+  onZoomChanged: (Boolean) -> Unit,
+  onDownloadMediaOnDemand: (MediaEntity) -> Flow<FileDownloadProgress>,
+  onSaveDownloadedPath: (Long, String) -> Unit,
+  onClearStaleCachedPath: (Long) -> Unit,
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
-  val existingLocalUri = remember(media.id, media.localUri, media.cachedLocalVideoPath) {
+  val hasUsableCache = remember(media.id, media.cachedLocalVideoPath) {
+    MediaStoreScanner.isUsableLocalFile(media.cachedLocalVideoPath)
+  }
+
+  LaunchedEffect(media.id, media.cachedLocalVideoPath) {
+    if (!media.cachedLocalVideoPath.isNullOrBlank() && !hasUsableCache) {
+      onClearStaleCachedPath(media.id)
+    }
+  }
+
+  val localFullPhotoModel = remember(media.id, media.localUri, media.cachedLocalVideoPath, hasUsableCache) {
+    val localReadable = media.localUri?.takeIf {
+      MediaStoreScanner.isLocalUriAccessible(context, it)
+    }
+    localReadable ?: media.cachedLocalVideoPath
+      ?.takeIf { hasUsableCache }
+      ?.let { File(it) }
+  }
+
+  var localModelFailed by remember(media.id, localFullPhotoModel) { mutableStateOf(false) }
+
+  if (localFullPhotoModel != null && !localModelFailed) {
+    ZoomablePhotoBox(
+      isActivePage = isActivePage,
+      onZoomChanged = onZoomChanged,
+      modifier = modifier,
+    ) {
+      AsyncImage(
+        model = localFullPhotoModel,
+        contentDescription = media.fileName,
+        contentScale = ContentScale.Fit,
+        onError = {
+          localModelFailed = true
+          if (!media.cachedLocalVideoPath.isNullOrBlank()) {
+            onClearStaleCachedPath(media.id)
+          }
+        },
+        modifier = Modifier.fillMaxSize(),
+      )
+    }
+  } else {
+    OnDemandPhotoDownloadFallback(
+      media = media,
+      isActivePage = isActivePage,
+      onZoomChanged = onZoomChanged,
+      onDownloadOnDemand = onDownloadMediaOnDemand,
+      onSaveDownloadedPath = onSaveDownloadedPath,
+      onClearStaleCachedPath = onClearStaleCachedPath,
+      modifier = modifier,
+    )
+  }
+}
+
+@Composable
+private fun ZoomablePhotoBox(
+  isActivePage: Boolean,
+  onZoomChanged: (Boolean) -> Unit,
+  modifier: Modifier = Modifier,
+  content: @Composable () -> Unit,
+) {
+  var scale by remember { mutableFloatStateOf(1f) }
+  var offset by remember { mutableStateOf(Offset.Zero) }
+  var containerSize by remember { mutableStateOf(IntSize.Zero) }
+  val latestOnZoomChanged by rememberUpdatedState(onZoomChanged)
+
+  LaunchedEffect(isActivePage) {
+    if (!isActivePage) {
+      scale = 1f
+      offset = Offset.Zero
+      latestOnZoomChanged(false)
+    }
+  }
+
+  LaunchedEffect(scale, isActivePage) {
+    if (isActivePage) {
+      latestOnZoomChanged(scale > 1.02f)
+    }
+  }
+
+  Box(
+    modifier = modifier
+      .fillMaxSize()
+      .onSizeChanged { containerSize = it }
+      .pointerInput(Unit) {
+        detectTapGestures(
+          onDoubleTap = {
+            if (scale > 1.02f) {
+              scale = 1f
+              offset = Offset.Zero
+            } else {
+              scale = 2.5f
+            }
+          }
+        )
+      }
+      .pointerInput(Unit) {
+        awaitEachGesture {
+          awaitFirstDown(requireUnconsumed = false)
+          do {
+            val event = awaitPointerEvent()
+            val pressedCount = event.changes.count { it.pressed }
+            val zoomChange = event.calculateZoom()
+            val panChange = event.calculatePan()
+            val handleTransform = pressedCount >= 2 || scale > 1.02f
+            if (handleTransform) {
+              val nextScale = (scale * zoomChange).coerceIn(1f, 4f)
+              val nextOffset = if (nextScale <= 1.02f) {
+                Offset.Zero
+              } else {
+                val maxX = ((containerSize.width * (nextScale - 1f)) / 2f).coerceAtLeast(0f)
+                val maxY = ((containerSize.height * (nextScale - 1f)) / 2f).coerceAtLeast(0f)
+                Offset(
+                  x = (offset.x + panChange.x).coerceIn(-maxX, maxX),
+                  y = (offset.y + panChange.y).coerceIn(-maxY, maxY),
+                )
+              }
+              scale = nextScale
+              offset = nextOffset
+              event.changes.forEach { if (it.positionChanged()) it.consume() }
+            }
+          } while (event.changes.any { it.pressed })
+        }
+      }
+      .graphicsLayer {
+        scaleX = scale
+        scaleY = scale
+        translationX = offset.x
+        translationY = offset.y
+      },
+    contentAlignment = Alignment.Center,
+  ) {
+    content()
+  }
+}
+
+@Composable
+private fun OnDemandVideoPlayerContent(
+  media: MediaEntity,
+  isActivePage: Boolean,
+  onDownloadMediaOnDemand: (MediaEntity) -> Flow<FileDownloadProgress>,
+  onSaveDownloadedVideoPath: (Long, String) -> Unit,
+  onClearStaleCachedPath: (Long) -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  val context = LocalContext.current
+  val hasUsableCache = remember(media.id, media.cachedLocalVideoPath) {
+    MediaStoreScanner.isUsableLocalFile(media.cachedLocalVideoPath)
+  }
+  LaunchedEffect(media.id, media.cachedLocalVideoPath) {
+    if (!media.cachedLocalVideoPath.isNullOrBlank() && !hasUsableCache) {
+      onClearStaleCachedPath(media.id)
+    }
+  }
+
+  val existingLocalUri = remember(media.id, media.localUri, media.cachedLocalVideoPath, hasUsableCache) {
     val localReadableUri = media.localUri?.takeIf {
       MediaStoreScanner.isLocalUriAccessible(context, it)
     }?.let { Uri.parse(it) }
     localReadableUri ?: media.cachedLocalVideoPath
-      ?.takeIf { it.isNotBlank() && File(it).exists() }
+      ?.takeIf { hasUsableCache }
       ?.let { Uri.fromFile(File(it)) }
   }
 
   var playableUri by remember(media.id) { mutableStateOf(existingLocalUri) }
   var downloadProgress by remember(media.id) { mutableStateOf<FileDownloadProgress?>(null) }
   var downloadError by remember(media.id) { mutableStateOf<String?>(null) }
-  var retryTrigger by remember { mutableStateOf(0) }
+  var retryTrigger by remember(media.id) { mutableIntStateOf(0) }
 
   LaunchedEffect(media.id, existingLocalUri, retryTrigger) {
     if (existingLocalUri != null) {
       playableUri = existingLocalUri
+      downloadError = null
       return@LaunchedEffect
     }
-    if (playableUri == null && media.telegramFileId != null) {
+    val hasSource = media.telegramFileId != null ||
+      !media.telegramRemoteFileId.isNullOrBlank() ||
+      (media.telegramChatId != null && media.telegramMessageId != null)
+    if (!hasSource) {
+      downloadError = "Không tìm thấy tệp video trên máy hoặc Telegram"
+      return@LaunchedEffect
+    }
+    if (playableUri == null) {
       downloadError = null
-      onDownloadVideoOnDemand(media.telegramFileId)
+      downloadProgress = null
+      onDownloadMediaOnDemand(media)
         .catch { err -> downloadError = err.message ?: "Không thể tải video từ Telegram" }
         .collect { progress ->
           downloadProgress = progress
-          if (progress.isCompleted && !progress.localPath.isNullOrBlank()) {
-            onSaveDownloadedVideoPath(media.id, progress.localPath)
-            playableUri = Uri.fromFile(File(progress.localPath))
+          if (progress.isCompleted && MediaStoreScanner.isUsableLocalFile(progress.localPath)) {
+            val validPath = progress.localPath!!
+            onSaveDownloadedVideoPath(media.id, validPath)
+            playableUri = Uri.fromFile(File(validPath))
           }
         }
     }
@@ -408,10 +655,11 @@ private fun OnDemandVideoPlayerContent(
     if (activeUri != null) {
       Media3ExoPlayerBox(
         uri = activeUri,
+        playWhenActive = isActivePage,
         modifier = Modifier.fillMaxSize(),
       )
     } else {
-      val previewThumb = media.cachedThumbPath?.takeIf { it.isNotBlank() && File(it).exists() }
+      val previewThumb = media.cachedThumbPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }
       if (previewThumb != null) {
         AsyncImage(
           model = File(previewThumb),
@@ -426,16 +674,24 @@ private fun OnDemandVideoPlayerContent(
         Column(
           horizontalAlignment = Alignment.CenterHorizontally,
           modifier = Modifier
-            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(24.dp)
+            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
             .padding(24.dp),
         ) {
           Text(
             text = downloadError ?: "Lỗi tải video",
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White,
+            textAlign = TextAlign.Center,
           )
           Spacer(modifier = Modifier.height(12.dp))
-          Button(onClick = { retryTrigger++ }) {
+          Button(
+            onClick = {
+              playableUri = null
+              retryTrigger++
+            },
+            modifier = Modifier.testTag("viewer_retry_download_button"),
+          ) {
             Text("Thử tải lại")
           }
         }
@@ -460,6 +716,7 @@ private fun OnDemandVideoPlayerContent(
             text = downloadProgress?.statusMessageVi ?: "Đang tải video gốc từ Telegram... $pct%",
             style = MaterialTheme.typography.titleSmall,
             color = Color.White,
+            textAlign = TextAlign.Center,
           )
           Spacer(modifier = Modifier.height(10.dp))
           LinearProgressIndicator(
@@ -483,6 +740,7 @@ private fun OnDemandVideoPlayerContent(
 @Composable
 private fun Media3ExoPlayerBox(
   uri: Uri,
+  playWhenActive: Boolean,
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
@@ -490,7 +748,15 @@ private fun Media3ExoPlayerBox(
     ExoPlayer.Builder(context).build().apply {
       setMediaItem(MediaItem.fromUri(uri))
       prepare()
-      playWhenReady = true
+      playWhenReady = playWhenActive
+    }
+  }
+
+  LaunchedEffect(exoPlayer, playWhenActive) {
+    if (!playWhenActive) {
+      exoPlayer.pause()
+    } else if (!exoPlayer.isPlaying) {
+      exoPlayer.playWhenReady = true
     }
   }
 
@@ -525,45 +791,67 @@ private fun Media3ExoPlayerBox(
 @Composable
 private fun OnDemandPhotoDownloadFallback(
   media: MediaEntity,
-  onDownloadOnDemand: (Int) -> Flow<FileDownloadProgress>,
+  isActivePage: Boolean,
+  onZoomChanged: (Boolean) -> Unit,
+  onDownloadOnDemand: (MediaEntity) -> Flow<FileDownloadProgress>,
   onSaveDownloadedPath: (Long, String) -> Unit,
+  onClearStaleCachedPath: (Long) -> Unit,
   modifier: Modifier = Modifier,
 ) {
   var localPath by remember(media.id) { mutableStateOf<String?>(null) }
-  var progressFraction by remember(media.id) { mutableStateOf(0f) }
+  var progressFraction by remember(media.id) { mutableFloatStateOf(0f) }
   var statusMessage by remember(media.id) { mutableStateOf<String?>(null) }
   var downloadError by remember(media.id) { mutableStateOf<String?>(null) }
-  var retryTrigger by remember { mutableStateOf(0) }
+  var retryTrigger by remember(media.id) { mutableIntStateOf(0) }
 
   LaunchedEffect(media.id, retryTrigger) {
-    val fileId = media.telegramFileId ?: return@LaunchedEffect
+    val hasSource = media.telegramFileId != null ||
+      !media.telegramRemoteFileId.isNullOrBlank() ||
+      (media.telegramChatId != null && media.telegramMessageId != null)
+    if (!hasSource) {
+      downloadError = "Không tìm thấy tệp ảnh trên máy hoặc Telegram"
+      return@LaunchedEffect
+    }
     downloadError = null
     statusMessage = null
-    onDownloadOnDemand(fileId)
+    localPath = null
+    onDownloadOnDemand(media)
       .catch { err ->
         downloadError = err.message ?: "Không thể tải ảnh từ Telegram"
       }
       .collect { prog ->
         progressFraction = prog.fraction
         statusMessage = prog.statusMessageVi
-        if (prog.isCompleted && !prog.localPath.isNullOrBlank()) {
-          onSaveDownloadedPath(media.id, prog.localPath)
-          localPath = prog.localPath
+        if (prog.isCompleted && MediaStoreScanner.isUsableLocalFile(prog.localPath)) {
+          val validPath = prog.localPath!!
+          onSaveDownloadedPath(media.id, validPath)
+          localPath = validPath
         }
       }
   }
 
   Box(modifier = modifier, contentAlignment = Alignment.Center) {
-    val path = localPath
+    val path = localPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }
     if (path != null) {
-      AsyncImage(
-        model = File(path),
-        contentDescription = media.fileName,
-        contentScale = ContentScale.Fit,
+      ZoomablePhotoBox(
+        isActivePage = isActivePage,
+        onZoomChanged = onZoomChanged,
         modifier = Modifier.fillMaxSize(),
-      )
+      ) {
+        AsyncImage(
+          model = File(path),
+          contentDescription = media.fileName,
+          contentScale = ContentScale.Fit,
+          onError = {
+            localPath = null
+            onClearStaleCachedPath(media.id)
+            downloadError = "Tệp ảnh bộ nhớ đệm không hợp lệ"
+          },
+          modifier = Modifier.fillMaxSize(),
+        )
+      }
     } else {
-      val previewThumb = media.cachedThumbPath?.takeIf { it.isNotBlank() && File(it).exists() }
+      val previewThumb = media.cachedThumbPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }
       if (previewThumb != null) {
         AsyncImage(
           model = File(previewThumb),
@@ -578,16 +866,21 @@ private fun OnDemandPhotoDownloadFallback(
         Column(
           horizontalAlignment = Alignment.CenterHorizontally,
           modifier = Modifier
-            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(24.dp)
+            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
             .padding(24.dp),
         ) {
           Text(
             text = downloadError ?: "Không thể tải ảnh từ Telegram",
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White,
+            textAlign = TextAlign.Center,
           )
           Spacer(modifier = Modifier.height(12.dp))
-          Button(onClick = { retryTrigger++ }) {
+          Button(
+            onClick = { retryTrigger++ },
+            modifier = Modifier.testTag("viewer_retry_download_button"),
+          ) {
             Text("Thử tải lại")
           }
         }
@@ -605,6 +898,7 @@ private fun OnDemandPhotoDownloadFallback(
             text = statusMessage ?: "Đang tải ảnh gốc từ Telegram...",
             style = MaterialTheme.typography.bodySmall,
             color = Color.White,
+            textAlign = TextAlign.Center,
           )
         }
       }

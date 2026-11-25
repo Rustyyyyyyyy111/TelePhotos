@@ -17,10 +17,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Cached
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.CollectionsBookmark
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
@@ -40,6 +42,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -62,10 +65,9 @@ import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.CacheCleanupManager
 import com.laughing.telephotos.core.Formatters
 import com.laughing.telephotos.core.ThemeMode
-import com.laughing.telephotos.data.local.MediaEntity
+import com.laughing.telephotos.data.local.AlbumWithCount
 import com.laughing.telephotos.data.local.StorageStats
 import com.laughing.telephotos.data.local.SyncTargetEntity
-import com.laughing.telephotos.data.local.UploadStatus
 import com.laughing.telephotos.data.repository.ManualSyncProgressState
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
@@ -81,8 +83,8 @@ fun SyncStorageScreen(
   authState: TelegramAuthState,
   connectionStatus: TelegramConnectionStatus,
   lockedTarget: SyncTargetEntity?,
+  albums: List<AlbumWithCount>,
   storageStats: StorageStats,
-  uploadQueue: List<MediaEntity>,
   floodWaitRemainingSec: Long,
   manualSyncProgress: ManualSyncProgressState,
   cacheSizeBytes: Long,
@@ -91,6 +93,7 @@ fun SyncStorageScreen(
   onSelectAppIconPreset: (AppIconPreset) -> Unit = {},
   onToggleAdvancedBlur: (Boolean) -> Unit,
   onToggleWifiOnly: (Boolean) -> Unit,
+  onSelectDefaultUploadAlbum: (Long) -> Unit = {},
   onOpenTelegramAuth: () -> Unit,
   onSwitchApiCredentials: () -> Unit,
   onOpenTargetSelector: () -> Unit,
@@ -104,6 +107,12 @@ fun SyncStorageScreen(
 ) {
   val isLoggedIn = settings.isTelegramLoggedIn || authState is TelegramAuthState.Ready
   var showFreeUpAllDialog by remember { mutableStateOf(false) }
+  var showDefaultDestDialog by remember { mutableStateOf(false) }
+
+  val selectedDefaultAlbum = remember(albums, settings.defaultUploadAlbumId) {
+    if (settings.defaultUploadAlbumId <= 0L) null
+    else albums.firstOrNull { it.id == settings.defaultUploadAlbumId }
+  }
 
   LaunchedEffect(Unit) {
     onRefreshCacheSize()
@@ -332,6 +341,43 @@ fun SyncStorageScreen(
               Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(16.dp))
               Spacer(modifier = Modifier.width(6.dp))
               Text("Đổi khoá API")
+            }
+            if (lockedTarget != null) {
+              Spacer(modifier = Modifier.height(12.dp))
+              Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+              ) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  modifier = Modifier.weight(1f).padding(end = 8.dp),
+                ) {
+                  Icon(
+                    imageVector = Icons.Filled.CollectionsBookmark,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.size(18.dp),
+                  )
+                  Spacer(modifier = Modifier.width(8.dp))
+                  Column {
+                    Text("Đích tải lên mặc định", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                      text = selectedDefaultAlbum?.title ?: "Tự động theo Ảnh / Video",
+                      style = MaterialTheme.typography.bodySmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                  }
+                }
+                OutlinedButton(
+                  onClick = { showDefaultDestDialog = true },
+                  modifier = Modifier.testTag("setting_default_destination_button"),
+                ) {
+                  Text("Chọn")
+                }
+              }
             }
           }
         }
@@ -597,54 +643,92 @@ fun SyncStorageScreen(
         }
       }
 
-      // 7. Manual Upload Queue Items
-      if (uploadQueue.isNotEmpty()) {
-        item(key = "queue_header") {
-          Text(
-            text = "Hàng đợi chờ đồng bộ (${uploadQueue.size})",
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.padding(top = 4.dp),
-          )
-        }
-        items(uploadQueue, key = { "q_${it.id}" }) { item ->
-          TelePhotosGlassCard(
-            shape = RoundedCornerShape(14.dp),
-            modifier = Modifier.fillMaxWidth(),
-          ) {
-            Row(
-              modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.SpaceBetween,
+      // Pending upload queue item list intentionally omitted from Setting;
+      // numeric metrics ("Đang chờ") remain in the summary card above.
+    }
+  }
+
+  if (showDefaultDestDialog) {
+    AlertDialog(
+      onDismissRequest = { showDefaultDestDialog = false },
+      title = { Text("Đích tải lên mặc định") },
+      text = {
+        LazyColumn(
+          verticalArrangement = Arrangement.spacedBy(6.dp),
+          contentPadding = PaddingValues(vertical = 4.dp),
+        ) {
+          item(key = "dest_auto_default") {
+            val selected = selectedDefaultAlbum == null
+            Surface(
+              onClick = {
+                onSelectDefaultUploadAlbum(0L)
+                showDefaultDestDialog = false
+              },
+              shape = RoundedCornerShape(12.dp),
+              color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+              modifier = Modifier.testTag("default_dest_auto"),
             ) {
-              Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                Text(
-                  text = item.fileName,
-                  style = MaterialTheme.typography.titleSmall,
-                  maxLines = 1,
-                  overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                  text = item.lastError ?: "${Formatters.formatFileSize(item.sizeBytes)} • SHA-256 ${
-                    item.contentHash.take(10)
-                  }",
-                  style = MaterialTheme.typography.bodySmall,
-                  color = if (item.uploadStatus == UploadStatus.FAILED) StatusErrorRed else MaterialTheme.colorScheme.onSurfaceVariant,
-                  maxLines = 1,
-                  overflow = TextOverflow.Ellipsis,
-                )
+              Row(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .padding(horizontal = 14.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+              ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                  Text("Tự động theo Ảnh / Video", style = MaterialTheme.typography.titleSmall)
+                  Text(
+                    text = "Ảnh vào chủ đề «Ảnh», video vào chủ đề «Video»",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                if (selected) {
+                  Icon(Icons.Filled.Check, contentDescription = "Đang chọn", tint = MaterialTheme.colorScheme.primary)
+                }
               }
-              Text(
-                text = item.uploadStatus.labelVi,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-              )
+            }
+          }
+          items(albums, key = { "dest_${it.id}" }) { album ->
+            val selected = selectedDefaultAlbum?.id == album.id
+            Surface(
+              onClick = {
+                onSelectDefaultUploadAlbum(album.id)
+                showDefaultDestDialog = false
+              },
+              shape = RoundedCornerShape(12.dp),
+              color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+              modifier = Modifier.testTag("default_dest_album_${album.id}"),
+            ) {
+              Row(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .padding(horizontal = 14.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+              ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                  Text(album.title, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Text(
+                    text = "${album.itemCount} ảnh & video",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                if (selected) {
+                  Icon(Icons.Filled.Check, contentDescription = "Đang chọn", tint = MaterialTheme.colorScheme.primary)
+                }
+              }
             }
           }
         }
-      }
-    }
+      },
+      confirmButton = {
+        TextButton(onClick = { showDefaultDestDialog = false }) {
+          Text("Đóng")
+        }
+      },
+    )
   }
 
   if (showFreeUpAllDialog) {

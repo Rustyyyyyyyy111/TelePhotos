@@ -23,6 +23,8 @@ data class AppSettings(
   val appIconPreset: AppIconPreset = AppIconPreset.DEFAULT,
   val wifiOnlyUpload: Boolean = true,
   val uploadPacingMs: Long = 2000L,
+  val photoGridColumns: Int = 3,
+  val defaultUploadAlbumId: Long = 0L,
   val floodWaitUntilEpochMs: Long = 0L,
   val floodWaitRetryAfterSec: Int = 0,
   val floodWaitReason: String? = null,
@@ -47,6 +49,8 @@ class SettingsPreferences(private val context: Context) {
     val APP_ICON_PRESET = stringPreferencesKey("app_icon_preset")
     val WIFI_ONLY = booleanPreferencesKey("wifi_only_upload")
     val UPLOAD_PACING_MS = longPreferencesKey("upload_pacing_ms")
+    val PHOTO_GRID_COLUMNS = intPreferencesKey("photo_grid_columns")
+    val DEFAULT_UPLOAD_ALBUM_ID = longPreferencesKey("default_upload_album_id")
     val FLOOD_WAIT_UNTIL = longPreferencesKey("flood_wait_until_epoch_ms")
     val FLOOD_WAIT_RETRY_SEC = intPreferencesKey("flood_wait_retry_after_sec")
     val FLOOD_WAIT_REASON = stringPreferencesKey("flood_wait_reason")
@@ -68,12 +72,15 @@ class SettingsPreferences(private val context: Context) {
       val iconName = prefs[Keys.APP_ICON_PRESET] ?: AppIconPreset.DEFAULT.name
       val appIconPreset =
         AppIconPreset.entries.firstOrNull { it.name == iconName } ?: AppIconPreset.DEFAULT
+      val storedCols = prefs[Keys.PHOTO_GRID_COLUMNS] ?: 3
       AppSettings(
         themeMode = themeMode,
         advancedBlurEnabled = prefs[Keys.ADVANCED_BLUR] ?: false,
         appIconPreset = appIconPreset,
         wifiOnlyUpload = prefs[Keys.WIFI_ONLY] ?: true,
         uploadPacingMs = prefs[Keys.UPLOAD_PACING_MS] ?: 2000L,
+        photoGridColumns = storedCols.coerceIn(MIN_PHOTO_GRID_COLUMNS, MAX_PHOTO_GRID_COLUMNS),
+        defaultUploadAlbumId = (prefs[Keys.DEFAULT_UPLOAD_ALBUM_ID] ?: 0L).coerceAtLeast(0L),
         floodWaitUntilEpochMs = prefs[Keys.FLOOD_WAIT_UNTIL] ?: 0L,
         floodWaitRetryAfterSec = prefs[Keys.FLOOD_WAIT_RETRY_SEC] ?: 0,
         floodWaitReason = prefs[Keys.FLOOD_WAIT_REASON],
@@ -163,6 +170,19 @@ class SettingsPreferences(private val context: Context) {
     }
   }
 
+  suspend fun setPhotoGridColumns(columns: Int) {
+    val clamped = clampPhotoGridColumns(columns)
+    context.telePhotosDataStore.edit { prefs ->
+      prefs[Keys.PHOTO_GRID_COLUMNS] = clamped
+    }
+  }
+
+  suspend fun setDefaultUploadAlbumId(albumId: Long) {
+    context.telePhotosDataStore.edit { prefs ->
+      prefs[Keys.DEFAULT_UPLOAD_ALBUM_ID] = albumId.coerceAtLeast(0L)
+    }
+  }
+
   suspend fun setFloodWaitUntil(
     untilEpochMs: Long,
     reason: String?,
@@ -191,5 +211,13 @@ class SettingsPreferences(private val context: Context) {
     context.telePhotosDataStore.edit { prefs ->
       prefs[Keys.LAST_HISTORY_SYNC] = epochMs
     }
+  }
+
+  companion object {
+    const val MIN_PHOTO_GRID_COLUMNS = 2
+    const val MAX_PHOTO_GRID_COLUMNS = 5
+
+    fun clampPhotoGridColumns(columns: Int): Int =
+      columns.coerceIn(MIN_PHOTO_GRID_COLUMNS, MAX_PHOTO_GRID_COLUMNS)
   }
 }

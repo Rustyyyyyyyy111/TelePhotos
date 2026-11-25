@@ -5,6 +5,7 @@ import android.os.Build
 import com.laughing.telephotos.BuildConfig
 import com.laughing.telephotos.core.CacheCleanupManager
 import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.MediaStoreScanner
 import com.laughing.telephotos.core.NetworkAlertCoordinator
 import com.laughing.telephotos.core.NetworkInterruptedException
 import com.laughing.telephotos.core.NetworkOperationType
@@ -14,6 +15,7 @@ import com.laughing.telephotos.core.RetryDecision
 import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.core.StalledTransferException
 import com.laughing.telephotos.core.TelegramCaptionMetadata
+import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.MediaType
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -55,6 +57,10 @@ class PendingUploadInterruptedException(
   message: String,
   cause: Throwable? = null,
 ) : java.io.IOException(message, cause)
+
+private class StaleOrMissingTelegramFileException(
+  message: String,
+) : IllegalStateException(message)
 
 /**
  * Persistent foreground-reusable & self-recovering TDLib manager:
@@ -1434,8 +1440,393 @@ class TdLibManager(
       }.getOrNull()
     } ?: return null
     val completed = result.local?.isDownloadingCompleted == true
-    return result.local?.path?.takeIf { completed && it.isNotBlank() && File(it).exists() }
+    val path = result.local?.path
+    return path?.takeIf { completed && MediaStoreScanner.isUsableLocalFile(it) }
   }
+
+  private fun extractFileFromMessage(
+    msg: TdApi.Message,
+    expectedMediaType: MediaType? = null,
+  ): RefreshedTelegramFile? {
+    return when (val content = msg.content) {
+      is TdApi.MessageDocument -> {
+        val doc = content.document
+        val file = doc.document
+        val rawPath = file.local?.path
+        val usable = file.local?.isDownloadingCompleted == true && MediaStoreScanner.isUsableLocalFile(rawPath)
+        RefreshedTelegramFile(
+          fileId = file.id,
+          remoteFileId = file.remote?.id,
+          thumbFileId = doc.thumbnail?.file?.id,
+          localPath = rawPath.takeIf { usable },
+          isDownloadCompleted = usable,
+          expectedSizeBytes = file.expectedSize.takeIf { it > 0L } ?: file.size.coerceAtLeast(0L),
+        )
+      }
+      is TdApi.MessagePhoto -> {
+        val sizes = content.photo.sizes ?: return null
+        val largest = sizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: return null
+        val compactThumb = sizes
+          .filter { maxOf(it.width, it.height) in 90..360 }
+          .minByOrNull { it.width.toLong() * it.height.toLong() }
+          ?: sizes.minByOrNull { it.width.toLong() * it.height.toLong() }
+        val file = largest.photo
+        val rawPath = file.local?.path
+        val usable = file.local?.isDownloadingCompleted == true && MediaStoreScanner.isUsableLocalFile(rawPath)
+        RefreshedTelegramFile(
+          fileId = file.id,
+          remoteFileId = file.remote?.id,
+          thumbFileId = compactThumb?.photo?.id ?: file.id,
+          localPath = rawPath.takeIf { usable },
+          isDownloadCompleted = usable,
+          expectedSizeBytes = file.expectedSize.takeIf { it > 0L } ?: file.size.coerceAtLeast(0L),
+        )
+      }
+      is TdApi.MessageVideo -> {
+        val video = content.video
+        val file = video.video
+        val rawPath = file.local?.path
+        val usable = file.local?.isDownloadingCompleted == true && MediaStoreScanner.isUsableLocalFile(rawPath)
+        RefreshedTelegramFile(
+          fileId = file.id,
+          remoteFileId = file.remote?.id,
+          thumbFileId = video.thumbnail?.file?.id,
+          localPath = rawPath.takeIf { usable },
+          isDownloadCompleted = usable,
+          expectedSizeBytes = file.expectedSize.takeIf { it > 0L } ?: file.size.coerceAtLeast(0L),
+        )
+      }
+      else -> if (expectedMediaType == null) null else null
+    }
+  }
+
+  /**
+   * Re-fetches the authoritative Telegram message via chatId + messageId (with bounded topic/chat
+   * history fallback) to obtain a fresh session fileId when stored handles or cache paths are stale.
+   */
+  suspend fun refreshMediaSourceFromMessage(
+    chatId: Long,
+    messageId: Long,
+    topicId: Long?,
+    expectedMediaType: MediaType,
+  ): RefreshedTelegramFile? {
+    if (chatId == 0L || messageId == 0L) return null
+    if (!isSessionReady()) {
+      ensureConnected().getOrThrow()
+    }
+
+    val directMsg = try {
+      sendFunction(TdApi.GetMessage(chatId, messageId)) as? TdApi.Message
+    } catch (t: Throwable) {
+      if (t is CancellationException || t is FloodWaitException || t is SecurityException) throw t
+      if (NetworkRetryPolicy.isTransientNetworkError(t, context)) throw t
+      null
+    }
+
+    val resolvedMsg = directMsg ?: run {
+      val historyObj = try {
+        if (topicId != null && topicId > 0L) {
+          sendFunction(TdApi.GetForumTopicHistory(chatId, topicId.toInt(), messageId, -1, 5))
+        } else {
+          sendFunction(TdApi.GetChatHistory(chatId, messageId, -1, 5, false))
+        } as? TdApi.Messages
+      } catch (t: Throwable) {
+        if (t is CancellationException || t is FloodWaitException || t is SecurityException) throw t
+        if (NetworkRetryPolicy.isTransientNetworkError(t, context)) throw t
+        null
+      }
+      historyObj?.messages?.firstOrNull { it.id == messageId }
+    }
+
+    val extracted = resolvedMsg?.let { extractFileFromMessage(it, expectedMediaType) } ?: return null
+    if (!extracted.isDownloadCompleted && extracted.fileId > 0) {
+      // Ensure TDLib doesn't cling to a previously deleted/zero-byte cache record for this fileId
+      val probed = runCatching { sendFunction(TdApi.GetFile(extracted.fileId)) as? TdApi.File }.getOrNull()
+      if (probed?.local?.isDownloadingCompleted == true &&
+        !MediaStoreScanner.isUsableLocalFile(probed.local?.path)
+      ) {
+        runCatching { sendFunction(TdApi.DeleteFile(probed.id)) }
+      }
+    }
+    return extracted
+  }
+
+  private suspend fun resolveFreshMediaFile(media: MediaEntity): RefreshedTelegramFile {
+    ensureConnected().getOrThrow()
+
+    val storedFileId = media.telegramFileId
+    if (storedFileId != null && storedFileId > 0) {
+      val existingFile = try {
+        sendFunction(TdApi.GetFile(storedFileId)) as? TdApi.File
+      } catch (t: Throwable) {
+        if (t is CancellationException || t is FloodWaitException || t is SecurityException) throw t
+        if (NetworkRetryPolicy.isTransientNetworkError(t, context)) throw t
+        null
+      }
+
+      if (existingFile != null && existingFile.id > 0) {
+        val localCompleted = existingFile.local?.isDownloadingCompleted == true
+        val localPath = existingFile.local?.path
+        if (localCompleted && MediaStoreScanner.isUsableLocalFile(localPath)) {
+          return RefreshedTelegramFile(
+            fileId = existingFile.id,
+            remoteFileId = existingFile.remote?.id ?: media.telegramRemoteFileId,
+            thumbFileId = media.telegramThumbFileId,
+            localPath = localPath,
+            isDownloadCompleted = true,
+            expectedSizeBytes = existingFile.expectedSize.takeIf { it > 0L } ?: existingFile.size.coerceAtLeast(0L),
+          )
+        }
+        if (localCompleted && !MediaStoreScanner.isUsableLocalFile(localPath)) {
+          // Local cache file under cacheDir/tdlib_files was cleared/corrupted after restart: reset handle!
+          runCatching { sendFunction(TdApi.DeleteFile(existingFile.id)) }
+        } else {
+          return RefreshedTelegramFile(
+            fileId = existingFile.id,
+            remoteFileId = existingFile.remote?.id ?: media.telegramRemoteFileId,
+            thumbFileId = media.telegramThumbFileId,
+            localPath = null,
+            isDownloadCompleted = false,
+            expectedSizeBytes = existingFile.expectedSize.takeIf { it > 0L } ?: existingFile.size.coerceAtLeast(0L),
+          )
+        }
+      }
+    }
+
+    val chatId = media.telegramChatId
+    val messageId = media.telegramMessageId
+    if (chatId != null && messageId != null) {
+      val refreshedFromMessage = refreshMediaSourceFromMessage(
+        chatId = chatId,
+        messageId = messageId,
+        topicId = media.topicId,
+        expectedMediaType = media.mediaType,
+      )
+      if (refreshedFromMessage != null && refreshedFromMessage.fileId > 0) {
+        return refreshedFromMessage
+      }
+    }
+
+    val remoteId = media.telegramRemoteFileId
+    if (!remoteId.isNullOrBlank()) {
+      val remoteFile = try {
+        sendFunction(TdApi.GetRemoteFile(remoteId, null)) as? TdApi.File
+      } catch (t: Throwable) {
+        if (t is CancellationException || t is FloodWaitException || t is SecurityException) throw t
+        if (NetworkRetryPolicy.isTransientNetworkError(t, context)) throw t
+        null
+      }
+      if (remoteFile != null && remoteFile.id > 0) {
+        val localCompleted = remoteFile.local?.isDownloadingCompleted == true
+        val localPath = remoteFile.local?.path
+        if (localCompleted && !MediaStoreScanner.isUsableLocalFile(localPath)) {
+          runCatching { sendFunction(TdApi.DeleteFile(remoteFile.id)) }
+        }
+        val usable = localCompleted && MediaStoreScanner.isUsableLocalFile(localPath)
+        return RefreshedTelegramFile(
+          fileId = remoteFile.id,
+          remoteFileId = remoteFile.remote?.id ?: remoteId,
+          thumbFileId = media.telegramThumbFileId,
+          localPath = localPath.takeIf { usable },
+          isDownloadCompleted = usable,
+          expectedSizeBytes = remoteFile.expectedSize.takeIf { it > 0L } ?: remoteFile.size.coerceAtLeast(0L),
+        )
+      }
+    }
+
+    throw IllegalStateException("Không tìm thấy tệp trên Telegram (tin nhắn hoặc tệp đã bị xoá)")
+  }
+
+  /**
+   * Self-healing on-demand media download:
+   * 1. Guards behind TDLib readiness (`ensureConnected` -> `AuthorizationStateReady`).
+   * 2. Validates existing fileId & physical disk file (>0 bytes); clears stale TDLib file state.
+   * 3. Automatically re-fetches Telegram message (GetMessage / topic history) if fileId is stale
+   *    or TDLib reports "File not found", updates persisted refs, and downloads cleanly.
+   */
+  fun downloadMediaOnDemand(
+    media: MediaEntity,
+    onResolvedTelegramFile: suspend (RefreshedTelegramFile) -> Unit = {},
+  ): Flow<FileDownloadProgress> = flow {
+    val tracker = NetworkRetryTracker()
+    var lastKnownBytes = 0L
+    var activeFileId = media.telegramFileId ?: 0
+    var hasRefreshedFromMessage = false
+
+    beginTransfer(markSyncing = true)
+    try {
+      emit(
+        FileDownloadProgress(
+          fileId = activeFileId,
+          downloadedBytes = 0L,
+          totalBytes = media.sizeBytes,
+          isCompleted = false,
+          localPath = null,
+          statusMessageVi = if (isSessionReady()) {
+            "Đang chuẩn bị tải tệp từ Telegram..."
+          } else {
+            "Đang kết nối lại phiên Telegram..."
+          },
+        )
+      )
+
+      val initialTarget = resolveFreshMediaFile(media)
+      activeFileId = initialTarget.fileId
+      if (initialTarget.fileId != media.telegramFileId ||
+        initialTarget.remoteFileId != media.telegramRemoteFileId ||
+        initialTarget.thumbFileId != media.telegramThumbFileId
+      ) {
+        onResolvedTelegramFile(initialTarget)
+      }
+      if (initialTarget.isDownloadCompleted && MediaStoreScanner.isUsableLocalFile(initialTarget.localPath)) {
+        val completedPath = initialTarget.localPath!!
+        val finalSize = File(completedPath).length().coerceAtLeast(initialTarget.expectedSizeBytes)
+        emit(
+          FileDownloadProgress(
+            fileId = initialTarget.fileId,
+            downloadedBytes = finalSize,
+            totalBytes = finalSize,
+            isCompleted = true,
+            localPath = completedPath,
+          )
+        )
+        return@flow
+      }
+
+      while (true) {
+        try {
+          ensureConnected().getOrThrow()
+
+          val c = client ?: throw NetworkInterruptedException("Chưa kết nối Telegram")
+          if (!NetworkRetryPolicy.isNetworkAvailable(context)) {
+            throw NetworkInterruptedException("Không có kết nối mạng")
+          }
+
+          val completed = awaitSingleDownloadAttempt(
+            c = c,
+            fileId = activeFileId,
+            initialBytes = lastKnownBytes,
+            onProgress = { prog ->
+              if (prog.downloadedBytes > lastKnownBytes) {
+                lastKnownBytes = prog.downloadedBytes
+                tracker.reset()
+              }
+              emit(prog)
+            },
+          )
+          if (completed != null) {
+            emit(completed)
+            return@flow
+          }
+        } catch (t: Throwable) {
+          if (t is CancellationException) throw t
+          if (t is FloodWaitException) throw t
+
+          val rawLower = t.message.orEmpty().lowercase()
+          val isMissingOrStaleFile = t is StaleOrMissingTelegramFileException ||
+            rawLower.contains("file not found") ||
+            rawLower.contains("không tìm thấy tệp")
+          if (isMissingOrStaleFile) {
+            if (!hasRefreshedFromMessage) {
+              hasRefreshedFromMessage = true
+              lastKnownBytes = 0L
+              emit(
+                FileDownloadProgress(
+                  fileId = activeFileId,
+                  downloadedBytes = 0L,
+                  totalBytes = media.sizeBytes,
+                  isCompleted = false,
+                  localPath = null,
+                  statusMessageVi = "Đang làm mới liên kết tệp từ Telegram...",
+                )
+              )
+              if (activeFileId > 0) {
+                runCatching { sendFunction(TdApi.DeleteFile(activeFileId)) }
+              }
+              val refreshed = if (media.telegramChatId != null && media.telegramMessageId != null) {
+                refreshMediaSourceFromMessage(
+                  chatId = media.telegramChatId,
+                  messageId = media.telegramMessageId,
+                  topicId = media.topicId,
+                  expectedMediaType = media.mediaType,
+                )
+              } else {
+                null
+              } ?: media.telegramRemoteFileId?.takeIf { it.isNotBlank() }?.let { remoteId ->
+                runCatching { sendFunction(TdApi.GetRemoteFile(remoteId, null)) as? TdApi.File }
+                  .getOrNull()
+                  ?.takeIf { it.id > 0 }
+                  ?.let { rf ->
+                    RefreshedTelegramFile(
+                      fileId = rf.id,
+                      remoteFileId = rf.remote?.id ?: remoteId,
+                      thumbFileId = media.telegramThumbFileId,
+                      localPath = null,
+                      isDownloadCompleted = false,
+                      expectedSizeBytes = rf.expectedSize.takeIf { it > 0L } ?: rf.size.coerceAtLeast(0L),
+                    )
+                  }
+              }
+
+              if (refreshed != null && refreshed.fileId > 0) {
+                if (refreshed.fileId != activeFileId) {
+                  runCatching { sendFunction(TdApi.DeleteFile(refreshed.fileId)) }
+                }
+                activeFileId = refreshed.fileId
+                onResolvedTelegramFile(refreshed)
+                if (refreshed.isDownloadCompleted && MediaStoreScanner.isUsableLocalFile(refreshed.localPath)) {
+                  val path = refreshed.localPath!!
+                  val len = File(path).length().coerceAtLeast(refreshed.expectedSizeBytes)
+                  emit(
+                    FileDownloadProgress(
+                      fileId = refreshed.fileId,
+                      downloadedBytes = len,
+                      totalBytes = len,
+                      isCompleted = true,
+                      localPath = path,
+                    )
+                  )
+                  return@flow
+                }
+                continue
+              }
+            }
+            throw IllegalStateException("Không tìm thấy tệp trên Telegram (tin nhắn hoặc tệp đã bị xoá)")
+          }
+
+          if (!NetworkRetryPolicy.isTransientNetworkError(t, context)) {
+            throw t
+          }
+          when (val decision = tracker.onFailure()) {
+            is RetryDecision.WaitAndRetry -> {
+              emit(
+                FileDownloadProgress(
+                  fileId = activeFileId,
+                  downloadedBytes = lastKnownBytes,
+                  totalBytes = media.sizeBytes,
+                  isCompleted = false,
+                  localPath = null,
+                  statusMessageVi = "Mất kết nối, đang thử lại sau 8 giây (lần ${decision.attemptNumber}/2)...",
+                )
+              )
+              delay(decision.delayMs)
+              if (!isSessionReady()) {
+                runCatching { ensureConnected(forceReconnect = true) }
+              }
+            }
+            RetryDecision.StopAndNotify -> {
+              networkAlertCoordinator.reportFinalFailure(NetworkOperationType.DOWNLOAD)
+              throw NetworkInterruptedException("Không thể tải ảnh/video từ Telegram.")
+            }
+          }
+        }
+      }
+    } finally {
+      withContext(NonCancellable) {
+        endTransfer()
+      }
+    }
+  }.flowOn(Dispatchers.IO)
 
   /**
    * Reuses the persistent foreground TDLib session on demand to download a tapped photo or video,
@@ -1519,27 +1910,38 @@ class TdLibManager(
     var lastProgressAtMs = System.currentTimeMillis()
     var lastSeenBytes = initialBytes
 
+    fun emitFileState(fileObj: TdApi.File) {
+      val downloaded = fileObj.local?.downloadedSize ?: 0L
+      if (downloaded > lastSeenBytes) {
+        lastSeenBytes = downloaded
+        lastProgressAtMs = System.currentTimeMillis()
+      }
+      val reportedCompleted = fileObj.local?.isDownloadingCompleted == true
+      val rawPath = fileObj.local?.path
+      if (reportedCompleted && !MediaStoreScanner.isUsableLocalFile(rawPath)) {
+        eventChannel.trySend(
+          Result.failure(StaleOrMissingTelegramFileException("File not found"))
+        )
+        return
+      }
+      val verifiedPath = rawPath?.takeIf { reportedCompleted && MediaStoreScanner.isUsableLocalFile(it) }
+      eventChannel.trySend(
+        Result.success(
+          FileDownloadProgress(
+            fileId = fileObj.id,
+            downloadedBytes = downloaded,
+            totalBytes = fileObj.expectedSize,
+            isCompleted = verifiedPath != null,
+            localPath = verifiedPath,
+          )
+        )
+      )
+    }
+
     val collectorJob = launch {
       fileUpdates.collect { updatedFile ->
         if (updatedFile.id == fileId) {
-          val downloaded = updatedFile.local?.downloadedSize ?: 0L
-          if (downloaded > lastSeenBytes) {
-            lastSeenBytes = downloaded
-            lastProgressAtMs = System.currentTimeMillis()
-          }
-          val completed = updatedFile.local?.isDownloadingCompleted == true
-          val localPath = updatedFile.local?.path?.takeIf { completed && it.isNotBlank() }
-          eventChannel.trySend(
-            Result.success(
-              FileDownloadProgress(
-                fileId = updatedFile.id,
-                downloadedBytes = downloaded,
-                totalBytes = updatedFile.expectedSize,
-                isCompleted = completed,
-                localPath = localPath,
-              )
-            )
-          )
+          emitFileState(updatedFile)
         }
       }
     }
@@ -1574,6 +1976,10 @@ class TdLibManager(
           eventChannel.trySend(
             Result.failure(FloodWaitException(safeWait, unlockAt, reason))
           )
+        } else if (obj.message?.contains("file not found", ignoreCase = true) == true) {
+          eventChannel.trySend(
+            Result.failure(StaleOrMissingTelegramFileException(obj.message ?: "File not found"))
+          )
         } else {
           val translated = TelegramPolicyGuard.translateAuthError(obj.message)
           val ex: Throwable = if (NetworkRetryPolicy.isTransientNetworkError(IllegalStateException(obj.message), context)) {
@@ -1584,24 +1990,7 @@ class TdLibManager(
           eventChannel.trySend(Result.failure(ex))
         }
       } else if (obj is TdApi.File) {
-        val downloaded = obj.local?.downloadedSize ?: 0L
-        if (downloaded > lastSeenBytes) {
-          lastSeenBytes = downloaded
-          lastProgressAtMs = System.currentTimeMillis()
-        }
-        val completed = obj.local?.isDownloadingCompleted == true
-        val localPath = obj.local?.path?.takeIf { completed && it.isNotBlank() }
-        eventChannel.trySend(
-          Result.success(
-            FileDownloadProgress(
-              fileId = obj.id,
-              downloadedBytes = downloaded,
-              totalBytes = obj.expectedSize,
-              isCompleted = completed,
-              localPath = localPath,
-            )
-          )
-        )
+        emitFileState(obj)
       }
     }
 

@@ -168,4 +168,116 @@ class ExampleRobolectricTest {
       db.close()
     }
   }
+
+  @Test
+  fun `album queries surface Photo and Video Forum Topics and match topicId items`() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val mediaDao = db.mediaDao()
+      val albumDao = db.albumDao()
+
+      val photosAlbumId = albumDao.upsert(
+        AlbumEntity(
+          title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+          chatId = -100555L,
+          messageThreadId = 101L,
+          isTrashTopic = false,
+        )
+      )
+      val videosAlbumId = albumDao.upsert(
+        AlbumEntity(
+          title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+          chatId = -100555L,
+          messageThreadId = 102L,
+          isTrashTopic = false,
+        )
+      )
+      val customAlbumId = albumDao.upsert(
+        AlbumEntity(
+          title = "Gia đình",
+          chatId = -100555L,
+          messageThreadId = 202L,
+          isTrashTopic = false,
+        )
+      )
+      albumDao.upsert(
+        AlbumEntity(
+          title = TelegramPolicyGuard.TRASH_TOPIC_TITLE,
+          chatId = -100555L,
+          messageThreadId = 999L,
+          isTrashTopic = true,
+        )
+      )
+
+      val topicPhotoId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "sha256_topic_photo_1",
+          fileName = "TG_Photo_101.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 2048L,
+          takenAtEpochMs = 3000L,
+          albumId = null,
+          topicId = 101L,
+          cachedLocalVideoPath = "/tmp/stale/cache.jpg",
+          telegramFileId = 42,
+          uploadStatus = UploadStatus.UPLOADED,
+        )
+      )
+      mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "sha256_topic_video_1",
+          fileName = "TG_Video_102.mp4",
+          mimeType = "video/mp4",
+          mediaType = MediaType.VIDEO,
+          durationSec = 15,
+          sizeBytes = 8192L,
+          takenAtEpochMs = 3100L,
+          albumId = null,
+          topicId = 102L,
+          uploadStatus = UploadStatus.UPLOADED,
+        )
+      )
+      mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "sha256_custom_photo_1",
+          fileName = "family.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 1024L,
+          takenAtEpochMs = 2900L,
+          albumId = customAlbumId,
+          topicId = 202L,
+          uploadStatus = UploadStatus.UPLOADED,
+        )
+      )
+
+      val albums = albumDao.observeAlbumsWithCount().first()
+      assertEquals(listOf("Ảnh", "Video", "Gia đình"), albums.map { it.title })
+      assertEquals(1, albums.first { it.id == photosAlbumId }.itemCount)
+      assertEquals(1, albums.first { it.id == videosAlbumId }.itemCount)
+      assertEquals(1, albums.first { it.id == customAlbumId }.itemCount)
+
+      assertEquals(1, mediaDao.observeAlbumPhotos(photosAlbumId).first().size)
+      assertEquals(1, mediaDao.observeAlbumVideos(videosAlbumId).first().size)
+
+      mediaDao.clearCachedVideoPath(topicPhotoId)
+      mediaDao.updateTelegramFileRefs(
+        id = topicPhotoId,
+        fileId = 888,
+        remoteFileId = "remote_ref_888",
+        thumbFileId = 889,
+      )
+      val refreshed = mediaDao.getById(topicPhotoId)!!
+      assertNull(refreshed.cachedLocalVideoPath)
+      assertEquals(888, refreshed.telegramFileId)
+      assertEquals("remote_ref_888", refreshed.telegramRemoteFileId)
+      assertEquals(889, refreshed.telegramThumbFileId)
+    } finally {
+      db.close()
+    }
+  }
 }

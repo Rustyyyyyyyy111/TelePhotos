@@ -13,13 +13,21 @@ interface AlbumDao {
     """
     SELECT a.id, a.title, a.chatId, a.messageThreadId, a.isTrashTopic,
            a.iconColor, a.coverUri, a.createdAtEpochMs,
-           COUNT(m.id) AS itemCount
+           COUNT(DISTINCT m.id) AS itemCount
     FROM albums a
-    LEFT JOIN media_items m ON m.albumId = a.id AND m.isTrashed = 0
+    LEFT JOIN media_items m
+      ON m.isTrashed = 0
+      AND (m.albumId = a.id OR (a.messageThreadId > 0 AND m.topicId = a.messageThreadId))
     WHERE a.isTrashTopic = 0
-      AND LOWER(TRIM(a.title)) NOT IN ('ảnh', 'video', 'đã xoá gần đây', 'đã xóa gần đây')
+      AND LOWER(TRIM(a.title)) NOT IN ('đã xoá gần đây', 'đã xóa gần đây')
     GROUP BY a.id
-    ORDER BY a.createdAtEpochMs DESC
+    ORDER BY
+      CASE
+        WHEN LOWER(TRIM(a.title)) = 'ảnh' THEN 0
+        WHEN LOWER(TRIM(a.title)) = 'video' THEN 1
+        ELSE 2
+      END ASC,
+      a.createdAtEpochMs DESC
     """
   )
   fun observeAlbumsWithCount(): Flow<List<AlbumWithCount>>

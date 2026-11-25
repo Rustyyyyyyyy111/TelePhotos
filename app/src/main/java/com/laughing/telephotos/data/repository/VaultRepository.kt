@@ -72,6 +72,11 @@ data class FreeUpPreparation(
   val thumbPathOverrides: Map<Long, String>,
 )
 
+data class ResolvedUploadDestination(
+  val albumId: Long?,
+  val topicId: Long?,
+)
+
 data class ManualSyncProgressState(
   val isRunning: Boolean = false,
   val currentFileName: String = "",
@@ -314,23 +319,59 @@ class VaultRepository(
   }
 
   /**
-   * Removes legacy system-auto topic entries ("Ảnh", "Video", duplicate trash variants)
-   * from custom albums so only user-created albums appear in the Album tab.
+   * Ensures a persistent AlbumEntity exists for a Telegram Topic (including system "Ảnh" & "Video")
+   * without replacing existing rows (which would regenerate the primary key ID).
+   */
+  suspend fun ensureSystemMediaTopicAlbum(
+    chatId: Long,
+    threadId: Long,
+    title: String,
+    iconColor: Int,
+  ): Long {
+    val existing = albumDao.getByChatAndThread(chatId, threadId)
+    if (existing != null) {
+      return existing.id
+    }
+    return albumDao.upsert(
+      AlbumEntity(
+        title = title,
+        chatId = chatId,
+        messageThreadId = threadId,
+        isTrashTopic = false,
+        iconColor = iconColor,
+      )
+    )
+  }
+
+  /**
+   * Normalizes legacy trash album flags and ensures "Ảnh" / "Video" Forum Topic cards exist
+   * when a Forum-enabled Telegram target is locked.
    */
   suspend fun pruneSystemTopicAlbums() {
     val allAlbums = albumDao.getAllAlbums()
-    val idsToDelete = mutableListOf<Long>()
     for (album in allAlbums) {
-      if (TelegramPolicyGuard.isPhotosAutoTopicTitle(album.title) ||
-        TelegramPolicyGuard.isVideosAutoTopicTitle(album.title)
-      ) {
-        idsToDelete.add(album.id)
-      } else if (TelegramPolicyGuard.isTrashTopicTitle(album.title) && !album.isTrashTopic) {
+      if (TelegramPolicyGuard.isTrashTopicTitle(album.title) && !album.isTrashTopic) {
         albumDao.upsert(album.copy(isTrashTopic = true, title = TelegramPolicyGuard.TRASH_TOPIC_TITLE))
       }
     }
-    if (idsToDelete.isNotEmpty()) {
-      albumDao.deleteByIds(idsToDelete)
+    val lockedTarget = syncTargetDao.getTarget()
+    if (lockedTarget != null && lockedTarget.isForumEnabled) {
+      lockedTarget.photosThreadId?.takeIf { it > 0L }?.let { photosId ->
+        ensureSystemMediaTopicAlbum(
+          chatId = lockedTarget.chatId,
+          threadId = photosId,
+          title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+          iconColor = 0x6FB9F0,
+        )
+      }
+      lockedTarget.videosThreadId?.takeIf { it > 0L }?.let { videosId ->
+        ensureSystemMediaTopicAlbum(
+          chatId = lockedTarget.chatId,
+          threadId = videosId,
+          title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+          iconColor = 0xCB86DB,
+        )
+      }
     }
   }
 
@@ -351,6 +392,14 @@ class VaultRepository(
       var resolvedPhotosId: Long? = null
       var resolvedVideosId: Long? = null
 
+      val currentDefaultAlbumId = settingsPreferences.getCurrentSettings().defaultUploadAlbumId
+      if (currentDefaultAlbumId > 0L) {
+        val currentDefaultAlbum = albumDao.getAlbum(currentDefaultAlbumId)
+        if (currentDefaultAlbum == null || currentDefaultAlbum.chatId != candidate.chatId) {
+          settingsPreferences.setDefaultUploadAlbumId(0L)
+        }
+      }
+
       if (candidate.isForumEnabled) {
         tdLibManager.withActiveSession(markSyncing = true) {
           val core = tdLibManager.ensureThreeCoreTopics(candidate.chatId)
@@ -358,7 +407,9 @@ class VaultRepository(
           resolvedVideosId = core.videosThreadId
           resolvedTrashId = core.trashThreadId
 
-          if (resolvedTrashId != null) {
+          if (resolvedTrashId != null &&
+            albumDao.getByChatAndThread(candidate.chatId, resolvedTrashId!!) == null
+          ) {
             albumDao.upsert(
               AlbumEntity(
                 title = TelegramPolicyGuard.TRASH_TOPIC_TITLE,
@@ -370,8 +421,25 @@ class VaultRepository(
             )
           }
 
+          if (resolvedPhotosId != null) {
+            ensureSystemMediaTopicAlbum(
+              chatId = candidate.chatId,
+              threadId = resolvedPhotosId!!,
+              title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+              iconColor = 0x6FB9F0,
+            )
+          }
+          if (resolvedVideosId != null) {
+            ensureSystemMediaTopicAlbum(
+              chatId = candidate.chatId,
+              threadId = resolvedVideosId!!,
+              title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+              iconColor = 0xCB86DB,
+            )
+          }
+
           for (topic in core.allTopics) {
-            if (TelegramPolicyGuard.isSystemAutoTopicTitle(topic.title)) {
+            if (TelegramPolicyGuard.isTrashTopicTitle(topic.title)) {
               continue
             }
             if (albumDao.getByChatAndThread(candidate.chatId, topic.messageThreadId) == null) {
@@ -388,8 +456,6 @@ class VaultRepository(
           }
         }
       }
-
-      pruneSystemTopicAlbums()
 
       if (!candidate.isForumEnabled &&
         albumDao.getByChatAndThread(candidate.chatId, 0L) == null
@@ -419,47 +485,106 @@ class VaultRepository(
         confirmedAtEpochMs = System.currentTimeMillis(),
       )
       syncTargetDao.saveTarget(target)
+      pruneSystemTopicAlbums()
       target
     }
 
   /**
-   * Resolves the upload Forum Topic ID:
-   * - Non-forum groups, channels, and Saved Messages -> defaultMessageThreadId (null).
-   * - Items assigned to a custom user Album -> preserves that Album's topic ID.
-   * - Unassigned items on a Forum-enabled Group -> checks/creates and caches "Ảnh" (PHOTO) or "Video" (VIDEO).
+   * Resolves both Album row ID and Telegram Forum Topic ID for an upload item:
+   * - Explicit `media.albumId` takes top priority.
+   * - Otherwise falls back to Setting's `defaultUploadAlbumId` if valid for the locked chat.
+   * - Otherwise auto-routes to "Ảnh" (PHOTO) or "Video" (VIDEO) Forum Topic and ensures its Album card exists.
    */
-  suspend fun resolveUploadTopicId(media: MediaEntity, target: SyncTargetEntity): Long? {
-    if (!target.isForumEnabled) {
-      return target.defaultMessageThreadId
-    }
-
-    if (media.albumId != null) {
-      val customAlbum = albumDao.getAlbum(media.albumId)
-      if (customAlbum != null && !customAlbum.isTrashTopic) {
-        return customAlbum.messageThreadId
-      }
-    }
-
+  suspend fun resolveUploadDestination(
+    media: MediaEntity,
+    target: SyncTargetEntity,
+  ): ResolvedUploadDestination {
     val latestTarget = syncTargetDao.getTarget() ?: target
+    val explicitAlbum = media.albumId?.let { albumDao.getAlbum(it) }
+      ?.takeIf { !it.isTrashTopic && it.chatId == latestTarget.chatId }
+
+    val configuredDefaultAlbum = if (explicitAlbum == null) {
+      val defaultAlbumId = settingsPreferences.getCurrentSettings().defaultUploadAlbumId
+      if (defaultAlbumId > 0L) {
+        albumDao.getAlbum(defaultAlbumId)
+          ?.takeIf { !it.isTrashTopic && it.chatId == latestTarget.chatId }
+      } else {
+        null
+      }
+    } else {
+      null
+    }
+
+    val chosenAlbum = explicitAlbum ?: configuredDefaultAlbum
+    if (!latestTarget.isForumEnabled) {
+      val streamAlbumId = chosenAlbum?.id
+        ?: albumDao.getByChatAndThread(latestTarget.chatId, 0L)?.id
+        ?: albumDao.upsert(
+          AlbumEntity(
+            title = latestTarget.chatTitle,
+            chatId = latestTarget.chatId,
+            messageThreadId = 0L,
+            isTrashTopic = false,
+            iconColor = 0x6FB9F0,
+          )
+        )
+      return ResolvedUploadDestination(
+        albumId = streamAlbumId,
+        topicId = latestTarget.defaultMessageThreadId,
+      )
+    }
+
+    if (chosenAlbum != null) {
+      return ResolvedUploadDestination(
+        albumId = chosenAlbum.id,
+        topicId = chosenAlbum.messageThreadId.takeIf { it > 0L },
+      )
+    }
+
     return when (media.mediaType) {
       MediaType.PHOTO -> {
-        latestTarget.photosThreadId ?: tdLibManager.findOrCreateMediaTopic(
+        val threadId = latestTarget.photosThreadId ?: tdLibManager.findOrCreateMediaTopic(
           chatId = latestTarget.chatId,
           title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
           iconColor = 0x6FB9F0,
         ).also { createdId ->
           syncTargetDao.updatePhotosThreadId(createdId)
         }
+        val albumId = ensureSystemMediaTopicAlbum(
+          chatId = latestTarget.chatId,
+          threadId = threadId,
+          title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+          iconColor = 0x6FB9F0,
+        )
+        ResolvedUploadDestination(albumId = albumId, topicId = threadId)
       }
       MediaType.VIDEO -> {
-        latestTarget.videosThreadId ?: tdLibManager.findOrCreateMediaTopic(
+        val threadId = latestTarget.videosThreadId ?: tdLibManager.findOrCreateMediaTopic(
           chatId = latestTarget.chatId,
           title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
           iconColor = 0xCB86DB,
         ).also { createdId ->
           syncTargetDao.updateVideosThreadId(createdId)
         }
+        val albumId = ensureSystemMediaTopicAlbum(
+          chatId = latestTarget.chatId,
+          threadId = threadId,
+          title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+          iconColor = 0xCB86DB,
+        )
+        ResolvedUploadDestination(albumId = albumId, topicId = threadId)
       }
+    }
+  }
+
+  suspend fun resolveUploadTopicId(media: MediaEntity, target: SyncTargetEntity): Long? =
+    resolveUploadDestination(media, target).topicId
+
+  suspend fun updateAlbumCoverIfMissing(albumId: Long?, candidateCoverUri: String?) {
+    if (albumId == null || candidateCoverUri.isNullOrBlank()) return
+    val album = albumDao.getAlbum(albumId) ?: return
+    if (album.coverUri.isNullOrBlank()) {
+      albumDao.updateCoverUri(albumId, candidateCoverUri)
     }
   }
 
@@ -777,11 +902,21 @@ class VaultRepository(
           val albumId: Long? = when {
             isPhotosAuto -> {
               syncTargetDao.updatePhotosThreadId(topic.messageThreadId)
-              null
+              ensureSystemMediaTopicAlbum(
+                chatId = target.chatId,
+                threadId = topic.messageThreadId,
+                title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+                iconColor = topic.iconColor,
+              )
             }
             isVideosAuto -> {
               syncTargetDao.updateVideosThreadId(topic.messageThreadId)
-              null
+              ensureSystemMediaTopicAlbum(
+                chatId = target.chatId,
+                threadId = topic.messageThreadId,
+                title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+                iconColor = topic.iconColor,
+              )
             }
             isTrash -> {
               syncTargetDao.updateTrashThreadId(topic.messageThreadId)
@@ -876,22 +1011,48 @@ class VaultRepository(
         )
         totalAdded += ingestScannedItems(scanned, album.id, album.isTrashTopic, existingHashes)
       } else if (target.isForumEnabled) {
-        val topics = tdLibManager.getForumTopics(target.chatId)
+        val core = tdLibManager.ensureThreeCoreTopics(target.chatId)
+        core.photosThreadId?.let {
+          syncTargetDao.updatePhotosThreadId(it)
+          ensureSystemMediaTopicAlbum(
+            chatId = target.chatId,
+            threadId = it,
+            title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+            iconColor = 0x6FB9F0,
+          )
+        }
+        core.videosThreadId?.let {
+          syncTargetDao.updateVideosThreadId(it)
+          ensureSystemMediaTopicAlbum(
+            chatId = target.chatId,
+            threadId = it,
+            title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+            iconColor = 0xCB86DB,
+          )
+        }
+        core.trashThreadId?.let { syncTargetDao.updateTrashThreadId(it) }
+
+        val topics = core.allTopics.ifEmpty { tdLibManager.getForumTopics(target.chatId) }
         for (topic in topics) {
-          if (TelegramPolicyGuard.isSystemAutoTopicTitle(topic.title)) {
-            if (TelegramPolicyGuard.isPhotosAutoTopicTitle(topic.title)) {
-              syncTargetDao.updatePhotosThreadId(topic.messageThreadId)
-            } else if (TelegramPolicyGuard.isVideosAutoTopicTitle(topic.title)) {
-              syncTargetDao.updateVideosThreadId(topic.messageThreadId)
-            } else if (TelegramPolicyGuard.isTrashTopicTitle(topic.title)) {
-              syncTargetDao.updateTrashThreadId(topic.messageThreadId)
-            }
+          if (TelegramPolicyGuard.isTrashTopicTitle(topic.title)) {
+            syncTargetDao.updateTrashThreadId(topic.messageThreadId)
             continue
+          }
+          val normalizedTitle = when {
+            TelegramPolicyGuard.isPhotosAutoTopicTitle(topic.title) -> {
+              syncTargetDao.updatePhotosThreadId(topic.messageThreadId)
+              TelegramPolicyGuard.PHOTOS_TOPIC_TITLE
+            }
+            TelegramPolicyGuard.isVideosAutoTopicTitle(topic.title) -> {
+              syncTargetDao.updateVideosThreadId(topic.messageThreadId)
+              TelegramPolicyGuard.VIDEOS_TOPIC_TITLE
+            }
+            else -> topic.title
           }
           val albumId = albumDao.getByChatAndThread(target.chatId, topic.messageThreadId)?.id
             ?: albumDao.upsert(
               AlbumEntity(
-                title = topic.title,
+                title = normalizedTitle,
                 chatId = target.chatId,
                 messageThreadId = topic.messageThreadId,
                 isTrashTopic = false,
@@ -963,15 +1124,27 @@ class VaultRepository(
     if (filterMediaType == null || filterMediaType == MediaType.PHOTO) {
       val pTopic = core.photosThreadId
       if (pTopic != null) {
+        val photosAlbumId = ensureSystemMediaTopicAlbum(
+          chatId = target.chatId,
+          threadId = pTopic,
+          title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
+          iconColor = 0x6FB9F0,
+        )
         val scannedPhotos = tdLibManager.scanHistoryReadOnly(target.chatId, pTopic, limit = 60)
-        added += ingestScannedItems(scannedPhotos, null, false, existingHashes)
+        added += ingestScannedItems(scannedPhotos, photosAlbumId, false, existingHashes)
       }
     }
     if (filterMediaType == null || filterMediaType == MediaType.VIDEO) {
       val vTopic = core.videosThreadId
       if (vTopic != null) {
+        val videosAlbumId = ensureSystemMediaTopicAlbum(
+          chatId = target.chatId,
+          threadId = vTopic,
+          title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
+          iconColor = 0xCB86DB,
+        )
         val scannedVideos = tdLibManager.scanHistoryReadOnly(target.chatId, vTopic, limit = 60)
-        added += ingestScannedItems(scannedVideos, null, false, existingHashes)
+        added += ingestScannedItems(scannedVideos, videosAlbumId, false, existingHashes)
       }
     }
     return added
@@ -1007,8 +1180,26 @@ class VaultRepository(
     for (item in scanned) {
       val msgMatch = byMessageKey["${item.chatId}_${item.messageId}"]
       if (msgMatch != null) {
-        if (albumId != null && msgMatch.albumId == null && !isTrashTopic) {
-          mediaDao.assignToAlbum(listOf(msgMatch.id), albumId, item.topicId ?: msgMatch.topicId)
+        if (item.fileId != msgMatch.telegramFileId ||
+          item.remoteFileId != msgMatch.telegramRemoteFileId ||
+          item.thumbFileId != msgMatch.telegramThumbFileId
+        ) {
+          mediaDao.updateTelegramFileRefs(
+            id = msgMatch.id,
+            fileId = item.fileId,
+            remoteFileId = item.remoteFileId,
+            thumbFileId = item.thumbFileId,
+          )
+        }
+        val needsAlbumOrTopic = !isTrashTopic &&
+          ((albumId != null && msgMatch.albumId == null) ||
+            (item.topicId != null && msgMatch.topicId == null))
+        if (needsAlbumOrTopic) {
+          mediaDao.assignToAlbum(
+            ids = listOf(msgMatch.id),
+            albumId = msgMatch.albumId ?: albumId,
+            topicId = msgMatch.topicId ?: item.topicId,
+          )
         }
         if (albumCoverNeeded && albumId != null) {
           val coverCandidate = msgMatch.localUri ?: msgMatch.cachedThumbPath
@@ -1030,16 +1221,34 @@ class VaultRepository(
             messageId = item.messageId,
             fileId = item.fileId,
             remoteFileId = item.remoteFileId,
-            topicId = item.topicId,
+            topicId = item.topicId ?: existingByHash.topicId,
+            thumbFileId = item.thumbFileId,
+            albumId = if (!isTrashTopic) existingByHash.albumId ?: albumId else existingByHash.albumId,
+          )
+        } else if (item.fileId != existingByHash.telegramFileId ||
+          item.remoteFileId != existingByHash.telegramRemoteFileId ||
+          item.thumbFileId != existingByHash.telegramThumbFileId
+        ) {
+          mediaDao.updateTelegramFileRefs(
+            id = existingByHash.id,
+            fileId = item.fileId,
+            remoteFileId = item.remoteFileId,
             thumbFileId = item.thumbFileId,
           )
         }
-        if (albumId != null && existingByHash.albumId == null && !isTrashTopic) {
-          mediaDao.assignToAlbum(listOf(existingByHash.id), albumId, item.topicId ?: existingByHash.topicId)
+        val needsAlbumOrTopic = !isTrashTopic &&
+          ((albumId != null && existingByHash.albumId == null) ||
+            (item.topicId != null && existingByHash.topicId == null))
+        if (needsAlbumOrTopic) {
+          mediaDao.assignToAlbum(
+            ids = listOf(existingByHash.id),
+            albumId = existingByHash.albumId ?: albumId,
+            topicId = existingByHash.topicId ?: item.topicId,
+          )
         }
         var currentThumb = existingByHash.cachedThumbPath
         if (existingByHash.localUri == null &&
-          currentThumb.isNullOrBlank() &&
+          !MediaStoreScanner.isUsableLocalFile(currentThumb) &&
           item.thumbFileId != null &&
           thumbFetchCount < maxQuickThumbsPerBatch
         ) {
@@ -1073,15 +1282,33 @@ class VaultRepository(
             messageId = item.messageId,
             fileId = item.fileId,
             remoteFileId = item.remoteFileId,
-            topicId = item.topicId,
+            topicId = item.topicId ?: existingLocalMatch.topicId,
             thumbFileId = item.thumbFileId,
+            albumId = if (!isTrashTopic) existingLocalMatch.albumId ?: albumId else existingLocalMatch.albumId,
           )
           if (existingLocalMatch.contentHash.startsWith("ms_") || item.contentHash.length >= 32) {
             mediaDao.updateContentHash(existingLocalMatch.id, item.contentHash)
           }
+        } else if (item.fileId != existingLocalMatch.telegramFileId ||
+          item.remoteFileId != existingLocalMatch.telegramRemoteFileId ||
+          item.thumbFileId != existingLocalMatch.telegramThumbFileId
+        ) {
+          mediaDao.updateTelegramFileRefs(
+            id = existingLocalMatch.id,
+            fileId = item.fileId,
+            remoteFileId = item.remoteFileId,
+            thumbFileId = item.thumbFileId,
+          )
         }
-        if (albumId != null && existingLocalMatch.albumId == null && !isTrashTopic) {
-          mediaDao.assignToAlbum(listOf(existingLocalMatch.id), albumId, item.topicId ?: existingLocalMatch.topicId)
+        val needsAlbumOrTopic = !isTrashTopic &&
+          ((albumId != null && existingLocalMatch.albumId == null) ||
+            (item.topicId != null && existingLocalMatch.topicId == null))
+        if (needsAlbumOrTopic) {
+          mediaDao.assignToAlbum(
+            ids = listOf(existingLocalMatch.id),
+            albumId = existingLocalMatch.albumId ?: albumId,
+            topicId = existingLocalMatch.topicId ?: item.topicId,
+          )
         }
         if (albumCoverNeeded && albumId != null) {
           val coverCandidate = existingLocalMatch.localUri ?: existingLocalMatch.cachedThumbPath
@@ -1134,8 +1361,22 @@ class VaultRepository(
     return added
   }
 
+  fun downloadMediaOnDemand(media: MediaEntity): Flow<FileDownloadProgress> =
+    tdLibManager.downloadMediaOnDemand(media) { refreshed ->
+      mediaDao.updateTelegramFileRefs(
+        id = media.id,
+        fileId = refreshed.fileId,
+        remoteFileId = refreshed.remoteFileId,
+        thumbFileId = refreshed.thumbFileId,
+      )
+    }
+
   fun downloadMediaOnDemand(fileId: Int): Flow<FileDownloadProgress> =
     tdLibManager.downloadFileOnDemand(fileId)
+
+  suspend fun clearStaleCachedVideoPath(mediaId: Long) {
+    mediaDao.clearCachedVideoPath(mediaId)
+  }
 
   suspend fun saveDownloadedVideoPath(mediaId: Long, localPath: String) {
     mediaDao.updateCachedVideoPath(mediaId, localPath)
@@ -1152,16 +1393,18 @@ class VaultRepository(
       return@flow
     }
 
-    val cachedPath = media.cachedLocalVideoPath?.takeIf { it.isNotBlank() && File(it).exists() }
+    val cachedPath = media.cachedLocalVideoPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }
+    if (cachedPath == null && !media.cachedLocalVideoPath.isNullOrBlank()) {
+      mediaDao.clearCachedVideoPath(media.id)
+    }
+
     val sourceFile = if (cachedPath != null) {
       emit(SaveToDeviceProgress.Downloading(0.85f, "Đang lưu tệp vào thư viện thiết bị..."))
       File(cachedPath)
     } else {
-      val fileId = media.telegramFileId
-        ?: error("Không tìm thấy tệp nguồn trên Telegram để tải về máy")
       var downloadedPath: String? = null
-      tdLibManager.downloadFileOnDemand(fileId).collect { prog ->
-        if (prog.isCompleted && !prog.localPath.isNullOrBlank()) {
+      downloadMediaOnDemand(media).collect { prog ->
+        if (prog.isCompleted && MediaStoreScanner.isUsableLocalFile(prog.localPath)) {
           downloadedPath = prog.localPath
         } else {
           val pct = (prog.fraction * 100).toInt()
@@ -1173,7 +1416,7 @@ class VaultRepository(
           )
         }
       }
-      val resolved = downloadedPath?.let { File(it) }?.takeIf { it.exists() }
+      val resolved = downloadedPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }?.let { File(it) }
         ?: error("Không thể hoàn tất tải tệp từ Telegram")
       resolved
     }

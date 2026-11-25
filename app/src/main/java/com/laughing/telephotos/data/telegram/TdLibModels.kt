@@ -102,6 +102,15 @@ data class FileDownloadProgress(
     get() = if (totalBytes > 0L) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 }
 
+data class RefreshedTelegramFile(
+  val fileId: Int,
+  val remoteFileId: String?,
+  val thumbFileId: Int?,
+  val localPath: String?,
+  val isDownloadCompleted: Boolean,
+  val expectedSizeBytes: Long,
+)
+
 class FloodWaitException(
   val retryAfterSeconds: Int,
   val unlockAtEpochMs: Long,

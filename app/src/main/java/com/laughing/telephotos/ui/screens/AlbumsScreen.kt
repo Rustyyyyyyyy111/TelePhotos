@@ -34,8 +34,10 @@ import androidx.compose.material.icons.filled.CollectionsBookmark
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VideoCall
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -71,6 +73,7 @@ import com.laughing.telephotos.data.local.AlbumEntity
 import com.laughing.telephotos.data.local.AlbumWithCount
 import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.SyncTargetEntity
+import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import com.laughing.telephotos.ui.components.MediaGridTile
 import com.laughing.telephotos.ui.components.TelePhotosGlassCard
 
@@ -231,6 +234,19 @@ fun AlbumsScreen(
                   .background(Color(album.iconColor or 0x6FB9F0).copy(alpha = 0.22f)),
                 contentAlignment = Alignment.Center,
               ) {
+                val isPhotosTopic = TelegramPolicyGuard.isPhotosAutoTopicTitle(album.title)
+                val isVideosTopic = TelegramPolicyGuard.isVideosAutoTopicTitle(album.title)
+                val fallbackIcon = when {
+                  isPhotosTopic -> Icons.Filled.PhotoLibrary
+                  isVideosTopic -> Icons.Filled.VideoLibrary
+                  else -> Icons.Filled.Forum
+                }
+                val topicBadgeText = when {
+                  isPhotosTopic -> "Chủ đề Ảnh"
+                  isVideosTopic -> "Chủ đề Video"
+                  album.messageThreadId > 0L -> "Topic #${album.messageThreadId}"
+                  else -> "Kênh / Nhóm"
+                }
                 if (album.coverUri != null) {
                   AsyncImage(
                     model = album.coverUri,
@@ -240,7 +256,7 @@ fun AlbumsScreen(
                   )
                 } else {
                   Icon(
-                    imageVector = Icons.Filled.Forum,
+                    imageVector = fallbackIcon,
                     contentDescription = album.title,
                     tint = Color(album.iconColor or 0x6FB9F0).copy(alpha = 0.9f),
                     modifier = Modifier.size(38.dp),
@@ -254,7 +270,7 @@ fun AlbumsScreen(
                     .padding(8.dp),
                 ) {
                   Text(
-                    text = if (album.messageThreadId > 0L) "Topic #${album.messageThreadId}" else "Kênh / Nhóm",
+                    text = topicBadgeText,
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White,
                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
@@ -460,7 +476,7 @@ fun AlbumDetailScreen(
   isLoggedIn: Boolean = false,
   isBusy: Boolean = false,
   onBack: () -> Unit,
-  onMediaClick: (MediaEntity) -> Unit,
+  onMediaClick: (MediaEntity, Boolean) -> Unit,
   onImportIntoAlbum: (List<android.net.Uri>) -> Unit,
   onMoveSelectedToTrash: (List<Long>) -> Unit = {},
   onRefreshAlbum: () -> Unit = {},
@@ -494,13 +510,14 @@ fun AlbumDetailScreen(
   }
 
   val latestIsSelectionMode by rememberUpdatedState(isSelectionMode)
+  val latestSelectedTabIndex by rememberUpdatedState(selectedTabIndex)
   val latestMediaClick by rememberUpdatedState(onMediaClick)
   val stableTileClick = remember {
     { item: MediaEntity ->
       if (latestIsSelectionMode) {
         toggleItemSelection(item.id)
       } else {
-        latestMediaClick(item)
+        latestMediaClick(item, latestSelectedTabIndex == 1)
       }
     }
   }

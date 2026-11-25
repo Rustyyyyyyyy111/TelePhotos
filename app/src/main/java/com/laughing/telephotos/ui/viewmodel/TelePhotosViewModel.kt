@@ -47,6 +47,16 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+
+@Serializable
+enum class MediaCollectionScope {
+  PHOTOS,
+  VIDEOS,
+  ALBUM_PHOTOS,
+  ALBUM_VIDEOS,
+  TRASH,
+}
 
 data class TimelineSection(
   val headerTitle: String,
@@ -116,7 +126,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   val albums: StateFlow<List<AlbumWithCount>> =
     repo.albumsWithCountFlow
       .map { list ->
-        list.filterNot { TelegramPolicyGuard.isSystemAutoTopicTitle(it.title) || it.isTrashTopic }
+        list.filterNot { it.isTrashTopic || TelegramPolicyGuard.isTrashTopicTitle(it.title) }
       }
       .flowOn(Dispatchers.Default)
       .stateIn(
@@ -735,6 +745,14 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     viewModelScope.launch { prefs.setWifiOnlyUpload(wifiOnly) }
   }
 
+  fun setPhotoGridColumns(columns: Int) {
+    viewModelScope.launch { prefs.setPhotoGridColumns(columns) }
+  }
+
+  fun setDefaultUploadAlbumId(albumId: Long) {
+    viewModelScope.launch { prefs.setDefaultUploadAlbumId(albumId) }
+  }
+
   fun submitPhoneNumber(phone: String) {
     viewModelScope.launch {
       _isBusy.value = true
@@ -778,8 +796,43 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
 
   fun observeMediaById(mediaId: Long): Flow<MediaEntity?> = repo.observeMediaById(mediaId)
 
+  fun observeMediaCollection(
+    scope: MediaCollectionScope,
+    albumId: Long,
+    fallbackMediaId: Long,
+  ): Flow<List<MediaEntity>> {
+    val sourceFlow = when (scope) {
+      MediaCollectionScope.PHOTOS -> repo.photosTimelineFlow
+      MediaCollectionScope.VIDEOS -> repo.videosTimelineFlow
+      MediaCollectionScope.ALBUM_PHOTOS -> {
+        if (albumId > 0L) repo.observeAlbumPhotos(albumId) else repo.photosTimelineFlow
+      }
+      MediaCollectionScope.ALBUM_VIDEOS -> {
+        if (albumId > 0L) repo.observeAlbumVideos(albumId) else repo.videosTimelineFlow
+      }
+      MediaCollectionScope.TRASH -> repo.trashedMediaFlow
+    }
+    return combine(sourceFlow, repo.observeMediaById(fallbackMediaId)) { list, fallback ->
+      when {
+        list.isNotEmpty() -> list
+        fallback != null && ((scope == MediaCollectionScope.TRASH) == fallback.isTrashed) ->
+          listOf(fallback)
+        else -> emptyList()
+      }
+    }
+  }
+
+  fun downloadMediaOnDemand(media: MediaEntity): Flow<FileDownloadProgress> =
+    repo.downloadMediaOnDemand(media)
+
   fun downloadVideoOnDemand(fileId: Int): Flow<FileDownloadProgress> =
     repo.downloadMediaOnDemand(fileId)
+
+  fun clearStaleCachedVideoPath(mediaId: Long) {
+    viewModelScope.launch {
+      repo.clearStaleCachedVideoPath(mediaId)
+    }
+  }
 
   fun saveDownloadedVideoPath(mediaId: Long, path: String) {
     viewModelScope.launch {

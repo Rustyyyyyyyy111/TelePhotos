@@ -328,11 +328,24 @@ object MediaStoreScanner {
     return scaled
   }
 
+  fun isUsableLocalFile(path: String?): Boolean {
+    if (path.isNullOrBlank()) return false
+    return runCatching {
+      val file = File(path)
+      file.exists() && file.isFile && file.canRead() && file.length() > 0L
+    }.getOrDefault(false)
+  }
+
   fun isLocalUriAccessible(context: Context, uriString: String?): Boolean {
     if (uriString.isNullOrBlank()) return false
     val uri = runCatching { Uri.parse(uriString) }.getOrNull() ?: return false
+    if (uri.scheme == "file") {
+      return isUsableLocalFile(uri.path)
+    }
     return runCatching {
-      context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+      context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+        afd.parcelFileDescriptor.statSize != 0L
+      } ?: false
     }.getOrDefault(false)
   }
 

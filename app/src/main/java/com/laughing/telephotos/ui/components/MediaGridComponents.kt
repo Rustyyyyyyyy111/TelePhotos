@@ -4,6 +4,8 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -54,6 +56,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -65,6 +68,8 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.MediaStoreScanner
+import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.UploadStatus
@@ -83,6 +88,8 @@ fun ChronologicalMediaGrid(
   onItemClick: (MediaEntity) -> Unit,
   onItemLongPress: (MediaEntity) -> Unit,
   onToggleDateGroup: (List<Long>) -> Unit = {},
+  columnsCount: Int? = null,
+  onPinchColumnsChange: ((Int) -> Unit)? = null,
   modifier: Modifier = Modifier,
   contentPadding: PaddingValues = PaddingValues(bottom = 96.dp),
 ) {
@@ -91,6 +98,9 @@ fun ChronologicalMediaGrid(
   val currentItemClick by rememberUpdatedState(onItemClick)
   val currentItemLongPress by rememberUpdatedState(onItemLongPress)
   val currentToggleDateGroup by rememberUpdatedState(onToggleDateGroup)
+  val resolvedColumns = columnsCount?.let { SettingsPreferences.clampPhotoGridColumns(it) }
+  val currentColumnsCount by rememberUpdatedState(resolvedColumns)
+  val currentPinchCallback by rememberUpdatedState(onPinchColumnsChange)
 
   val headerIndexMap = remember(sections) {
     val map = ArrayList<Pair<Int, String>>(sections.size)
@@ -106,9 +116,56 @@ fun ChronologicalMediaGrid(
     sections.sumOf { 1 + it.items.size }
   }
 
-  BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+  BoxWithConstraints(
+    modifier = modifier
+      .fillMaxSize()
+      .then(
+        if (onPinchColumnsChange != null) {
+          Modifier.pointerInput(Unit) {
+            awaitEachGesture {
+              var totalZoom = 1f
+              var triggered = false
+              do {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val pressedCount = event.changes.count { it.pressed }
+                if (pressedCount >= 2 && !triggered) {
+                  val zoomChange = event.calculateZoom()
+                  if (zoomChange.isFinite() && zoomChange > 0f) {
+                    totalZoom *= zoomChange
+                    val activeCols = currentColumnsCount ?: 3
+                    if (totalZoom >= 1.22f) {
+                      val nextCols = SettingsPreferences.clampPhotoGridColumns(activeCols - 1)
+                      if (nextCols != activeCols) {
+                        currentPinchCallback?.invoke(nextCols)
+                      }
+                      triggered = true
+                    } else if (totalZoom <= 0.82f) {
+                      val nextCols = SettingsPreferences.clampPhotoGridColumns(activeCols + 1)
+                      if (nextCols != activeCols) {
+                        currentPinchCallback?.invoke(nextCols)
+                      }
+                      triggered = true
+                    }
+                  }
+                  event.changes.forEach { if (it.pressed) it.consume() }
+                } else if (pressedCount < 2) {
+                  totalZoom = 1f
+                  triggered = false
+                }
+              } while (event.changes.any { it.pressed })
+            }
+          }
+        } else {
+          Modifier
+        }
+      ),
+  ) {
     LazyVerticalGrid(
-      columns = GridCells.Adaptive(minSize = 112.dp),
+      columns = if (resolvedColumns != null) {
+        GridCells.Fixed(resolvedColumns)
+      } else {
+        GridCells.Adaptive(minSize = 112.dp)
+      },
       state = gridState,
       contentPadding = contentPadding,
       verticalArrangement = Arrangement.spacedBy(3.dp),
@@ -229,7 +286,9 @@ fun MediaGridTile(
   val latestLongPress by rememberUpdatedState(onMediaLongPress)
 
   val modelData = remember(media.id, media.localUri, media.cachedThumbPath, media.cachedLocalVideoPath) {
-    media.localUri ?: media.cachedThumbPath ?: media.cachedLocalVideoPath
+    media.localUri
+      ?: media.cachedThumbPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }
+      ?: media.cachedLocalVideoPath?.takeIf { MediaStoreScanner.isUsableLocalFile(it) }
   }
 
   val imageRequest = remember(modelData) {

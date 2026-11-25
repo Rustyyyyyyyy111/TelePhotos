@@ -50,27 +50,50 @@ interface MediaDao {
 
   @Query(
     """
-    SELECT * FROM media_items
-    WHERE isTrashed = 0 AND albumId = :albumId
-    ORDER BY takenAtEpochMs DESC, id DESC
+    SELECT m.* FROM media_items m
+    WHERE m.isTrashed = 0
+      AND (
+        m.albumId = :albumId
+        OR EXISTS (
+          SELECT 1 FROM albums a
+          WHERE a.id = :albumId AND a.messageThreadId > 0 AND m.topicId = a.messageThreadId
+        )
+      )
+    ORDER BY m.takenAtEpochMs DESC, m.id DESC
     """
   )
   fun observeMediaByAlbum(albumId: Long): Flow<List<MediaEntity>>
 
   @Query(
     """
-    SELECT * FROM media_items
-    WHERE isTrashed = 0 AND albumId = :albumId AND mediaType = 'PHOTO'
-    ORDER BY takenAtEpochMs DESC, id DESC
+    SELECT m.* FROM media_items m
+    WHERE m.isTrashed = 0
+      AND m.mediaType = 'PHOTO'
+      AND (
+        m.albumId = :albumId
+        OR EXISTS (
+          SELECT 1 FROM albums a
+          WHERE a.id = :albumId AND a.messageThreadId > 0 AND m.topicId = a.messageThreadId
+        )
+      )
+    ORDER BY m.takenAtEpochMs DESC, m.id DESC
     """
   )
   fun observeAlbumPhotos(albumId: Long): Flow<List<MediaEntity>>
 
   @Query(
     """
-    SELECT * FROM media_items
-    WHERE isTrashed = 0 AND albumId = :albumId AND mediaType = 'VIDEO'
-    ORDER BY takenAtEpochMs DESC, id DESC
+    SELECT m.* FROM media_items m
+    WHERE m.isTrashed = 0
+      AND m.mediaType = 'VIDEO'
+      AND (
+        m.albumId = :albumId
+        OR EXISTS (
+          SELECT 1 FROM albums a
+          WHERE a.id = :albumId AND a.messageThreadId > 0 AND m.topicId = a.messageThreadId
+        )
+      )
+    ORDER BY m.takenAtEpochMs DESC, m.id DESC
     """
   )
   fun observeAlbumVideos(albumId: Long): Flow<List<MediaEntity>>
@@ -216,6 +239,7 @@ interface MediaDao {
         telegramFileId = :fileId,
         telegramRemoteFileId = :remoteFileId,
         topicId = :topicId,
+        albumId = COALESCE(:albumId, albumId),
         telegramThumbFileId = COALESCE(:thumbFileId, telegramThumbFileId),
         lastError = NULL,
         updatedAtEpochMs = :updatedAt
@@ -230,6 +254,7 @@ interface MediaDao {
     remoteFileId: String?,
     topicId: Long?,
     thumbFileId: Int? = null,
+    albumId: Long? = null,
     updatedAt: Long = System.currentTimeMillis(),
   )
 
@@ -340,6 +365,37 @@ interface MediaDao {
   suspend fun updateCachedVideoPath(
     id: Long,
     localPath: String,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET cachedLocalVideoPath = NULL,
+        updatedAtEpochMs = :updatedAt
+    WHERE id = :id
+    """
+  )
+  suspend fun clearCachedVideoPath(
+    id: Long,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET telegramFileId = :fileId,
+        telegramRemoteFileId = COALESCE(:remoteFileId, telegramRemoteFileId),
+        telegramThumbFileId = COALESCE(:thumbFileId, telegramThumbFileId),
+        updatedAtEpochMs = :updatedAt
+    WHERE id = :id
+    """
+  )
+  suspend fun updateTelegramFileRefs(
+    id: Long,
+    fileId: Int?,
+    remoteFileId: String?,
+    thumbFileId: Int?,
     updatedAt: Long = System.currentTimeMillis(),
   )
 

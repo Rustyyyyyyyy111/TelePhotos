@@ -4,15 +4,18 @@ import com.laughing.telephotos.core.AppIconPreset
 import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.CacheCleanupManager
 import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.MediaStoreScanner
 import com.laughing.telephotos.core.NetworkAlertCoordinator
 import com.laughing.telephotos.core.NetworkInterruptedException
 import com.laughing.telephotos.core.NetworkOperationType
 import com.laughing.telephotos.core.NetworkRetryPolicy
 import com.laughing.telephotos.core.NetworkRetryTracker
 import com.laughing.telephotos.core.RetryDecision
+import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.core.TelegramCaptionMetadata
 import com.laughing.telephotos.core.TelegramCaptionPayload
 import com.laughing.telephotos.data.local.SyncTargetType
+import java.io.File
 import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
@@ -243,5 +246,38 @@ class ExampleUnitTest {
 
     assertTrue(NetworkRetryPolicy.isTransientNetworkError(NetworkInterruptedException("Mất mạng")))
     assertTrue(NetworkRetryPolicy.isTransientNetworkError(IllegalStateException("Client is closed")))
+  }
+
+  @Test
+  fun photoGridColumns_clampsBetween2And5_andDefaultsToAutoDestination() {
+    val defaults = AppSettings()
+    assertEquals(3, defaults.photoGridColumns)
+    assertEquals(0L, defaults.defaultUploadAlbumId)
+
+    assertEquals(2, SettingsPreferences.clampPhotoGridColumns(0))
+    assertEquals(2, SettingsPreferences.clampPhotoGridColumns(2))
+    assertEquals(4, SettingsPreferences.clampPhotoGridColumns(4))
+    assertEquals(5, SettingsPreferences.clampPhotoGridColumns(5))
+    assertEquals(5, SettingsPreferences.clampPhotoGridColumns(12))
+  }
+
+  @Test
+  fun mediaStoreScanner_isUsableLocalFile_rejectsMissingAndZeroByteFiles() {
+    assertFalse(MediaStoreScanner.isUsableLocalFile(null))
+    assertFalse(MediaStoreScanner.isUsableLocalFile("   "))
+    assertFalse(MediaStoreScanner.isUsableLocalFile("/nonexistent/telephotos/missing.jpg"))
+
+    val tempEmpty = File.createTempFile("tp_empty_", ".jpg")
+    val tempValid = File.createTempFile("tp_valid_", ".jpg")
+    try {
+      assertEquals(0L, tempEmpty.length())
+      assertFalse(MediaStoreScanner.isUsableLocalFile(tempEmpty.absolutePath))
+
+      tempValid.writeBytes(byteArrayOf(1, 2, 3, 4))
+      assertTrue(MediaStoreScanner.isUsableLocalFile(tempValid.absolutePath))
+    } finally {
+      tempEmpty.delete()
+      tempValid.delete()
+    }
   }
 }

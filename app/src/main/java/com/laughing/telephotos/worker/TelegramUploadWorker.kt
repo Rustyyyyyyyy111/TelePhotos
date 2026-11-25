@@ -235,6 +235,9 @@ class TelegramUploadWorker(
         // 2-layer deduplication guard: skip if hash was already uploaded
         val alreadyUploaded = mediaDao.findUploadedByHash(nextItem.contentHash)
         if (alreadyUploaded != null && alreadyUploaded.id != nextItem.id) {
+          val dest = runCatching { repo.resolveUploadDestination(nextItem, currentTarget) }.getOrNull()
+          val resolvedAlbumId = nextItem.albumId ?: alreadyUploaded.albumId ?: dest?.albumId
+          val resolvedTopicId = alreadyUploaded.topicId ?: nextItem.topicId ?: dest?.topicId
           if (alreadyUploaded.localUri == null && nextItem.localUri != null) {
             mediaDao.updateLocalUri(alreadyUploaded.id, nextItem.localUri)
             mediaDao.deleteByIds(listOf(nextItem.id))
@@ -245,7 +248,9 @@ class TelegramUploadWorker(
               messageId = alreadyUploaded.telegramMessageId ?: 0L,
               fileId = alreadyUploaded.telegramFileId,
               remoteFileId = alreadyUploaded.telegramRemoteFileId,
-              topicId = alreadyUploaded.topicId ?: nextItem.topicId,
+              topicId = resolvedTopicId,
+              thumbFileId = alreadyUploaded.telegramThumbFileId,
+              albumId = resolvedAlbumId,
             )
           }
           retryTracker.reset()
@@ -293,6 +298,9 @@ class TelegramUploadWorker(
             if (!trueHash.isNullOrBlank()) {
               val uploadedDup = mediaDao.findUploadedByHash(trueHash)
               if (uploadedDup != null && uploadedDup.id != nextItem.id) {
+                val dest = runCatching { repo.resolveUploadDestination(nextItem, currentTarget) }.getOrNull()
+                val resolvedAlbumId = nextItem.albumId ?: uploadedDup.albumId ?: dest?.albumId
+                val resolvedTopicId = uploadedDup.topicId ?: nextItem.topicId ?: dest?.topicId
                 if (uploadedDup.localUri == null && nextItem.localUri != null) {
                   mediaDao.updateLocalUri(uploadedDup.id, nextItem.localUri)
                   mediaDao.deleteByIds(listOf(nextItem.id))
@@ -303,7 +311,9 @@ class TelegramUploadWorker(
                     messageId = uploadedDup.telegramMessageId ?: 0L,
                     fileId = uploadedDup.telegramFileId,
                     remoteFileId = uploadedDup.telegramRemoteFileId,
-                    topicId = uploadedDup.topicId ?: nextItem.topicId,
+                    topicId = resolvedTopicId,
+                    thumbFileId = uploadedDup.telegramThumbFileId,
+                    albumId = resolvedAlbumId,
                   )
                 }
                 completed++
@@ -336,8 +346,12 @@ class TelegramUploadWorker(
               }
 
               val refreshedTarget = syncTargetDao.getTarget() ?: currentTarget
-              val resolvedTopicId = repo.resolveUploadTopicId(effectiveItem, refreshedTarget)
-              val caption = repo.buildDocumentCaption(effectiveItem.copy(topicId = resolvedTopicId))
+              val dest = repo.resolveUploadDestination(effectiveItem, refreshedTarget)
+              val resolvedTopicId = dest.topicId
+              val resolvedAlbumId = dest.albumId ?: effectiveItem.albumId
+              val caption = repo.buildDocumentCaption(
+                effectiveItem.copy(topicId = resolvedTopicId, albumId = resolvedAlbumId)
+              )
 
               val sent = tdLib.sendDocumentOriginal(
                 chatId = refreshedTarget.chatId,
@@ -351,15 +365,18 @@ class TelegramUploadWorker(
                 onProgressMade = { retryTracker.reset() },
               )
 
+              val finalTopicId = sent.messageThreadId ?: resolvedTopicId
               mediaDao.markUploaded(
                 id = effectiveItem.id,
                 chatId = sent.chatId,
                 messageId = sent.messageId,
                 fileId = sent.fileId,
                 remoteFileId = sent.remoteFileId,
-                topicId = sent.messageThreadId ?: resolvedTopicId,
+                topicId = finalTopicId,
                 thumbFileId = sent.thumbFileId,
+                albumId = resolvedAlbumId,
               )
+              repo.updateAlbumCoverIfMissing(resolvedAlbumId, effectiveItem.localUri)
               retryTracker.reset()
               completed++
               itemHandled = true
