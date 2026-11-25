@@ -36,7 +36,9 @@ import com.laughing.telephotos.data.local.SyncTargetEntity
 import com.laughing.telephotos.data.local.UploadStatus
 import com.laughing.telephotos.data.telegram.FileDownloadProgress
 import com.laughing.telephotos.data.telegram.FloodWaitException
+import com.laughing.telephotos.data.telegram.FloodWaitState
 import com.laughing.telephotos.data.telegram.ScannedTelegramMedia
+import com.laughing.telephotos.data.telegram.TdLibLifecycleState
 import com.laughing.telephotos.data.telegram.TdLibManager
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
@@ -44,6 +46,7 @@ import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import com.laughing.telephotos.worker.TelegramUploadWorker
 import java.io.File
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
@@ -93,6 +96,8 @@ class VaultRepository(
 
   val authState: StateFlow<TelegramAuthState> = tdLibManager.authState
   val connectionStatus: StateFlow<TelegramConnectionStatus> = tdLibManager.connectionStatus
+  val lifecycleState: StateFlow<TdLibLifecycleState> = tdLibManager.lifecycleState
+  val floodWaitState: StateFlow<FloodWaitState?> = tdLibManager.floodWaitState
   val networkInterruptionAlert: StateFlow<NetworkInterruptionAlert?> = networkAlertCoordinator.activeAlert
   val photosTimelineFlow: Flow<List<MediaEntity>> = mediaDao.observePhotosTimeline()
   val videosTimelineFlow: Flow<List<MediaEntity>> = mediaDao.observeVideosTimeline()
@@ -330,16 +335,15 @@ class VaultRepository(
   }
 
   /**
-   * Loads allowlisted private targets via a short-lived TDLib session, then disconnects immediately.
+   * Loads allowlisted private targets reusing the active TDLib session.
    */
-  suspend fun loadAllowedTargetsShortLived(): List<TelegramCandidateTarget> =
-    tdLibManager.withShortLivedConnection {
+  suspend fun loadAllowedTargets(): List<TelegramCandidateTarget> =
+    tdLibManager.withActiveSession(markSyncing = false) {
       tdLibManager.loadAllowedTargets()
     }
 
   /**
-   * Locks an allowlisted destination via a short-lived TDLib session, ensures "Đã xoá gần đây" topic,
-   * then disconnects TDLib immediately.
+   * Locks an allowlisted destination and ensures the 3 core topics ("Ảnh", "Video", "Đã Xoá Gần Đây").
    */
   suspend fun lockSyncTarget(candidate: TelegramCandidateTarget): Result<SyncTargetEntity> =
     runCatching {
@@ -348,7 +352,7 @@ class VaultRepository(
       var resolvedVideosId: Long? = null
 
       if (candidate.isForumEnabled) {
-        tdLibManager.withShortLivedConnection {
+        tdLibManager.withActiveSession(markSyncing = true) {
           val core = tdLibManager.ensureThreeCoreTopics(candidate.chatId)
           resolvedPhotosId = core.photosThreadId
           resolvedVideosId = core.videosThreadId
@@ -446,8 +450,7 @@ class VaultRepository(
   }
 
   /**
-   * Creates an Album (Forum Topic via short-lived TDLib connection when Forum-enabled),
-   * then disconnects TDLib immediately.
+   * Creates an Album (Forum Topic via active TDLib session when Forum-enabled).
    */
   suspend fun createAlbum(title: String, iconColor: Int = 0x6FB9F0): Result<AlbumEntity> =
     runCatching {
@@ -468,7 +471,7 @@ class VaultRepository(
       val settings = settingsPreferences.getCurrentSettings()
 
       val threadId = if (target.isForumEnabled && settings.isTelegramLoggedIn) {
-        tdLibManager.withShortLivedConnection {
+        tdLibManager.withActiveSession(markSyncing = true) {
           tdLibManager.findOrCreateMediaTopic(
             chatId = target.chatId,
             title = cleanTitle,
@@ -517,7 +520,7 @@ class VaultRepository(
     val forwardedTrashMsgIds = mutableMapOf<Long, Long>()
     if (needsTelegramAction && target != null) {
       runCatching {
-        tdLibManager.withShortLivedConnection {
+        tdLibManager.withActiveSession(markSyncing = true) {
           val resolvedTrashTopicId = trashTopicId ?: tdLibManager.findOrCreateTrashTopic(target.chatId)
           trashTopicId = resolvedTrashTopicId
           syncTargetDao.updateTrashThreadId(resolvedTrashTopicId)
@@ -735,8 +738,7 @@ class VaultRepository(
   }
 
   /**
-   * Read-only history reconstruction wrapped in a short-lived TDLib session.
-   * Immediately disconnects TDLib when finished.
+   * Read-only history reconstruction reusing the active TDLib session.
    */
   suspend fun syncHistoryReadOnly(): Result<Int> = runCatching {
     val target = syncTargetDao.getTarget()
@@ -749,7 +751,7 @@ class VaultRepository(
     val existingAll = mediaDao.getAllMediaSnapshot()
     val existingHashes = existingAll.filter { it.uploadStatus == UploadStatus.UPLOADED }
       .map { it.contentHash }.toHashSet()
-    val reconstructedCount = tdLibManager.withShortLivedConnection {
+    val reconstructedCount = tdLibManager.withActiveSession(markSyncing = true) {
       var totalAdded = 0
       if (target.isForumEnabled) {
         val topics = tdLibManager.getForumTopics(target.chatId)
@@ -816,7 +818,7 @@ class VaultRepository(
     pruneSystemTopicAlbums()
     settingsPreferences.updateLastHistorySync(System.currentTimeMillis())
     settingsPreferences.setLastSyncStatusMessage(
-      "Đã quét chỉ đọc xong ($reconstructedCount mục mới) — Đã ngắt kết nối Telegram"
+      "Đã quét chỉ đọc xong ($reconstructedCount mục mới)"
     )
     reconstructedCount
   }
@@ -1113,11 +1115,15 @@ class VaultRepository(
     }
 
     val now = System.currentTimeMillis()
-    if (settings.floodWaitUntilEpochMs > now) {
-      val rem = ((settings.floodWaitUntilEpochMs - now) / 1000L).coerceAtLeast(1L)
-      error("Telegram đang giới hạn tốc độ. Vui lòng đợi thêm $rem giây.")
-    } else if (settings.floodWaitUntilEpochMs > 0L) {
-      settingsPreferences.clearFloodWait()
+    val activeUnlockMs = maxOf(
+      settings.floodWaitUntilEpochMs,
+      tdLibManager.floodWaitState.value?.unlockAtEpochMs ?: 0L,
+    )
+    if (activeUnlockMs > now) {
+      val rem = ((activeUnlockMs - now + 999L) / 1000L).coerceAtLeast(1L)
+      error("Telegram đang giới hạn tốc độ (FLOOD_WAIT). Hàng đợi tạm khoá thêm $rem giây.")
+    } else if (settings.floodWaitUntilEpochMs > 0L || tdLibManager.floodWaitState.value != null) {
+      tdLibManager.clearFloodWait()
     }
 
     if (settings.wifiOnlyUpload && !isWifiConnected()) {
@@ -1173,26 +1179,75 @@ class VaultRepository(
   }
 
   /**
+   * Reschedules TelegramUploadWorker after a long FLOOD_WAIT cooldown expires so no wake lock
+   * is held while waiting.
+   */
+  suspend fun scheduleUploadAfterFloodWait(
+    delayMs: Long,
+    filterMediaType: MediaType?,
+  ) {
+    val settings = settingsPreferences.getCurrentSettings()
+    val networkType = if (settings.wifiOnlyUpload) NetworkType.UNMETERED else NetworkType.CONNECTED
+    val constraints = Constraints.Builder()
+      .setRequiredNetworkType(networkType)
+      .build()
+
+    val inputData = workDataOf(
+      TelegramUploadWorker.KEY_FILTER_MEDIA_TYPE to filterMediaType?.name,
+    )
+
+    val request = OneTimeWorkRequestBuilder<TelegramUploadWorker>()
+      .setInitialDelay(delayMs.coerceAtLeast(1_000L), TimeUnit.MILLISECONDS)
+      .setConstraints(constraints)
+      .setInputData(inputData)
+      .build()
+
+    WorkManager.getInstance(context).enqueueUniqueWork(
+      TelegramUploadWorker.UNIQUE_WORK_NAME,
+      ExistingWorkPolicy.REPLACE,
+      request,
+    )
+  }
+
+  /**
    * Immediately cancels the running manual WorkManager batch, resets interrupted items,
-   * and closes TDLib immediately so no background connection remains open.
+   * trims TDLib cache, and keeps the foreground session alive (or closes if backgrounded).
    */
   suspend fun stopManualSync() {
     WorkManager.getInstance(context).cancelUniqueWork(TelegramUploadWorker.UNIQUE_WORK_NAME)
     mediaDao.resetInterruptedUploadsToQueued()
-    tdLibManager.releaseShortLivedSession(forceClose = true)
+    tdLibManager.optimizeStorageLightweight()
+    if (!tdLibManager.isAppInForeground()) {
+      tdLibManager.closeConnectionIdle(preserveWaitApiState = false)
+    }
     settingsPreferences.setLastSyncStatusMessage(
-      "Đã dừng đồng bộ — Đã ngắt kết nối Telegram"
+      if (tdLibManager.isAppInForeground()) {
+        "Đã dừng đồng bộ — Phiên Telegram sẵn sàng"
+      } else {
+        "Đã dừng đồng bộ — Đã chuyển sang chế độ nền"
+      }
     )
   }
 
+  /**
+   * Records dynamic FLOOD_WAIT unlock timestamp without closing or reconnecting TDLib,
+   * and locks/pauses the upload queue until unlockAtEpochMs expires.
+   */
   suspend fun handleFloodWait(exception: FloodWaitException) {
-    val bufferSec = TelegramPolicyGuard.FLOOD_WAIT_SAFETY_BUFFER_SEC
-    val totalWaitSec = exception.retryAfterSeconds + bufferSec
-    val untilMs = System.currentTimeMillis() + (totalWaitSec * 1000L)
-    settingsPreferences.setFloodWaitUntil(untilMs, exception.message)
-    mediaDao.pauseActiveQueueForFloodWait("Tạm dừng ${totalWaitSec}s do giới hạn Telegram")
+    val now = System.currentTimeMillis()
+    val unlockAtMs = exception.unlockAtEpochMs.takeIf { it > now }
+      ?: TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(exception.retryAfterSeconds, now)
+    val totalWaitSec = ((unlockAtMs - now + 999L) / 1000L).toInt()
+      .coerceAtLeast(exception.retryAfterSeconds)
+
+    tdLibManager.recordFloodWait(
+      retryAfterSeconds = exception.retryAfterSeconds,
+      unlockAtEpochMs = unlockAtMs,
+      reason = exception.message,
+    )
+    mediaDao.pauseActiveQueueForFloodWait("Tạm khoá ${totalWaitSec}s do giới hạn Telegram (FLOOD_WAIT_${exception.retryAfterSeconds})")
     settingsPreferences.setLastSyncStatusMessage(
-      "Tạm dừng ${totalWaitSec}s do giới hạn Telegram — Đã ngắt kết nối Telegram"
+      "Telegram giới hạn tốc độ (${exception.retryAfterSeconds}s) — Tạm khoá hàng đợi ${totalWaitSec}s (giữ phiên nhàn rỗi)"
     )
   }
 

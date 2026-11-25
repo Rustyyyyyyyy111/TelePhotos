@@ -98,9 +98,19 @@ object NetworkRetryPolicy {
     return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
   }
 
+  fun isFloodWaitError(throwable: Throwable?): Boolean {
+    if (throwable is FloodWaitException) return true
+    val msg = throwable?.message.orEmpty()
+    return msg.contains("FLOOD_WAIT", ignoreCase = true) ||
+      msg.contains("retry after", ignoreCase = true) ||
+      msg.contains("Too Many Requests", ignoreCase = true) ||
+      msg.contains("giới hạn tốc độ", ignoreCase = true)
+  }
+
   fun isTransientNetworkError(throwable: Throwable?, context: Context? = null): Boolean {
     if (throwable is CancellationException) return false
-    if (throwable is FloodWaitException) return false
+    if (throwable is SecurityException) return false
+    if (isFloodWaitError(throwable)) return false
     if (throwable is NetworkInterruptedException ||
       throwable is StalledTransferException ||
       throwable is IOException ||
@@ -117,7 +127,8 @@ object NetworkRetryPolicy {
       msg.contains("thiếu quyền") ||
       msg.contains("chưa bật quyền") ||
       msg.contains("chưa đăng nhập") ||
-      msg.contains("chưa cấu hình api")
+      msg.contains("chưa cấu hình api") ||
+      msg.contains("chính sách chỉ đọc")
     ) {
       return false
     }
@@ -133,6 +144,7 @@ object NetworkRetryPolicy {
       msg.contains("eof") ||
       msg.contains("unavailable") ||
       msg.contains("waitingfornetwork") ||
-      msg.contains("tdlib chưa sẵn sàng")
+      msg.contains("tdlib chưa sẵn sàng") ||
+      msg.contains("client is closed")
   }
 }

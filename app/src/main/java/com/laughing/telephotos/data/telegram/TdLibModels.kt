@@ -4,11 +4,33 @@ import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.SyncTargetType
 
 enum class TelegramConnectionStatus(val labelVi: String) {
-  DISCONNECTED_IDLE("Đã ngắt kết nối Telegram (chỉ kết nối khi bấm đồng bộ)"),
+  DISCONNECTED_IDLE("Đã ngắt kết nối (Chờ thao tác)"),
   CONNECTING("Đang kết nối Telegram..."),
-  CONNECTED_ACTIVE("Đang kết nối Telegram"),
-  DISCONNECTING("Đang ngắt kết nối Telegram..."),
+  RECONNECTING("Đang kết nối lại Telegram..."),
+  READY("Sẵn sàng • Đã kết nối Telegram"),
+  SYNCING("Đang đồng bộ / Đang tải..."),
+  FLOOD_WAIT("Tạm khoá hàng đợi (FLOOD_WAIT)"),
+  DISCONNECTING("Đang chuyển sang chế độ nền..."),
 }
+
+enum class TdLibLifecycleState {
+  IDLE,
+  CONNECTING,
+  RECONNECTING,
+  READY,
+  AWAITING_CREDENTIALS,
+  AWAITING_PHONE,
+  AWAITING_CODE,
+  AWAITING_PASSWORD,
+  FLOOD_WAIT,
+  ERROR,
+}
+
+data class FloodWaitState(
+  val retryAfterSeconds: Int,
+  val unlockAtEpochMs: Long,
+  val reason: String,
+)
 
 sealed interface TelegramAuthState {
   data object Uninitialized : TelegramAuthState
@@ -82,5 +104,6 @@ data class FileDownloadProgress(
 
 class FloodWaitException(
   val retryAfterSeconds: Int,
+  val unlockAtEpochMs: Long,
   override val message: String,
 ) : Exception(message)

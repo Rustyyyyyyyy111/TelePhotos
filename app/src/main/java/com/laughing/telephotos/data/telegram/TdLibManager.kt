@@ -19,8 +19,6 @@ import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -39,7 +37,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -59,6 +56,16 @@ class PendingUploadInterruptedException(
   cause: Throwable? = null,
 ) : java.io.IOException(message, cause)
 
+/**
+ * Persistent foreground-reusable & self-recovering TDLib manager:
+ * - Keeps one app-wide TDLib client alive while the app is in foreground so actions reuse the session.
+ * - Uses Mutex + single-flight CompletableDeferred to prevent duplicate clients or init races.
+ * - Tracks all in-flight TDLib requests via ConcurrentHashMap with timeouts.
+ * - Routes every TdApi.Function through TelegramPolicyGuard.assertAllowedFunction.
+ * - Keeps the session idle/alive during FLOOD_WAIT and persists cooldown expiry without reconnecting.
+ * - Runs lightweight OptimizeStorage + Close() only when backgrounded (with no active workers/transfers),
+ *   on explicit logout, or when switching API credentials.
+ */
 class TdLibManager(
   private val context: Context,
   private val settingsPreferences: SettingsPreferences,
@@ -67,13 +74,22 @@ class TdLibManager(
 
   private val internalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val lifecycleMutex = Mutex()
-  private val activeShortLivedActions = AtomicInteger(0)
+  private val activeTransfers = AtomicInteger(0)
+  private val activeWorkers = AtomicInteger(0)
+  private val requestIdGenerator = AtomicLong(1L)
+  private val inFlightRequests = ConcurrentHashMap<Long, CompletableDeferred<TdApi.Object>>()
 
   private val _authState = MutableStateFlow<TelegramAuthState>(TelegramAuthState.Uninitialized)
   val authState: StateFlow<TelegramAuthState> = _authState.asStateFlow()
 
   private val _connectionStatus = MutableStateFlow(TelegramConnectionStatus.DISCONNECTED_IDLE)
   val connectionStatus: StateFlow<TelegramConnectionStatus> = _connectionStatus.asStateFlow()
+
+  private val _lifecycleState = MutableStateFlow(TdLibLifecycleState.IDLE)
+  val lifecycleState: StateFlow<TdLibLifecycleState> = _lifecycleState.asStateFlow()
+
+  private val _floodWaitState = MutableStateFlow<FloodWaitState?>(null)
+  val floodWaitState: StateFlow<FloodWaitState?> = _floodWaitState.asStateFlow()
 
   private val fileUpdates = MutableSharedFlow<TdApi.File>(extraBufferCapacity = 64)
   private val messageSendEvents = MutableSharedFlow<MessageSendEvent>(extraBufferCapacity = 64)
@@ -91,40 +107,196 @@ class TdLibManager(
   @Volatile private var waitingForParameters: Boolean = false
   @Volatile private var closedDeferred: CompletableDeferred<Unit>? = null
   @Volatile private var tdConnectionState: TdApi.ConnectionState? = null
+  @Volatile private var activeConnectDeferred: CompletableDeferred<Result<TelegramAuthState.Ready>>? = null
+  @Volatile private var isIntentionalShutdown: Boolean = false
+  @Volatile private var appInForeground: Boolean = false
+  @Volatile private var closeWhenIdlePending: Boolean = false
+
+  fun isAppInForeground(): Boolean = appInForeground
+
+  fun isSessionReady(): Boolean =
+    client != null && _authState.value is TelegramAuthState.Ready &&
+      tdConnectionState !is TdApi.ConnectionStateWaitingForNetwork
+
+  private fun isFloodWaitCurrentlyActive(): Boolean {
+    val active = _floodWaitState.value ?: return false
+    return active.unlockAtEpochMs > System.currentTimeMillis()
+  }
+
+  private fun refreshSteadyStatus() {
+    val currentFlood = _floodWaitState.value
+    if (currentFlood != null && currentFlood.unlockAtEpochMs > System.currentTimeMillis()) {
+      _connectionStatus.value = TelegramConnectionStatus.FLOOD_WAIT
+      _lifecycleState.value = TdLibLifecycleState.FLOOD_WAIT
+      return
+    }
+    when {
+      activeWorkers.get() > 0 || activeTransfers.get() > 0 -> {
+        _connectionStatus.value = TelegramConnectionStatus.SYNCING
+        if (_authState.value is TelegramAuthState.Ready) {
+          _lifecycleState.value = TdLibLifecycleState.READY
+        }
+      }
+      client != null && _authState.value is TelegramAuthState.Ready -> {
+        _connectionStatus.value = TelegramConnectionStatus.READY
+        _lifecycleState.value = TdLibLifecycleState.READY
+      }
+      client == null -> {
+        _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+        _lifecycleState.value = TdLibLifecycleState.IDLE
+      }
+    }
+  }
 
   /**
-   * Initializes TDLib strictly on-demand (never called at Application startup).
+   * Called by TelePhotosApplication when the app enters the foreground.
+   * Restores any persisted FLOOD_WAIT state and proactively warms up the reusable session
+   * if the user is already authenticated.
+   */
+  suspend fun onAppForegrounded() {
+    appInForeground = true
+    closeWhenIdlePending = false
+    val settings = settingsPreferences.getCurrentSettings()
+    val now = System.currentTimeMillis()
+    if (settings.floodWaitUntilEpochMs > now) {
+      _floodWaitState.value = FloodWaitState(
+        retryAfterSeconds = settings.floodWaitRetryAfterSec.coerceAtLeast(1),
+        unlockAtEpochMs = settings.floodWaitUntilEpochMs,
+        reason = settings.floodWaitReason ?: "Telegram đang giới hạn tốc độ",
+      )
+      _connectionStatus.value = TelegramConnectionStatus.FLOOD_WAIT
+      _lifecycleState.value = TdLibLifecycleState.FLOOD_WAIT
+    } else if (settings.floodWaitUntilEpochMs > 0L) {
+      settingsPreferences.clearFloodWait()
+      _floodWaitState.value = null
+    }
+
+    if (settings.isTelegramLoggedIn &&
+      NetworkRetryPolicy.isNetworkAvailable(context) &&
+      !isSessionReady()
+    ) {
+      runCatching { ensureConnected(forceReconnect = false) }
+    } else {
+      refreshSteadyStatus()
+    }
+  }
+
+  /**
+   * Called by TelePhotosApplication when all non-config-changing activities stop (app backgrounded).
+   * Closes TDLib cleanly once any active transfers/workers finish.
+   */
+  suspend fun onAppBackgrounded() {
+    appInForeground = false
+    if (activeTransfers.get() > 0 || activeWorkers.get() > 0) {
+      closeWhenIdlePending = true
+      return
+    }
+    closeConnectionIdle(preserveWaitApiState = false)
+  }
+
+  /**
+   * Initializes TDLib strictly on-demand when UI/Auth or foreground session needs it.
    */
   suspend fun ensureInitializedOnDemand() {
+    lifecycleMutex.withLock {
+      ensureInitializedLocked(isReconnect = false)
+    }
+  }
+
+  private suspend fun ensureInitializedLocked(isReconnect: Boolean) {
     if (client != null && _authState.value !is TelegramAuthState.WaitApiCredentials) {
       return
     }
-
+    isIntentionalShutdown = false
     val settings = settingsPreferences.getCurrentSettings()
     val resolved = resolveCredentials(settings.customTelegramApiId, settings.customTelegramApiHash)
     if (resolved == null) {
       _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+      _lifecycleState.value = TdLibLifecycleState.AWAITING_CREDENTIALS
       _authState.value = TelegramAuthState.WaitApiCredentials()
       return
     }
 
     activeApiId = resolved.first
     activeApiHash = resolved.second
-    _connectionStatus.value = TelegramConnectionStatus.CONNECTING
+    _connectionStatus.value = if (isReconnect) {
+      TelegramConnectionStatus.RECONNECTING
+    } else {
+      TelegramConnectionStatus.CONNECTING
+    }
+    _lifecycleState.value = if (isReconnect) {
+      TdLibLifecycleState.RECONNECTING
+    } else {
+      TdLibLifecycleState.CONNECTING
+    }
     createClientIfNeeded()
   }
 
-  fun isSessionReady(): Boolean =
-    client != null && _authState.value is TelegramAuthState.Ready &&
-      tdConnectionState !is TdApi.ConnectionStateWaitingForNetwork
-
   /**
-   * Opens a short-lived TDLib session for a single user-triggered action.
+   * Single-flight connection guarantee: concurrent callers join the same CompletableDeferred
+   * so duplicate TDLib clients are never spawned. Automatically recovers if closed/uninitialized.
    */
-  suspend fun acquireShortLivedSession(timeoutMs: Long = 20_000L): Result<TelegramAuthState.Ready> {
-    activeShortLivedActions.incrementAndGet()
+  suspend fun ensureConnected(
+    forceReconnect: Boolean = false,
+    timeoutMs: Long = 20_000L,
+  ): Result<TelegramAuthState.Ready> {
+    if (!forceReconnect && isSessionReady()) {
+      val currentReady = _authState.value as? TelegramAuthState.Ready
+      if (currentReady != null) {
+        refreshSteadyStatus()
+        return Result.success(currentReady)
+      }
+    }
+
+    val deferred = lifecycleMutex.withLock {
+      if (!forceReconnect && isSessionReady()) {
+        val currentReady = _authState.value as? TelegramAuthState.Ready
+        if (currentReady != null) {
+          refreshSteadyStatus()
+          return Result.success(currentReady)
+        }
+      }
+
+      val existing = activeConnectDeferred
+      if (!forceReconnect && existing != null && !existing.isCompleted) {
+        existing
+      } else {
+        if (forceReconnect) {
+          closeClientLocked(
+            preserveWaitApiState = false,
+            closingStatus = TelegramConnectionStatus.RECONNECTING,
+          )
+        }
+        val newDeferred = CompletableDeferred<Result<TelegramAuthState.Ready>>()
+        activeConnectDeferred = newDeferred
+        internalScope.launch {
+          val result = awaitOrStartSessionInternal(
+            isReconnect = forceReconnect,
+            timeoutMs = timeoutMs,
+          )
+          newDeferred.complete(result)
+          if (activeConnectDeferred === newDeferred) {
+            activeConnectDeferred = null
+          }
+        }
+        newDeferred
+      }
+    }
+
+    val awaited = withTimeoutOrNull(timeoutMs + 1_000L) {
+      deferred.await()
+    }
+    return awaited ?: Result.failure(
+      NetworkInterruptedException("Hết thời gian kết nối tới Telegram. Vui lòng thử lại.")
+    )
+  }
+
+  private suspend fun awaitOrStartSessionInternal(
+    isReconnect: Boolean,
+    timeoutMs: Long,
+  ): Result<TelegramAuthState.Ready> {
     lifecycleMutex.withLock {
-      ensureInitializedOnDemand()
+      ensureInitializedLocked(isReconnect = isReconnect)
     }
 
     val terminalState = withTimeoutOrNull(timeoutMs) {
@@ -140,74 +312,187 @@ class TdLibManager(
 
     return when (terminalState) {
       is TelegramAuthState.Ready -> {
-        _connectionStatus.value = TelegramConnectionStatus.CONNECTED_ACTIVE
+        refreshSteadyStatus()
         Result.success(terminalState)
       }
       is TelegramAuthState.WaitApiCredentials -> {
-        releaseShortLivedSession(forceClose = false)
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_CREDENTIALS
+        _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
         Result.failure(IllegalStateException("Chưa cấu hình API ID / API Hash Telegram trong Setting."))
       }
-      is TelegramAuthState.WaitPhoneNumber,
-      is TelegramAuthState.WaitCode,
-      is TelegramAuthState.WaitPassword -> {
-        releaseShortLivedSession(forceClose = false)
+      is TelegramAuthState.WaitPhoneNumber -> {
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_PHONE
         Result.failure(IllegalStateException("Phiên Telegram chưa đăng nhập. Vui lòng vào Setting để đăng nhập."))
       }
+      is TelegramAuthState.WaitCode -> {
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_CODE
+        Result.failure(IllegalStateException("Phiên Telegram đang chờ mã OTP. Vui lòng vào Setting để đăng nhập."))
+      }
+      is TelegramAuthState.WaitPassword -> {
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_PASSWORD
+        Result.failure(IllegalStateException("Phiên Telegram đang chờ mật khẩu 2 bước. Vui lòng vào Setting để đăng nhập."))
+      }
       is TelegramAuthState.Error -> {
-        releaseShortLivedSession(forceClose = false)
+        _lifecycleState.value = TdLibLifecycleState.ERROR
         Result.failure(IllegalStateException(terminalState.messageVi))
       }
       null, TelegramAuthState.Uninitialized -> {
-        releaseShortLivedSession(forceClose = false)
-        Result.failure(IllegalStateException("Hết thời gian kết nối tới Telegram. Vui lòng thử lại."))
+        _lifecycleState.value = TdLibLifecycleState.ERROR
+        Result.failure(NetworkInterruptedException("Hết thời gian kết nối tới Telegram. Vui lòng thử lại."))
       }
     }
   }
 
-  suspend fun releaseShortLivedSession(forceClose: Boolean = false) {
-    val remaining = if (forceClose) {
-      activeShortLivedActions.set(0)
-      0
-    } else {
-      activeShortLivedActions.decrementAndGet().coerceAtLeast(0)
+  fun beginTransfer(markSyncing: Boolean = true) {
+    activeTransfers.incrementAndGet()
+    if (markSyncing && !isFloodWaitCurrentlyActive()) {
+      _connectionStatus.value = TelegramConnectionStatus.SYNCING
     }
-    if (remaining == 0 || forceClose) {
+  }
+
+  suspend fun endTransfer() {
+    val remaining = activeTransfers.decrementAndGet().coerceAtLeast(0)
+    if (remaining == 0 && !appInForeground && closeWhenIdlePending && activeWorkers.get() == 0) {
       closeConnectionIdle(preserveWaitApiState = false)
+    } else {
+      refreshSteadyStatus()
+    }
+  }
+
+  fun beginWorkLease() {
+    activeWorkers.incrementAndGet()
+    if (!isFloodWaitCurrentlyActive()) {
+      _connectionStatus.value = TelegramConnectionStatus.SYNCING
+    }
+  }
+
+  suspend fun endWorkLease() {
+    val remaining = activeWorkers.decrementAndGet().coerceAtLeast(0)
+    if (isSessionReady()) {
+      optimizeStorageLightweight()
+    }
+    if (remaining == 0 && !appInForeground && activeTransfers.get() == 0) {
+      closeConnectionIdle(preserveWaitApiState = false)
+    } else {
+      refreshSteadyStatus()
     }
   }
 
   /**
-   * Executes a single Telegram action inside a short-lived TDLib connection
-   * and immediately closes TDLib via TdApi.Close() when finished, failed, or cancelled.
+   * Executes a Telegram operation reusing the active TDLib session (connecting if needed).
+   * Keeps the session alive while the app is in the foreground.
    */
-  suspend fun <T> withShortLivedConnection(block: suspend () -> T): T {
-    acquireShortLivedSession().getOrThrow()
+  suspend fun <T> withActiveSession(
+    markSyncing: Boolean = true,
+    block: suspend () -> T,
+  ): T {
+    beginTransfer(markSyncing = markSyncing)
     return try {
+      ensureConnected().getOrThrow()
       block()
     } finally {
       withContext(NonCancellable) {
-        releaseShortLivedSession(forceClose = false)
+        endTransfer()
       }
     }
   }
 
   /**
-   * Immediately closes the TDLib client to free native threads, sockets, and RAM on low-end devices.
-   * Preserves local DataStore login profile so subsequent actions reconnect without re-entering OTP.
+   * Lightweight cache & TDLib database trim safe to run without tearing down the active session.
+   */
+  suspend fun optimizeStorageLightweight() {
+    val currentClient = client
+    if (currentClient != null && _authState.value is TelegramAuthState.Ready) {
+      runCatching {
+        withTimeoutOrNull(1_200L) {
+          sendFunction(
+            TdApi.OptimizeStorage(
+              400L * 1024L * 1024L,
+              -1,
+              -1,
+              60 * 60 * 24,
+              null,
+              null,
+              null,
+              false,
+              50,
+            ),
+            timeoutMs = 1_200L,
+          )
+        }
+      }
+    }
+    runCatching { CacheCleanupManager.enforceCacheLimitLru(context) }
+  }
+
+  /**
+   * Records a dynamic FLOOD_WAIT cooldown without closing or reconnecting the TDLib client.
+   */
+  suspend fun recordFloodWait(
+    retryAfterSeconds: Int,
+    unlockAtEpochMs: Long,
+    reason: String,
+  ) {
+    val safeRetry = retryAfterSeconds.coerceAtLeast(1)
+    _floodWaitState.value = FloodWaitState(
+      retryAfterSeconds = safeRetry,
+      unlockAtEpochMs = unlockAtEpochMs,
+      reason = reason,
+    )
+    _connectionStatus.value = TelegramConnectionStatus.FLOOD_WAIT
+    _lifecycleState.value = TdLibLifecycleState.FLOOD_WAIT
+    settingsPreferences.setFloodWaitUntil(
+      untilEpochMs = unlockAtEpochMs,
+      reason = reason,
+      retryAfterSeconds = safeRetry,
+    )
+  }
+
+  suspend fun clearFloodWait() {
+    _floodWaitState.value = null
+    settingsPreferences.clearFloodWait()
+    refreshSteadyStatus()
+  }
+
+  /**
+   * Closes the TDLib client cleanly (background transition, logout, or credential switch).
+   * Preserves local DataStore login profile so subsequent sessions resume without OTP.
    */
   suspend fun closeConnectionIdle(preserveWaitApiState: Boolean = false) {
     lifecycleMutex.withLock {
-      val currentClient = client
-      if (currentClient == null) {
-        _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
-        if (!preserveWaitApiState && _authState.value !is TelegramAuthState.WaitApiCredentials) {
-          _authState.value = TelegramAuthState.Uninitialized
-        }
-        return
-      }
+      closeClientLocked(
+        preserveWaitApiState = preserveWaitApiState,
+        closingStatus = TelegramConnectionStatus.DISCONNECTING,
+      )
+    }
+  }
 
-      _connectionStatus.value = TelegramConnectionStatus.DISCONNECTING
-      // Trim TDLib file database before closing if authenticated and active
+  private suspend fun closeClientLocked(
+    preserveWaitApiState: Boolean,
+    closingStatus: TelegramConnectionStatus,
+  ) {
+    val currentClient = client
+    if (currentClient == null) {
+      failAllInFlightRequests("Client is closed")
+      if (!isFloodWaitCurrentlyActive()) {
+        _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+        _lifecycleState.value = if (preserveWaitApiState) {
+          TdLibLifecycleState.AWAITING_CREDENTIALS
+        } else {
+          TdLibLifecycleState.IDLE
+        }
+      }
+      if (!preserveWaitApiState && _authState.value !is TelegramAuthState.WaitApiCredentials) {
+        _authState.value = TelegramAuthState.Uninitialized
+      }
+      return
+    }
+
+    isIntentionalShutdown = true
+    closeWhenIdlePending = false
+    _connectionStatus.value = closingStatus
+
+    if (_authState.value is TelegramAuthState.Ready) {
       runCatching {
         withTimeoutOrNull(800L) {
           sendSuspending(
@@ -221,26 +506,52 @@ class TdLibManager(
               null,
               false,
               50,
-            )
+            ),
+            timeoutMs = 800L,
           )
         }
       }
-      val deferred = CompletableDeferred<Unit>()
-      closedDeferred = deferred
-      runCatching {
-        currentClient.send(TdApi.Close()) { }
-      }
-      withTimeoutOrNull(1200L) {
-        deferred.await()
-      }
-      closedDeferred = null
-      client = null
-      waitingForParameters = false
-      if (!preserveWaitApiState) {
-        _authState.value = TelegramAuthState.Uninitialized
-      }
+    }
+
+    val deferred = CompletableDeferred<Unit>()
+    closedDeferred = deferred
+    runCatching {
+      val closeFn = TdApi.Close()
+      TelegramPolicyGuard.assertAllowedFunction(closeFn)
+      currentClient.send(closeFn) { }
+    }
+    withTimeoutOrNull(1_200L) {
+      deferred.await()
+    }
+    closedDeferred = null
+    client = null
+    waitingForParameters = false
+    failAllInFlightRequests("Client is closed")
+
+    if (!preserveWaitApiState) {
+      _authState.value = TelegramAuthState.Uninitialized
+    }
+    if (isFloodWaitCurrentlyActive()) {
+      _connectionStatus.value = TelegramConnectionStatus.FLOOD_WAIT
+      _lifecycleState.value = TdLibLifecycleState.FLOOD_WAIT
+    } else {
       _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
-      runCatching { CacheCleanupManager.enforceCacheLimitLru(context) }
+      _lifecycleState.value = if (preserveWaitApiState) {
+        TdLibLifecycleState.AWAITING_CREDENTIALS
+      } else {
+        TdLibLifecycleState.IDLE
+      }
+    }
+    runCatching { CacheCleanupManager.enforceCacheLimitLru(context) }
+  }
+
+  private fun failAllInFlightRequests(reason: String) {
+    val entries = inFlightRequests.entries.toList()
+    inFlightRequests.clear()
+    for ((_, deferred) in entries) {
+      if (!deferred.isCompleted) {
+        deferred.completeExceptionally(NetworkInterruptedException(reason))
+      }
     }
   }
 
@@ -265,18 +576,27 @@ class TdLibManager(
       require(cleanHash.length >= 16) { "API Hash không hợp lệ (quá ngắn)" }
 
       settingsPreferences.saveApiCredentials(parsedId, cleanHash)
-      activeApiId = parsedId
-      activeApiHash = cleanHash
-      _connectionStatus.value = TelegramConnectionStatus.CONNECTING
-
-      if (client == null) {
-        createClientIfNeeded()
-      } else if (waitingForParameters) {
-        applyTdlibParameters()
-      } else {
-        closeConnectionIdle(preserveWaitApiState = false)
+      lifecycleMutex.withLock {
+        activeApiId = parsedId
+        activeApiHash = cleanHash
+        isIntentionalShutdown = false
         _connectionStatus.value = TelegramConnectionStatus.CONNECTING
-        createClientIfNeeded()
+        _lifecycleState.value = TdLibLifecycleState.CONNECTING
+
+        if (client == null) {
+          createClientIfNeeded()
+        } else if (waitingForParameters) {
+          applyTdlibParameters()
+        } else {
+          closeClientLocked(
+            preserveWaitApiState = false,
+            closingStatus = TelegramConnectionStatus.RECONNECTING,
+          )
+          _connectionStatus.value = TelegramConnectionStatus.CONNECTING
+          _lifecycleState.value = TdLibLifecycleState.CONNECTING
+          isIntentionalShutdown = false
+          createClientIfNeeded()
+        }
       }
       Unit
     }
@@ -286,6 +606,7 @@ class TdLibManager(
     val currentId = if (settings.customTelegramApiId > 0) settings.customTelegramApiId.toString() else ""
     val currentHash = settings.customTelegramApiHash
     closeConnectionIdle(preserveWaitApiState = true)
+    _lifecycleState.value = TdLibLifecycleState.AWAITING_CREDENTIALS
     _authState.value = TelegramAuthState.WaitApiCredentials(
       initialApiId = currentId,
       initialApiHash = currentHash,
@@ -293,22 +614,26 @@ class TdLibManager(
   }
 
   fun returnToPhoneNumberStep() {
+    _lifecycleState.value = TdLibLifecycleState.AWAITING_PHONE
     _authState.value = TelegramAuthState.WaitPhoneNumber(initialPhone = lastPhoneEntered)
   }
 
   private fun createClientIfNeeded() {
     if (client != null) return
+    isIntentionalShutdown = false
     val created = runCatching {
       Client.create(
         { obj -> handleUpdate(obj) },
         { err ->
           _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+          _lifecycleState.value = TdLibLifecycleState.ERROR
           _authState.value = TelegramAuthState.Error(
             TelegramPolicyGuard.translateAuthError(err.message)
           )
         },
         { err ->
           _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+          _lifecycleState.value = TdLibLifecycleState.ERROR
           _authState.value = TelegramAuthState.Error(
             TelegramPolicyGuard.translateAuthError(err.message)
           )
@@ -320,6 +645,7 @@ class TdLibManager(
       client = c
     }.onFailure { throwable ->
       _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+      _lifecycleState.value = TdLibLifecycleState.ERROR
       _authState.value = TelegramAuthState.Error(
         "Không thể khởi tạo thư viện TDLib trên thiết bị này: ${throwable.message ?: "Thiếu thư viện native"}"
       )
@@ -347,22 +673,26 @@ class TdLibManager(
           applyTdlibParameters()
         } else {
           _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+          _lifecycleState.value = TdLibLifecycleState.AWAITING_CREDENTIALS
           _authState.value = TelegramAuthState.WaitApiCredentials()
         }
       }
       is TdApi.AuthorizationStateWaitPhoneNumber -> {
         waitingForParameters = false
-        _connectionStatus.value = TelegramConnectionStatus.CONNECTED_ACTIVE
+        _connectionStatus.value = TelegramConnectionStatus.CONNECTING
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_PHONE
         _authState.value = TelegramAuthState.WaitPhoneNumber(initialPhone = lastPhoneEntered)
       }
       is TdApi.AuthorizationStateWaitCode -> {
         waitingForParameters = false
-        _connectionStatus.value = TelegramConnectionStatus.CONNECTED_ACTIVE
+        _connectionStatus.value = TelegramConnectionStatus.CONNECTING
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_CODE
         _authState.value = TelegramAuthState.WaitCode(lastPhoneEntered)
       }
       is TdApi.AuthorizationStateWaitPassword -> {
         waitingForParameters = false
-        _connectionStatus.value = TelegramConnectionStatus.CONNECTED_ACTIVE
+        _connectionStatus.value = TelegramConnectionStatus.CONNECTING
+        _lifecycleState.value = TdLibLifecycleState.AWAITING_PASSWORD
         _authState.value = TelegramAuthState.WaitPassword(state.passwordHint ?: "")
       }
       is TdApi.AuthorizationStateReady -> {
@@ -372,10 +702,34 @@ class TdLibManager(
       is TdApi.AuthorizationStateClosed -> {
         client = null
         waitingForParameters = false
+        failAllInFlightRequests("Client is closed")
         closedDeferred?.complete(Unit)
-        _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+
+        val unexpectedClose = !isIntentionalShutdown
         if (_authState.value !is TelegramAuthState.WaitApiCredentials) {
           _authState.value = TelegramAuthState.Uninitialized
+        }
+        if (unexpectedClose && appInForeground && !isFloodWaitCurrentlyActive()) {
+          _connectionStatus.value = TelegramConnectionStatus.RECONNECTING
+          _lifecycleState.value = TdLibLifecycleState.RECONNECTING
+          internalScope.launch {
+            val settings = settingsPreferences.getCurrentSettings()
+            if (settings.isTelegramLoggedIn && NetworkRetryPolicy.isNetworkAvailable(context)) {
+              delay(500L)
+              ensureConnected(forceReconnect = false)
+            } else {
+              _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+              _lifecycleState.value = TdLibLifecycleState.IDLE
+            }
+          }
+        } else {
+          if (isFloodWaitCurrentlyActive()) {
+            _connectionStatus.value = TelegramConnectionStatus.FLOOD_WAIT
+            _lifecycleState.value = TdLibLifecycleState.FLOOD_WAIT
+          } else {
+            _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+            _lifecycleState.value = TdLibLifecycleState.IDLE
+          }
         }
       }
       else -> Unit
@@ -385,6 +739,7 @@ class TdLibManager(
   private fun applyTdlibParameters() {
     if (activeApiId <= 0 || activeApiHash.isBlank()) {
       _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+      _lifecycleState.value = TdLibLifecycleState.AWAITING_CREDENTIALS
       _authState.value = TelegramAuthState.WaitApiCredentials()
       return
     }
@@ -409,9 +764,11 @@ class TdLibManager(
       applicationVersion = "1.0"
     }
 
+    TelegramPolicyGuard.assertAllowedFunction(params)
     client?.send(params) { result ->
       if (result is TdApi.Error) {
         _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+        _lifecycleState.value = TdLibLifecycleState.ERROR
         _authState.value = TelegramAuthState.Error(
           TelegramPolicyGuard.translateAuthError(result.message)
         )
@@ -421,7 +778,9 @@ class TdLibManager(
 
   private fun fetchCurrentUser() {
     val c = client ?: return
-    c.send(TdApi.GetMe()) { obj ->
+    val getMe = TdApi.GetMe()
+    TelegramPolicyGuard.assertAllowedFunction(getMe)
+    c.send(getMe) { obj ->
       when (obj) {
         is TdApi.User -> {
           cachedUserId = obj.id
@@ -435,15 +794,16 @@ class TdLibManager(
               phoneNumber = phone,
             )
           }
-          _connectionStatus.value = TelegramConnectionStatus.CONNECTED_ACTIVE
           _authState.value = TelegramAuthState.Ready(
             userId = obj.id,
             displayName = name,
             phoneNumber = phone,
           )
+          refreshSteadyStatus()
         }
         is TdApi.Error -> {
           _connectionStatus.value = TelegramConnectionStatus.DISCONNECTED_IDLE
+          _lifecycleState.value = TdLibLifecycleState.ERROR
           _authState.value = TelegramAuthState.Error(
             TelegramPolicyGuard.translateAuthError(obj.message)
           )
@@ -484,30 +844,33 @@ class TdLibManager(
     }
     cachedUserId = 0L
     settingsPreferences.clearTelegramSession()
+    clearFloodWait()
     closeConnectionIdle(preserveWaitApiState = false)
     Unit
   }
 
   suspend fun loadAllowedTargets(): List<TelegramCandidateTarget> {
-    if (client == null || _authState.value !is TelegramAuthState.Ready) return emptyList()
-    val chatsObj = sendSuspending(TdApi.GetChats(TdApi.ChatListMain(), 100)) as? TdApi.Chats
+    if (!isSessionReady()) {
+      ensureConnected().getOrThrow()
+    }
+    val chatsObj = sendFunction(TdApi.GetChats(TdApi.ChatListMain(), 100)) as? TdApi.Chats
       ?: return emptyList()
 
     val results = mutableListOf<TelegramCandidateTarget>()
     for (chatId in chatsObj.chatIds) {
-      val chat = runCatching { sendSuspending(TdApi.GetChat(chatId)) as? TdApi.Chat }.getOrNull()
+      val chat = runCatching { sendFunction(TdApi.GetChat(chatId)) as? TdApi.Chat }.getOrNull()
         ?: continue
       var supergroup: TdApi.Supergroup? = null
       var basicGroup: TdApi.BasicGroup? = null
       when (val type = chat.type) {
         is TdApi.ChatTypeSupergroup -> {
           supergroup = runCatching {
-            sendSuspending(TdApi.GetSupergroup(type.supergroupId)) as? TdApi.Supergroup
+            sendFunction(TdApi.GetSupergroup(type.supergroupId)) as? TdApi.Supergroup
           }.getOrNull()
         }
         is TdApi.ChatTypeBasicGroup -> {
           basicGroup = runCatching {
-            sendSuspending(TdApi.GetBasicGroup(type.basicGroupId)) as? TdApi.BasicGroup
+            sendFunction(TdApi.GetBasicGroup(type.basicGroupId)) as? TdApi.BasicGroup
           }.getOrNull()
         }
         else -> Unit
@@ -528,7 +891,7 @@ class TdLibManager(
 
   suspend fun getForumTopics(chatId: Long): List<TopicInfoModel> {
     if (client == null) return emptyList()
-    val topicsObj = sendSuspending(TdApi.GetForumTopics(chatId, "", 0, 0L, 0, 100))
+    val topicsObj = sendFunction(TdApi.GetForumTopics(chatId, "", 0, 0L, 0, 100))
       as? TdApi.ForumTopics ?: return emptyList()
     return topicsObj.topics.map { topic ->
       TopicInfoModel(
@@ -634,7 +997,7 @@ class TdLibManager(
     sourceMessageId: Long,
     trashThreadId: Long,
   ): Long? {
-    if (client == null || _authState.value !is TelegramAuthState.Ready) return null
+    if (!isSessionReady()) return null
     val options = TdApi.MessageSendOptions().apply {
       disableNotification = true
       fromBackground = false
@@ -648,7 +1011,7 @@ class TdLibManager(
       true,
       false,
     )
-    val result = sendSuspending(req) as? TdApi.Messages ?: return null
+    val result = sendFunction(req) as? TdApi.Messages ?: return null
     return result.messages?.firstOrNull()?.id
   }
 
@@ -665,7 +1028,7 @@ class TdLibManager(
 
     val icon = TdApi.ForumTopicIcon(iconColor, 0L)
     val req = TdApi.CreateForumTopic(chatId, title.trim(), false, icon)
-    val info = sendSuspending(req) as TdApi.ForumTopicInfo
+    val info = sendFunction(req) as TdApi.ForumTopicInfo
     return TopicInfoModel(
       chatId = chatId,
       messageThreadId = info.forumTopicId.toLong(),
@@ -702,23 +1065,18 @@ class TdLibManager(
     var targetPendingMsg: TdApi.Message? = null
     if (existingPendingMessageId != null) {
       val existing = runCatching {
-        sendSuspending(TdApi.GetMessage(chatId, existingPendingMessageId)) as? TdApi.Message
+        sendFunction(TdApi.GetMessage(chatId, existingPendingMessageId)) as? TdApi.Message
       }.getOrNull()
 
       if (existing != null) {
         when (existing.sendingState) {
-          null -> {
-            // Already finished uploading during/after recovery -> zero duplicate!
-            return messageToSentResult(existing)
-          }
-          is TdApi.MessageSendingStatePending -> {
-            targetPendingMsg = existing
-          }
+          null -> return messageToSentResult(existing)
+          is TdApi.MessageSendingStatePending -> targetPendingMsg = existing
           is TdApi.MessageSendingStateFailed -> {
             val failedState = existing.sendingState as TdApi.MessageSendingStateFailed
             if (failedState.canRetry) {
               val resent = runCatching {
-                sendSuspending(
+                sendFunction(
                   TdApi.ResendMessages(chatId, longArrayOf(existing.id), null, 0L)
                 ) as? TdApi.Messages
               }.getOrNull()
@@ -764,7 +1122,7 @@ class TdLibManager(
         this.options = options
         this.inputMessageContent = content
       }
-      sendSuspending(req) as TdApi.Message
+      sendFunction(req) as TdApi.Message
     }
 
     if (initialMsg.sendingState == null) {
@@ -812,7 +1170,11 @@ class TdLibManager(
               val rawMsg = event.error?.message
               val floodSec = TelegramPolicyGuard.parseFloodWaitSeconds(rawMsg)
               val ex: Throwable = if (floodSec != null || event.error?.code == 429) {
-                FloodWaitException(floodSec ?: 30, "Telegram yêu cầu chờ ${floodSec ?: 30} giây")
+                val waitSec = (floodSec ?: 30).coerceAtLeast(1)
+                val unlockAt = TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(waitSec)
+                val reason = "Telegram yêu cầu chờ $waitSec giây (FLOOD_WAIT_$waitSec)"
+                recordFloodWait(waitSec, unlockAt, reason)
+                FloodWaitException(waitSec, unlockAt, reason)
               } else {
                 val translated = TelegramPolicyGuard.translateAuthError(rawMsg)
                 if (NetworkRetryPolicy.isTransientNetworkError(IllegalStateException(rawMsg), context)) {
@@ -873,9 +1235,8 @@ class TdLibManager(
     }
 
     try {
-      // Double check via GetMessage in case update fired just before collector subscribed
       val currentCheck = runCatching {
-        sendSuspending(TdApi.GetMessage(initialMsg.chatId, initialMsg.id)) as? TdApi.Message
+        sendFunction(TdApi.GetMessage(initialMsg.chatId, initialMsg.id)) as? TdApi.Message
       }.getOrNull()
       if (currentCheck != null && currentCheck.sendingState == null) {
         return@coroutineScope messageToSentResult(currentCheck)
@@ -894,12 +1255,14 @@ class TdLibManager(
     messageThreadId: Long? = null,
     limit: Int = 30,
   ): List<ScannedTelegramMedia> {
-    if (client == null || _authState.value !is TelegramAuthState.Ready) return emptyList()
+    if (!isSessionReady()) {
+      ensureConnected().getOrThrow()
+    }
 
     val messagesObj = if (messageThreadId != null && messageThreadId != 0L) {
-      sendSuspending(TdApi.GetForumTopicHistory(chatId, messageThreadId.toInt(), 0L, 0, limit))
+      sendFunction(TdApi.GetForumTopicHistory(chatId, messageThreadId.toInt(), 0L, 0, limit))
     } else {
-      sendSuspending(TdApi.GetChatHistory(chatId, 0L, 0, limit, false))
+      sendFunction(TdApi.GetChatHistory(chatId, 0L, 0, limit, false))
     } as? TdApi.Messages ?: return emptyList()
 
     val scanned = mutableListOf<ScannedTelegramMedia>()
@@ -943,13 +1306,13 @@ class TdLibManager(
 
   /**
    * Quickly fetches a tiny (~15KB) Telegram document preview thumbnail synchronously while a
-   * short-lived TDLib session is already open so cloud-only grids render smoothly offline.
+   * TDLib session is open so cloud-only grids render smoothly offline.
    */
   suspend fun downloadThumbnailQuick(fileId: Int): String? {
     if (fileId <= 0 || client == null || _authState.value !is TelegramAuthState.Ready) return null
     val result = withTimeoutOrNull(4_000L) {
       runCatching {
-        sendSuspending(TdApi.DownloadFile(fileId, 32, 0L, 0L, true)) as? TdApi.File
+        sendFunction(TdApi.DownloadFile(fileId, 32, 0L, 0L, true), timeoutMs = 4_000L) as? TdApi.File
       }.getOrNull()
     } ?: return null
     val completed = result.local?.isDownloadingCompleted == true
@@ -957,77 +1320,73 @@ class TdLibManager(
   }
 
   /**
-   * Opens a short-lived TDLib session on demand to download a tapped photo or video,
-   * automatically detects network interruptions / stalls, retries twice with an 8s wait,
-   * stops & alerts on the 3rd consecutive failure, and closes TDLib immediately afterward.
+   * Reuses the persistent foreground TDLib session on demand to download a tapped photo or video,
+   * detects genuine network interruptions / stalls (8s x 2 retry + 25s stall detection),
+   * and keeps TDLib alive while in foreground (or closes if backgrounded once finished).
    */
   fun downloadFileOnDemand(fileId: Int): Flow<FileDownloadProgress> = flow {
     val tracker = NetworkRetryTracker()
     var lastKnownBytes = 0L
 
-    while (true) {
-      var acquired = false
-      try {
-        acquireShortLivedSession().getOrThrow()
-        acquired = true
+    beginTransfer(markSyncing = true)
+    try {
+      while (true) {
+        try {
+          ensureConnected().getOrThrow()
 
-        val c = client ?: throw NetworkInterruptedException("Chưa kết nối Telegram")
-        if (!NetworkRetryPolicy.isNetworkAvailable(context)) {
-          throw NetworkInterruptedException("Không có kết nối mạng")
-        }
-
-        val completed = awaitSingleDownloadAttempt(
-          c = c,
-          fileId = fileId,
-          initialBytes = lastKnownBytes,
-          onProgress = { prog ->
-            if (prog.downloadedBytes > lastKnownBytes) {
-              lastKnownBytes = prog.downloadedBytes
-              tracker.reset()
-            }
-            emit(prog)
-          },
-        )
-        if (completed != null) {
-          emit(completed)
-          return@flow
-        }
-      } catch (t: Throwable) {
-        if (t is CancellationException) throw t
-        if (t is FloodWaitException || !NetworkRetryPolicy.isTransientNetworkError(t, context)) {
-          throw t
-        }
-        if (acquired) {
-          withContext(NonCancellable) {
-            releaseShortLivedSession(forceClose = true)
+          val c = client ?: throw NetworkInterruptedException("Chưa kết nối Telegram")
+          if (!NetworkRetryPolicy.isNetworkAvailable(context)) {
+            throw NetworkInterruptedException("Không có kết nối mạng")
           }
-          acquired = false
-        }
-        when (val decision = tracker.onFailure()) {
-          is RetryDecision.WaitAndRetry -> {
-            emit(
-              FileDownloadProgress(
-                fileId = fileId,
-                downloadedBytes = lastKnownBytes,
-                totalBytes = 0L,
-                isCompleted = false,
-                localPath = null,
-                statusMessageVi = "Mất kết nối, đang thử lại sau 8 giây (lần ${decision.attemptNumber}/2)...",
+
+          val completed = awaitSingleDownloadAttempt(
+            c = c,
+            fileId = fileId,
+            initialBytes = lastKnownBytes,
+            onProgress = { prog ->
+              if (prog.downloadedBytes > lastKnownBytes) {
+                lastKnownBytes = prog.downloadedBytes
+                tracker.reset()
+              }
+              emit(prog)
+            },
+          )
+          if (completed != null) {
+            emit(completed)
+            return@flow
+          }
+        } catch (t: Throwable) {
+          if (t is CancellationException) throw t
+          if (t is FloodWaitException || !NetworkRetryPolicy.isTransientNetworkError(t, context)) {
+            throw t
+          }
+          when (val decision = tracker.onFailure()) {
+            is RetryDecision.WaitAndRetry -> {
+              emit(
+                FileDownloadProgress(
+                  fileId = fileId,
+                  downloadedBytes = lastKnownBytes,
+                  totalBytes = 0L,
+                  isCompleted = false,
+                  localPath = null,
+                  statusMessageVi = "Mất kết nối, đang thử lại sau 8 giây (lần ${decision.attemptNumber}/2)...",
+                )
               )
-            )
-            delay(decision.delayMs)
-          }
-          RetryDecision.StopAndNotify -> {
-            networkAlertCoordinator.reportFinalFailure(NetworkOperationType.DOWNLOAD)
-            throw NetworkInterruptedException("Không thể tải ảnh/video từ Telegram.")
-          }
-        }
-      } finally {
-        if (acquired) {
-          withContext(NonCancellable) {
-            releaseShortLivedSession(forceClose = false)
+              delay(decision.delayMs)
+              if (!isSessionReady()) {
+                runCatching { ensureConnected(forceReconnect = true) }
+              }
+            }
+            RetryDecision.StopAndNotify -> {
+              networkAlertCoordinator.reportFinalFailure(NetworkOperationType.DOWNLOAD)
+              throw NetworkInterruptedException("Không thể tải ảnh/video từ Telegram.")
+            }
           }
         }
+      }
+    } finally {
+      withContext(NonCancellable) {
+        endTransfer()
       }
     }
   }.flowOn(Dispatchers.IO)
@@ -1084,12 +1443,18 @@ class TdLibManager(
       }
     }
 
-    c.send(TdApi.DownloadFile(fileId, 16, 0, 0, true)) { obj ->
+    val downloadReq = TdApi.DownloadFile(fileId, 16, 0, 0, true)
+    TelegramPolicyGuard.assertAllowedFunction(downloadReq)
+    c.send(downloadReq) { obj ->
       if (obj is TdApi.Error) {
         val waitSec = TelegramPolicyGuard.parseFloodWaitSeconds(obj.message)
-        if (waitSec != null) {
+        if (waitSec != null || obj.code == 429) {
+          val safeWait = (waitSec ?: 30).coerceAtLeast(1)
+          val unlockAt = TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(safeWait)
+          val reason = "Telegram giới hạn tốc độ ($safeWait giây)"
+          internalScope.launch { recordFloodWait(safeWait, unlockAt, reason) }
           eventChannel.trySend(
-            Result.failure(FloodWaitException(waitSec, "Telegram giới hạn tốc độ ($waitSec giây)"))
+            Result.failure(FloodWaitException(safeWait, unlockAt, reason))
           )
         } else {
           val translated = TelegramPolicyGuard.translateAuthError(obj.message)
@@ -1138,33 +1503,80 @@ class TdLibManager(
     }
   }
 
-  private suspend fun sendSuspending(function: TdApi.Function<*>): TdApi.Object =
-    suspendCancellableCoroutine { cont ->
-      val c = client
-      if (c == null) {
-        cont.resumeWithException(IllegalStateException("TDLib chưa sẵn sàng"))
-        return@suspendCancellableCoroutine
+  /**
+   * Executes a TDLib function with policy verification, in-flight request tracking, timeout,
+   * dynamic FLOOD_WAIT capture (without reconnecting), and single automatic client recovery
+   * if the underlying client was closed unexpectedly.
+   */
+  suspend fun sendFunction(
+    function: TdApi.Function<*>,
+    timeoutMs: Long = 30_000L,
+  ): TdApi.Object {
+    TelegramPolicyGuard.assertAllowedFunction(function)
+    return try {
+      sendSuspending(function, timeoutMs)
+    } catch (t: Throwable) {
+      if (t is CancellationException || t is FloodWaitException || t is SecurityException) {
+        throw t
       }
-      c.send(function) { result ->
-        if (!cont.isActive) return@send
-        if (result is TdApi.Error) {
-          val floodSec = TelegramPolicyGuard.parseFloodWaitSeconds(result.message)
-          if (floodSec != null || result.code == 429) {
-            val waitSec = floodSec ?: 30
-            cont.resumeWithException(
-              FloodWaitException(
-                retryAfterSeconds = waitSec,
-                message = "Telegram yêu cầu chờ $waitSec giây (FLOOD_WAIT_$waitSec)",
-              )
-            )
-          } else {
-            cont.resumeWithException(
-              IllegalStateException(TelegramPolicyGuard.translateAuthError(result.message))
-            )
-          }
-        } else {
-          cont.resume(result)
-        }
+      val msg = t.message.orEmpty().lowercase()
+      val shouldRecoverClient = client == null ||
+        msg.contains("client is closed") ||
+        msg.contains("tdlib chưa sẵn sàng")
+      if (shouldRecoverClient &&
+        function !is TdApi.Close &&
+        function !is TdApi.LogOut &&
+        function !is TdApi.OptimizeStorage
+      ) {
+        ensureConnected(forceReconnect = true).getOrThrow()
+        sendSuspending(function, timeoutMs)
+      } else {
+        throw t
       }
     }
+  }
+
+  private suspend fun sendSuspending(
+    function: TdApi.Function<*>,
+    timeoutMs: Long = 30_000L,
+  ): TdApi.Object {
+    TelegramPolicyGuard.assertAllowedFunction(function)
+    val c = client ?: throw NetworkInterruptedException("TDLib chưa sẵn sàng")
+    val reqId = requestIdGenerator.getAndIncrement()
+    val deferred = CompletableDeferred<TdApi.Object>()
+    inFlightRequests[reqId] = deferred
+
+    val result = try {
+      c.send(function) { obj ->
+        val pending = inFlightRequests.remove(reqId)
+        pending?.complete(obj)
+      }
+      withTimeoutOrNull(timeoutMs) {
+        deferred.await()
+      } ?: throw NetworkInterruptedException("Hết thời gian chờ phản hồi từ Telegram")
+    } finally {
+      inFlightRequests.remove(reqId)
+    }
+
+    if (result is TdApi.Error) {
+      val floodSec = TelegramPolicyGuard.parseFloodWaitSeconds(result.message)
+      if (floodSec != null || result.code == 429) {
+        val waitSec = (floodSec ?: 30).coerceAtLeast(1)
+        val unlockAt = TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(waitSec)
+        val reason = "Telegram yêu cầu chờ $waitSec giây (FLOOD_WAIT_$waitSec)"
+        recordFloodWait(waitSec, unlockAt, reason)
+        throw FloodWaitException(
+          retryAfterSeconds = waitSec,
+          unlockAtEpochMs = unlockAt,
+          message = reason,
+        )
+      }
+      val translated = TelegramPolicyGuard.translateAuthError(result.message)
+      if (NetworkRetryPolicy.isTransientNetworkError(IllegalStateException(result.message), context)) {
+        throw NetworkInterruptedException(translated)
+      }
+      throw IllegalStateException(translated)
+    }
+    return result
+  }
 }

@@ -120,43 +120,59 @@ fun SyncStorageScreen(
         .fillMaxSize()
         .testTag("sync_storage_list"),
     ) {
-      // 0. Per-Action Short-Lived Telegram Connection Status Card
+      // 0. Persistent Foreground / Background-Idle Telegram Connection Status Card
       item(key = "connection_lifecycle_card") {
-        val isActive = connectionStatus == TelegramConnectionStatus.CONNECTED_ACTIVE ||
-          connectionStatus == TelegramConnectionStatus.CONNECTING
+        val statusIcon = when (connectionStatus) {
+          TelegramConnectionStatus.READY -> Icons.Filled.CloudQueue
+          TelegramConnectionStatus.CONNECTING,
+          TelegramConnectionStatus.RECONNECTING,
+          TelegramConnectionStatus.SYNCING -> Icons.Filled.CloudUpload
+          TelegramConnectionStatus.FLOOD_WAIT -> Icons.Filled.PauseCircleFilled
+          TelegramConnectionStatus.DISCONNECTING,
+          TelegramConnectionStatus.DISCONNECTED_IDLE -> Icons.Filled.CloudOff
+        }
+        val statusTint = when (connectionStatus) {
+          TelegramConnectionStatus.READY -> StatusUploadedGreen
+          TelegramConnectionStatus.FLOOD_WAIT -> StatusWarningAmber
+          TelegramConnectionStatus.CONNECTING,
+          TelegramConnectionStatus.RECONNECTING,
+          TelegramConnectionStatus.SYNCING -> MaterialTheme.colorScheme.primary
+          TelegramConnectionStatus.DISCONNECTING,
+          TelegramConnectionStatus.DISCONNECTED_IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
+        }
+        val titleText = if (connectionStatus == TelegramConnectionStatus.FLOOD_WAIT && floodWaitRemainingSec > 0L) {
+          "Tạm khoá hàng đợi (${Formatters.formatRemainingSeconds(floodWaitRemainingSec)})"
+        } else {
+          connectionStatus.labelVi
+        }
         TelePhotosGlassCard(modifier = Modifier.fillMaxWidth()) {
           Row(
             modifier = Modifier.padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
           ) {
             Icon(
-              imageVector = if (isActive) Icons.Filled.CloudQueue else Icons.Filled.CloudOff,
+              imageVector = statusIcon,
               contentDescription = null,
-              tint = if (isActive) StatusUploadedGreen else MaterialTheme.colorScheme.primary,
+              tint = statusTint,
               modifier = Modifier.size(22.dp),
             )
             Spacer(modifier = Modifier.width(10.dp))
             Column {
               Text(
-                text = connectionStatus.labelVi,
+                text = titleText,
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.onSurface,
               )
-              if (settings.lastSyncStatusMessage.isNotBlank()) {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                  text = settings.lastSyncStatusMessage,
-                  style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-              } else {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                  text = "Chế độ thủ công: Chỉ kết nối Telegram khi bạn bấm đồng bộ hoặc mở tệp từ đám mây.",
-                  style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-              }
+              Spacer(modifier = Modifier.height(2.dp))
+              Text(
+                text = if (settings.lastSyncStatusMessage.isNotBlank()) {
+                  settings.lastSyncStatusMessage
+                } else {
+                  "Giữ phiên Telegram sống khi mở app; tự động dọn bộ nhớ và đóng kết nối khi chuyển nền."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
             }
           }
         }
@@ -229,12 +245,12 @@ fun SyncStorageScreen(
               )
               Spacer(modifier = Modifier.width(12.dp))
               Column {
-                Text("Bộ ngắt mạch FLOOD_WAIT đang kích hoạt", style = MaterialTheme.typography.titleSmall)
+                Text("Tạm khoá hàng đợi (FLOOD_WAIT)", style = MaterialTheme.typography.titleSmall)
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                  text = "Đã ngắt kết nối Telegram để bảo vệ tài khoản. Còn lại ${
+                  text = "Đang giữ phiên Telegram nhàn rỗi và tạm khoá hàng đợi. Còn lại ${
                     Formatters.formatRemainingSeconds(floodWaitRemainingSec)
-                  } trước khi bạn có thể bấm tải lên lại.",
+                  } trước khi tự động hoặc thủ công tải lên tiếp.",
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -539,7 +555,7 @@ fun SyncStorageScreen(
                 Column {
                   Text("Chỉ cho phép tải lên khi dùng Wi-Fi", style = MaterialTheme.typography.titleSmall)
                   Text(
-                    text = "WorkManager tuần tự 1 luồng theo yêu cầu, giãn nhịp 2.0–3.5 giây/tệp dưới dạng Document gốc rồi tự ngắt kết nối",
+                    text = "WorkManager tuần tự 1 luồng theo yêu cầu, giãn nhịp 2.0–3.5 giây/tệp dưới dạng Document gốc",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )

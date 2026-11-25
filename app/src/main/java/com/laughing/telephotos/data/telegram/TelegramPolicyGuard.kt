@@ -18,6 +18,37 @@ object TelegramPolicyGuard {
   private const val NORMALIZED_PHOTOS_KEY = "anh"
   private const val NORMALIZED_VIDEOS_KEY = "video"
 
+  /**
+   * Strict Read-Only + Upload policy gate: blocks any TDLib function that deletes messages,
+   * chat history, or Forum Topics on Telegram.
+   */
+  fun isAllowedFunction(function: TdApi.Function<*>): Boolean {
+    return when (function) {
+      is TdApi.DeleteMessages,
+      is TdApi.DeleteChatHistory,
+      is TdApi.DeleteForumTopic,
+      is TdApi.DeleteChat -> false
+      else -> {
+        val name = function.javaClass.simpleName
+        val isDestructiveDelete = name.startsWith("Delete", ignoreCase = true) && (
+          name.contains("Message", ignoreCase = true) ||
+            name.contains("Topic", ignoreCase = true) ||
+            name.contains("History", ignoreCase = true) ||
+            name.equals("DeleteChat", ignoreCase = true)
+          )
+        !isDestructiveDelete
+      }
+    }
+  }
+
+  fun assertAllowedFunction(function: TdApi.Function<*>) {
+    if (!isAllowedFunction(function)) {
+      throw SecurityException(
+        "Chính sách Chỉ đọc: Ứng dụng không được phép xoá tin nhắn, lịch sử hoặc chủ đề trên Telegram (${function.javaClass.simpleName})."
+      )
+    }
+  }
+
   fun isTrashTopicTitle(title: String): Boolean =
     Formatters.normalizeTopicKey(title) == NORMALIZED_TRASH_KEY
 
@@ -45,6 +76,24 @@ object TelegramPolicyGuard {
     if (errorMessage.isNullOrBlank()) return null
     val match = floodWaitRegex.find(errorMessage) ?: return null
     return match.groupValues.getOrNull(1)?.toIntOrNull()
+  }
+
+  fun computeFloodWaitBufferSeconds(retryAfterSeconds: Int): Int {
+    val safeRetry = retryAfterSeconds.coerceAtLeast(1)
+    return when {
+      safeRetry <= 30 -> 3
+      safeRetry <= 300 -> 5
+      else -> 10
+    }
+  }
+
+  fun computeFloodWaitUnlockAtEpochMs(
+    retryAfterSeconds: Int,
+    nowMs: Long = System.currentTimeMillis(),
+  ): Long {
+    val safeRetry = retryAfterSeconds.coerceAtLeast(1)
+    val bufferSec = computeFloodWaitBufferSeconds(safeRetry)
+    return nowMs + (safeRetry + bufferSec) * 1000L
   }
 
   fun translateAuthError(rawMessage: String?): String {

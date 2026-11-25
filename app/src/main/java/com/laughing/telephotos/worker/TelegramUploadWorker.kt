@@ -21,11 +21,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 /**
- * On-demand single-thread sequential upload worker triggered ONLY by explicit user tap.
- * - Opens a short-lived TDLib session, uploads only new/unsynced items,
- *   routes unassigned photos/videos to auto-created "Ảnh" / "Video" Forum Topics,
- *   retries genuine network interruptions twice with an 8s wait (stopping & notifying on the 3rd),
- *   and immediately closes TDLib (TdApi.Close()) on completion, error, or "Dừng đồng bộ".
+ * On-demand single-thread sequential upload worker triggered ONLY by explicit user tap
+ * (or rescheduled by WorkManager after a long FLOOD_WAIT cooldown).
+ * - Shares the app-wide TdLibManager session; keeps TDLib alive while foregrounded
+ *   and closes cleanly on completion only when backgrounded.
+ * - Keeps transient network retry (8s x 2 + 25s stall) strictly separate from dynamic FLOOD_WAIT.
+ * - Respects exact FLOOD_WAIT unlock timestamp: short waits (<=60s) suspend/delay in-worker
+ *   keeping TDLib idle and resuming the pending item first; long waits (>60s) reschedule via
+ *   WorkManager initialDelay so no wake lock is held.
  */
 class TelegramUploadWorker(
   appContext: Context,
@@ -41,34 +44,129 @@ class TelegramUploadWorker(
     val tdLib = app.tdLibManager
     val repo = app.vaultRepository
 
-    val settings = prefs.getCurrentSettings()
-    val now = System.currentTimeMillis()
-    if (settings.floodWaitUntilEpochMs > now) {
-      return Result.success()
-    } else if (settings.floodWaitUntilEpochMs > 0L) {
-      prefs.clearFloodWait()
-    }
-
+    val initialSettings = prefs.getCurrentSettings()
     val initialTarget = syncTargetDao.getTarget() ?: return Result.success()
-    if (!initialTarget.isLocked || !settings.isTelegramLoggedIn) return Result.success()
+    if (!initialTarget.isLocked || !initialSettings.isTelegramLoggedIn) return Result.success()
 
-    val retryTracker = NetworkRetryTracker()
-    var sessionConnected = false
-    while (!isStopped) {
-      if (!NetworkRetryPolicy.isNetworkAvailable(applicationContext)) {
+    val filterMediaType = inputData.getString(KEY_FILTER_MEDIA_TYPE)
+      ?.let { raw -> runCatching { MediaType.valueOf(raw) }.getOrNull() }
+
+    tdLib.beginWorkLease()
+
+    var hitFloodWaitRescheduled = false
+    var stoppedByNetworkFailure = false
+    var uploadedAnyOrClean = false
+
+    try {
+      // 1. Check persisted or in-memory FLOOD_WAIT cooldown before sending any Telegram request
+      val initialUnlockAt = maxOf(
+        initialSettings.floodWaitUntilEpochMs,
+        tdLib.floodWaitState.value?.unlockAtEpochMs ?: 0L,
+      )
+      val initialNow = System.currentTimeMillis()
+      if (initialUnlockAt > initialNow) {
+        val remainingMs = initialUnlockAt - initialNow
+        val retryAfterSec = maxOf(
+          initialSettings.floodWaitRetryAfterSec,
+          tdLib.floodWaitState.value?.retryAfterSeconds ?: 0,
+        )
+        val shouldSuspendInWorker = retryAfterSec in 1..SHORT_FLOOD_WAIT_MAX_SEC ||
+          remainingMs <= SHORT_FLOOD_WAIT_MAX_WAIT_MS
+        if (shouldSuspendInWorker) {
+          val unlocked = suspendForFloodWait(
+            unlockAtEpochMs = initialUnlockAt,
+            currentFileName = "Tạm khoá hàng đợi",
+            completedCount = 0,
+            totalCount = 1,
+          )
+          if (!unlocked || isStopped) return Result.success()
+          tdLib.clearFloodWait()
+          requeueFloodWaitPaused(mediaDao, filterMediaType)
+        } else {
+          hitFloodWaitRescheduled = true
+          repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+          return Result.success()
+        }
+      } else if (initialSettings.floodWaitUntilEpochMs > 0L || tdLib.floodWaitState.value != null) {
+        tdLib.clearFloodWait()
+        requeueFloodWaitPaused(mediaDao, filterMediaType)
+      } else {
+        requeueFloodWaitPaused(mediaDao, filterMediaType)
+      }
+
+      // 2. Ensure single-flight TDLib connection (retry 8s x 2 ONLY on transient network errors)
+      val retryTracker = NetworkRetryTracker()
+      var sessionConnected = false
+      while (!isStopped) {
+        if (!NetworkRetryPolicy.isNetworkAvailable(applicationContext)) {
+          when (val decision = retryTracker.onFailure()) {
+            is RetryDecision.WaitAndRetry -> {
+              setProgress(
+                workDataOf(
+                  KEY_CURRENT_FILE to "Mất kết nối mạng, thử lại sau 8 giây (${decision.attemptNumber}/2)...",
+                  KEY_COMPLETED_COUNT to 0,
+                  KEY_TOTAL_COUNT to 1,
+                )
+              )
+              delay(decision.delayMs)
+              continue
+            }
+            RetryDecision.StopAndNotify -> {
+              stoppedByNetworkFailure = true
+              repo.reportNetworkInterruption(NetworkOperationType.UPLOAD)
+              prefs.setLastSyncStatusMessage("Tải lên bị gián đoạn — Không thể kết nối Telegram")
+              return Result.failure()
+            }
+          }
+        }
+
+        val connectResult = tdLib.ensureConnected()
+        if (connectResult.isSuccess) {
+          retryTracker.reset()
+          sessionConnected = true
+          break
+        }
+
+        val err = connectResult.exceptionOrNull()
+        if (err is FloodWaitException) {
+          repo.handleFloodWait(err)
+          val remainingMs = (err.unlockAtEpochMs - System.currentTimeMillis()).coerceAtLeast(1_000L)
+          if (err.retryAfterSeconds <= SHORT_FLOOD_WAIT_MAX_SEC) {
+            val unlocked = suspendForFloodWait(
+              unlockAtEpochMs = err.unlockAtEpochMs,
+              currentFileName = "Tạm khoá hàng đợi",
+              completedCount = 0,
+              totalCount = 1,
+            )
+            if (!unlocked || isStopped) return Result.success()
+            tdLib.clearFloodWait()
+            requeueFloodWaitPaused(mediaDao, filterMediaType)
+            continue
+          } else {
+            hitFloodWaitRescheduled = true
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+            return Result.success()
+          }
+        }
+
+        if (!NetworkRetryPolicy.isTransientNetworkError(err, applicationContext)) {
+          prefs.setLastSyncStatusMessage(err?.message ?: "Không thể kết nối Telegram")
+          return Result.failure()
+        }
+
         when (val decision = retryTracker.onFailure()) {
           is RetryDecision.WaitAndRetry -> {
             setProgress(
               workDataOf(
-                KEY_CURRENT_FILE to "Mất kết nối mạng, thử lại sau 8 giây (${decision.attemptNumber}/2)...",
+                KEY_CURRENT_FILE to "Kết nối Telegram gián đoạn, thử lại sau 8 giây (${decision.attemptNumber}/2)...",
                 KEY_COMPLETED_COUNT to 0,
                 KEY_TOTAL_COUNT to 1,
               )
             )
             delay(decision.delayMs)
-            continue
           }
           RetryDecision.StopAndNotify -> {
+            stoppedByNetworkFailure = true
             repo.reportNetworkInterruption(NetworkOperationType.UPLOAD)
             prefs.setLastSyncStatusMessage("Tải lên bị gián đoạn — Không thể kết nối Telegram")
             return Result.failure()
@@ -76,49 +174,10 @@ class TelegramUploadWorker(
         }
       }
 
-      val connectResult = tdLib.acquireShortLivedSession()
-      if (connectResult.isSuccess) {
-        retryTracker.reset()
-        sessionConnected = true
-        break
+      if (!sessionConnected || isStopped) {
+        return Result.success()
       }
 
-      val err = connectResult.exceptionOrNull()
-      if (!NetworkRetryPolicy.isTransientNetworkError(err, applicationContext)) {
-        prefs.setLastSyncStatusMessage(err?.message ?: "Không thể kết nối Telegram — Đã ngắt kết nối")
-        return Result.failure()
-      }
-
-      when (val decision = retryTracker.onFailure()) {
-        is RetryDecision.WaitAndRetry -> {
-          setProgress(
-            workDataOf(
-              KEY_CURRENT_FILE to "Kết nối Telegram gián đoạn, thử lại sau 8 giây (${decision.attemptNumber}/2)...",
-              KEY_COMPLETED_COUNT to 0,
-              KEY_TOTAL_COUNT to 1,
-            )
-          )
-          delay(decision.delayMs)
-        }
-        RetryDecision.StopAndNotify -> {
-          repo.reportNetworkInterruption(NetworkOperationType.UPLOAD)
-          prefs.setLastSyncStatusMessage("Tải lên bị gián đoạn — Không thể kết nối Telegram")
-          return Result.failure()
-        }
-      }
-    }
-
-    if (!sessionConnected) {
-      return Result.success()
-    }
-
-    val filterMediaType = inputData.getString(KEY_FILTER_MEDIA_TYPE)
-      ?.let { raw -> runCatching { MediaType.valueOf(raw) }.getOrNull() }
-
-    var hitFloodWait = false
-    var stoppedByNetworkFailure = false
-    var uploadedAnyOrClean = false
-    try {
       setProgress(
         workDataOf(
           KEY_CURRENT_FILE to "Đang kiểm tra chủ đề Telegram...",
@@ -140,7 +199,32 @@ class TelegramUploadWorker(
       }).coerceAtLeast(1)
       var completed = 0
 
+      // 3. Sequential upload loop (1 file at a time, 2.0-3.5s pacing)
       while (!isStopped) {
+        // Re-check queue flood lock before picking next item
+        val activeUnlock = tdLib.floodWaitState.value?.unlockAtEpochMs
+          ?: prefs.getCurrentSettings().floodWaitUntilEpochMs
+        if (activeUnlock > System.currentTimeMillis()) {
+          val remainingMs = activeUnlock - System.currentTimeMillis()
+          val retrySec = tdLib.floodWaitState.value?.retryAfterSeconds
+            ?: prefs.getCurrentSettings().floodWaitRetryAfterSec
+          if (retrySec in 1..SHORT_FLOOD_WAIT_MAX_SEC || remainingMs <= SHORT_FLOOD_WAIT_MAX_WAIT_MS) {
+            val unlocked = suspendForFloodWait(
+              unlockAtEpochMs = activeUnlock,
+              currentFileName = "Tạm khoá hàng đợi",
+              completedCount = completed,
+              totalCount = initialTotal,
+            )
+            if (!unlocked || isStopped) return Result.success()
+            tdLib.clearFloodWait()
+            requeueFloodWaitPaused(mediaDao, filterMediaType)
+          } else {
+            hitFloodWaitRescheduled = true
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+            return Result.success()
+          }
+        }
+
         val nextItem = if (filterMediaType != null) {
           mediaDao.getNextPendingUploadByType(filterMediaType.name)
         } else {
@@ -248,7 +332,7 @@ class TelegramUploadWorker(
                 )
               }
               if (!tdLib.isSessionReady()) {
-                tdLib.acquireShortLivedSession().getOrThrow()
+                tdLib.ensureConnected().getOrThrow()
               }
 
               val refreshedTarget = syncTargetDao.getTarget() ?: currentTarget
@@ -287,9 +371,28 @@ class TelegramUploadWorker(
                 )
               )
             } catch (flood: FloodWaitException) {
-              hitFloodWait = true
+              // Keep TDLib session idle/alive, lock upload queue until unlockAtEpochMs
               repo.handleFloodWait(flood)
-              return Result.success()
+              val remainingMs = (flood.unlockAtEpochMs - System.currentTimeMillis()).coerceAtLeast(1_000L)
+              if (flood.retryAfterSeconds <= SHORT_FLOOD_WAIT_MAX_SEC) {
+                val unlocked = suspendForFloodWait(
+                  unlockAtEpochMs = flood.unlockAtEpochMs,
+                  currentFileName = effectiveItem.fileName,
+                  completedCount = completed,
+                  totalCount = initialTotal,
+                )
+                if (!unlocked || isStopped) {
+                  return Result.success()
+                }
+                tdLib.clearFloodWait()
+                requeueFloodWaitPaused(mediaDao, filterMediaType)
+                mediaDao.updateUploadStatus(effectiveItem.id, UploadStatus.UPLOADING, null)
+                // Loop immediately resumes uploading this pending item first!
+              } else {
+                hitFloodWaitRescheduled = true
+                repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)
+                return Result.success()
+              }
             } catch (t: Throwable) {
               if (isStopped) {
                 mediaDao.updateUploadStatus(nextItem.id, UploadStatus.QUEUED, null)
@@ -299,6 +402,7 @@ class TelegramUploadWorker(
                 pendingMessageId = t.pendingMessageId
               }
 
+              // Strictly separate transient network retries (8s x 2) from FLOOD_WAIT
               if (NetworkRetryPolicy.isTransientNetworkError(t, applicationContext)) {
                 when (val decision = retryTracker.onFailure()) {
                   is RetryDecision.WaitAndRetry -> {
@@ -315,7 +419,7 @@ class TelegramUploadWorker(
                       return Result.success()
                     }
                     if (!tdLib.isSessionReady()) {
-                      runCatching { tdLib.closeConnectionIdle(preserveWaitApiState = false) }
+                      runCatching { tdLib.ensureConnected(forceReconnect = true) }
                     }
                   }
                   RetryDecision.StopAndNotify -> {
@@ -326,7 +430,7 @@ class TelegramUploadWorker(
                       error = "Mất kết nối mạng sau 3 lần thử",
                     )
                     repo.reportNetworkInterruption(NetworkOperationType.UPLOAD)
-                    prefs.setLastSyncStatusMessage("Tải lên bị gián đoạn — Đã ngắt kết nối Telegram")
+                    prefs.setLastSyncStatusMessage("Tải lên bị gián đoạn — Không thể kết nối Telegram")
                     return Result.failure()
                   }
                 }
@@ -353,7 +457,8 @@ class TelegramUploadWorker(
         if (isStopped) break
 
         // Enforce 2.0-3.5s pacing + jitter between sequential files
-        val basePacingMs = settings.uploadPacingMs.coerceAtLeast(2000L)
+        val latestSettings = prefs.getCurrentSettings()
+        val basePacingMs = latestSettings.uploadPacingMs.coerceAtLeast(2000L)
         val jitterMs = Random.nextLong(0L, 1501L)
         delay(basePacingMs + jitterMs)
       }
@@ -363,17 +468,60 @@ class TelegramUploadWorker(
       withContext(NonCancellable) {
         if (isStopped) {
           mediaDao.resetInterruptedUploadsToQueued()
-          prefs.setLastSyncStatusMessage("Đã dừng đồng bộ — Đã ngắt kết nối Telegram")
-        } else if (!hitFloodWait && !stoppedByNetworkFailure && uploadedAnyOrClean) {
           prefs.setLastSyncStatusMessage(
-            "Đã đồng bộ xong — Đã ngắt kết nối Telegram (chỉ kết nối khi bạn bấm đồng bộ)"
+            if (tdLib.isAppInForeground()) {
+              "Đã dừng đồng bộ — Phiên Telegram sẵn sàng"
+            } else {
+              "Đã dừng đồng bộ — Đã chuyển sang chế độ nền"
+            }
+          )
+        } else if (!hitFloodWaitRescheduled && !stoppedByNetworkFailure && uploadedAnyOrClean) {
+          prefs.setLastSyncStatusMessage(
+            if (tdLib.isAppInForeground()) {
+              "Đã đồng bộ xong — Phiên Telegram sẵn sàng"
+            } else {
+              "Đã đồng bộ xong — Đã chuyển sang chế độ nền"
+            }
           )
         }
-        tdLib.releaseShortLivedSession(forceClose = true)
+        tdLib.endWorkLease()
       }
     }
 
     return Result.success()
+  }
+
+  private suspend fun suspendForFloodWait(
+    unlockAtEpochMs: Long,
+    currentFileName: String,
+    completedCount: Int,
+    totalCount: Int,
+  ): Boolean {
+    while (!isStopped) {
+      val remainingMs = unlockAtEpochMs - System.currentTimeMillis()
+      if (remainingMs <= 0L) return true
+      val remSec = ((remainingMs + 999L) / 1000L).coerceAtLeast(1L)
+      setProgress(
+        workDataOf(
+          KEY_CURRENT_FILE to "$currentFileName — Chờ FLOOD_WAIT ${remSec}s",
+          KEY_COMPLETED_COUNT to completedCount,
+          KEY_TOTAL_COUNT to totalCount,
+        )
+      )
+      delay(minOf(1_000L, remainingMs))
+    }
+    return false
+  }
+
+  private suspend fun requeueFloodWaitPaused(
+    mediaDao: com.laughing.telephotos.data.local.MediaDao,
+    filterMediaType: MediaType?,
+  ) {
+    if (filterMediaType != null) {
+      mediaDao.requeueFloodWaitPausedByType(filterMediaType.name)
+    } else {
+      mediaDao.requeueFloodWaitPaused()
+    }
   }
 
   companion object {
@@ -382,5 +530,7 @@ class TelegramUploadWorker(
     const val KEY_COMPLETED_COUNT = "completed_count"
     const val KEY_TOTAL_COUNT = "total_count"
     const val KEY_FILTER_MEDIA_TYPE = "filter_media_type"
+    private const val SHORT_FLOOD_WAIT_MAX_SEC = 60
+    private const val SHORT_FLOOD_WAIT_MAX_WAIT_MS = 65_000L
   }
 }

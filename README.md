@@ -1,103 +1,182 @@
-# Tele Photos
+# Tele Photos — Đặc tả Kiến trúc & Ngữ cảnh Kỹ thuật (AI Context & Architecture Specification)
 
-Ứng dụng thư viện ảnh & sao lưu đám mây cho Android xây dựng bằng **Kotlin**, **Jetpack Compose** và **Telegram TDLib**, hoạt động theo mô hình **Chỉ tải lên (Upload-Only) + Xem trực tuyến + Tải về theo nhu cầu**.
+**Tele Photos** là ứng dụng thư viện ảnh & video kiêm sao lưu đám mây riêng tư cho Android, xây dựng bằng **Kotlin** và **Jetpack Compose** trên nền **Telegram TDLib**. Ứng dụng vận hành theo mô hình **Chỉ tải lên một chiều (Upload-Only) + Xem trực tuyến (Online Viewing) + Tải về từng tệp theo nhu cầu (On-Demand Single Download)**, **không** tải hàng loạt hai chiều về thiết bị và **không** sử dụng Firebase / Google Services.
 
----
-
-## Tính năng chính
-
-- **Thư viện hợp nhất Ảnh & Video (`Ảnh`, `Video`):**
-  - Tự động đọc ảnh/video trên thiết bị qua `MediaStore` và gộp với dữ liệu đã sao lưu từ Telegram (chống trùng lặp theo `localUri`, `SHA-256` và cặp tên tệp + kích thước).
-  - Hiển thị huy hiệu trạng thái đồng bộ trên từng mục (đã đồng bộ tick xanh, chưa tải lên tick xám, đang chờ, lỗi, tạm dừng `FLOOD_WAIT`).
-  - Nút **Đồng bộ** trên tab `Ảnh` chỉ tải lên ảnh; trên tab `Video` chỉ tải lên video.
-- **Tải lên nguyên gốc (`InputMessageDocument`):**
-  - Gửi ảnh và video lên Telegram dưới dạng **File (Document)** để giữ nguyên độ phân giải, codec, tên tệp và siêu dữ liệu, không bị nén.
-  - Tự động tạo ảnh thu nhỏ (`<= 320px` JPEG) đính kèm làm `InputThumbnail` để xem trước mượt mà.
-  - Đính kèm metadata `#tele_anh_meta` (JSON) vào caption để hỗ trợ quét chỉ đọc và khớp tệp giữa máy với đám mây.
-- **Tổ chức theo Album & Forum Topics:**
-  - Hỗ trợ khoá một đích lưu trữ riêng tư: Siêu nhóm riêng tư (tự động tách chủ đề **Ảnh**, **Video**, **Đã Xoá Gần Đây** nếu bật Forum), Nhóm thường, Kênh riêng tư hoặc Tin nhắn đã lưu (`Saved Messages`).
-  - Tạo Album riêng đồng bộ 1-1 với Forum Topic và ẩn 2 chủ đề hệ thống `Ảnh`/`Video` khỏi danh sách Album tuỳ chỉnh.
-- **Xem trực tuyến, Tải về máy & Giải phóng dung lượng:**
-  - Ưu tiên mở trực tiếp tệp trên thiết bị nếu còn bản cục bộ; tệp chỉ có trên Telegram sẽ hiển thị thumbnail nhẹ trước và tải/phát bằng **Media3 ExoPlayer** khi người dùng chạm mở.
-  - Nút **Tải về máy** lưu tệp gốc vào `Pictures/Tele Photos` (ảnh) hoặc `Movies/Tele Photos` (video).
-  - Tính năng **Giải phóng dung lượng máy** (trong chọn nhiều, trình xem và `Setting`) xoá bản cục bộ của các mục đã sao lưu trên Telegram, giữ lại bản đám mây để xem trực tuyến.
-  - Bộ nhớ đệm xem trực tuyến giới hạn tự động **500 MB** theo LRU (xoá tệp xem cũ nhất) và có nút dọn thủ công trong `Setting`.
-- **An toàn tài khoản & Kết nối ngắn hạn:**
-  - **Không tự động kết nối nền:** Chỉ khởi tạo TDLib khi người dùng đăng nhập, chọn đích, tạo album, quét chỉ đọc, đồng bộ hoặc mở tệp đám mây; tự động chạy `TdApi.OptimizeStorage` và `TdApi.Close()` ngay khi xong.
-  - **Chế độ Chỉ đọc + Tải lên:** Không bao giờ gọi API xoá tin nhắn hay xoá chủ đề trên Telegram. Xoá mục đã đồng bộ chỉ xoá bản trên máy (qua hộp thoại xác nhận hệ thống) và chuyển tiếp bản sao sang chủ đề **Đã Xoá Gần Đây** (lưu giữ cục bộ 30 ngày).
-  - Hàng đợi tuần tự 1 luồng qua `WorkManager`, giãn nhịp `2.0–3.5 giây/tệp`, hỗ trợ giới hạn chỉ tải lên qua Wi-Fi, bộ ngắt mạch `FLOOD_WAIT` và cơ chế thử lại khi rớt mạng (`8 giây x 2 lần`).
-- **Giao diện Tiếng Việt & Hỗ trợ máy cấu hình thấp:**
-  - Toàn bộ UI và tên chủ đề Telegram bằng Tiếng Việt.
-  - 3 chế độ giao diện: **Sáng**, **Tối** và **Liquid Glass** (tắt làm mờ nâng cao mặc định trên máy yếu), hỗ trợ bố cục thích ứng `NavigationBar` / `NavigationRail`.
+Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ đề (Forum Topics) trên Telegram đều bắt buộc sử dụng **Tiếng Việt**.
 
 ---
 
-## Công nghệ sử dụng
+## 1. Tổng quan Dự án & Tech Stack
 
-- **Ngôn ngữ & SDK:** Kotlin `2.4.21`, Java `11` bytecode, Android Gradle Plugin `9.1.1`, `minSdk 24`, `targetSdk 36`, `compileSdk 36`
-- **Giao diện:** Jetpack Compose (BOM `2024.09.00`), Material 3, Navigation Compose `2.8.9`, Coil `2.7.0` (`coil-compose`, `coil-video`), Media3 ExoPlayer `1.11.1`
-- **Lưu trữ & Nền:** Room `2.7.0` (KSP `2.3.5`), DataStore Preferences `1.1.7`, WorkManager `2.12.0`, Kotlin Coroutines `1.10.2`, `kotlinx-serialization-json` `1.13.0`
-- **Telegram:** TDLib Android (`com.github.tdlibx:td:1.8.56` qua JitPack)
-- **Kiểm thử:** JUnit `4.13.2`, Robolectric `4.16.1`, `kotlinx-coroutines-test`
+### Mục tiêu cốt lõi
+- Gộp danh sách ảnh (`Ảnh`) và video (`Video`) từ thiết bị (`MediaStore`) và lịch sử đã sao lưu trên Telegram (chống trùng lặp để mỗi mục chỉ xuất hiện một lần).
+- Tải lên thủ công theo hàng đợi tuần tự 1 luồng dưới dạng **Tệp gốc (`TdApi.InputMessageDocument`)** kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và metadata JSON `#tele_anh_meta` để bảo toàn 100% chất lượng gốc và EXIF.
+- Quản lý vòng đời kết nối **TDLib tái sử dụng theo Foreground/Background**: giữ một phiên `TdLibManager` duy nhất sống khi người dùng mở ứng dụng (loại bỏ chi phí kết nối lại liên tục), và tự động chạy `TdApi.OptimizeStorage` + `TdApi.Close()` khi ứng dụng chuyển sang chạy nền (sau khi mọi tác vụ/worker hoàn tất).
+- Tuân thủ chính sách **Chỉ đọc + Tải lên (`TelegramPolicyGuard`)**: tuyệt đối không gọi các hàm TDLib có khả năng xoá tin nhắn, lịch sử chat hoặc Forum Topic trên Telegram.
+
+### Ngôn ngữ, Build & Thư viện (xác thực từ `gradle/libs.versions.toml` & `app/build.gradle.kts`)
+- **Ngôn ngữ & SDK:** Kotlin `2.4.21`, Java `11` bytecode, Android Gradle Plugin `9.1.1`, `minSdk = 24`, `targetSdk = 36`, `compileSdk = 36`.
+- **Giao diện (UI):** Jetpack Compose BOM `2024.09.00`, Material 3, Navigation Compose `2.8.9`, Material Icons Extended.
+- **Hiển thị Ảnh/Video:** Coil `2.7.0` (`coil-compose`, `coil-video`), Media3 ExoPlayer `1.11.1` (`androidx-media3-exoplayer`, `androidx-media3-ui`).
+- **Lưu trữ & Tác vụ nền:**
+  - Room `2.7.0` (`room-runtime`, `room-ktx`, KSP `2.3.5`) — CSDL cục bộ `tele_photos_vault.db` (Version `2`).
+  - DataStore Preferences `1.1.7` (`tele_photos_settings`) — lưu cấu hình giao diện, Wi-Fi guard, API ID/Hash, thông tin phiên Telegram và dấu thời gian mở khoá `FLOOD_WAIT`.
+  - WorkManager `2.12.0` (`work-runtime-ktx`) — thực thi hàng đợi upload tuần tự (`TelegramUploadWorker`) và đặt lịch chạy lại qua `initialDelay` cho `FLOOD_WAIT` dài.
+  - Kotlin Coroutines `1.10.2` & `kotlinx-serialization-json` `1.13.0`.
+- **Telegram Client:** TDLib Android `com.github.tdlibx:td:1.8.56` (tải qua JitPack trong `settings.gradle.kts`).
+- **Secrets & Build Config:** `secrets-gradle-plugin` `2.0.1` đọc `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` từ `.env` / `.env.example` vào `BuildConfig` (người dùng cũng có thể nhập trực tiếp trên app nếu chưa cấu hình lúc build).
+- **Kiểm thử:** JUnit `4.13.2`, Robolectric `4.16.1`, `androidx.test:core` `1.6.1`, `kotlinx-coroutines-test` `1.10.2`.
 
 ---
 
-## Cấu trúc dự án
+## 2. Bản đồ Thư mục & Tệp Cốt lõi
 
 ```text
-app/src/main/java/com/laughing/telephotos/
-├── TelePhotosApplication.kt         # Khởi tạo repository/database và Coil ImageLoader
-├── MainActivity.kt                  # Activity chính bật edge-to-edge và áp dụng TelePhotosTheme
-├── core/
-│   ├── CacheCleanupManager.kt       # Quản lý giới hạn cache 500 MB LRU và dọn cache tạm
-│   ├── Formatters.kt                # Định dạng ngày/dung lượng/thời lượng, chuẩn hoá +84 & tên chủ đề
-│   ├── MediaHashUtil.kt             # Tính SHA-256 (lấy mẫu >16MB), staging upload, tạo thumbnail <=320px
-│   ├── MediaStoreScanner.kt         # Quét MediaStore, xin quyền, xoá hệ thống, lưu vào Pictures/Movies
-│   ├── NetworkRetryHelper.kt        # Retry 8s x 2 lần, phát hiện stall 25s, điều phối cảnh báo mạng
-│   ├── SettingsPreferences.kt       # DataStore lưu cấu hình theme, Wi-Fi guard, API ID/Hash, phiên TG
-│   ├── TelegramCaptionMetadata.kt   # Đóng gói/giải mã JSON #tele_anh_meta trong caption Document
-│   └── ThemeMode.kt                 # Enum giao diện Sáng / Tối / Liquid Glass
-├── data/
-│   ├── local/                       # Room Database v2 (MediaEntity/Dao, AlbumEntity/Dao, SyncTargetEntity/Dao)
-│   ├── telegram/                    # TdLibManager (phiên ngắn hạn), TdLibModels, TelegramPolicyGuard
-│   └── repository/VaultRepository.kt# Tầng điều phối trung tâm giữa Room, MediaStore, TDLib và WorkManager
-├── worker/TelegramUploadWorker.kt   # CoroutineWorker tải lên tuần tự từng tệp qua TDLib
-└── ui/                              # Navigation, ViewModel, Theme và các màn hình Compose
+├── .github/workflows/Main.yml            # CI GitHub Actions build app-debug.apk
+├── gradle/libs.versions.toml             # Version Catalog toàn bộ thư viện & plugin
+├── app/build.gradle.kts                  # Cấu hình Android app, signingConfigs, KSP, secrets
+└── app/src/
+    ├── main/java/com/laughing/telephotos/
+    │   ├── TelePhotosApplication.kt      # DI singleton cấp Application + ActivityLifecycleCallbacks
+    │   ├── MainActivity.kt               # Entry point edge-to-edge, gắn TelePhotosTheme
+    │   ├── core/
+    │   │   ├── CacheCleanupManager.kt    # Giới hạn cache 500 MB LRU & dọn bộ nhớ đệm
+    │   │   ├── Formatters.kt             # Định dạng ngày/dung lượng/thời lượng, chuẩn hoá +84 & tên Topic
+    │   │   ├── MediaHashUtil.kt          # SHA-256 (lấy mẫu 16MB với tệp lớn), staging upload, thumbnail <=320px
+    │   │   ├── MediaStoreScanner.kt      # Quét MediaStore, xin quyền, xoá hệ thống, lưu Pictures/Movies
+    │   │   ├── NetworkRetryHelper.kt     # Retry mạng tạm thời (8s x 2 + 25s stall) & NetworkAlertCoordinator
+    │   │   ├── SettingsPreferences.kt    # DataStore lưu AppSettings & unlockAtEpochMs cho FLOOD_WAIT
+    │   │   ├── TelegramCaptionMetadata.kt# Đóng gói/giải mã JSON #tele_anh_meta trong caption Document
+    │   │   └── ThemeMode.kt              # Enum 3 chế độ giao diện: LIGHT, DARK, LIQUID_GLASS
+    │   ├── data/
+    │   │   ├── local/
+    │   │   │   ├── TelePhotosDatabase.kt # Room v2 (entities + MIGRATION_1_2)
+    │   │   │   ├── MediaEntity.kt        # Bảng media_items, MediaType, UploadStatus
+    │   │   │   ├── MediaDao.kt           # Truy vấn Timeline, Queue, FreeUpSpace, PAUSED_FLOOD_WAIT
+    │   │   │   ├── AlbumEntity.kt        # Bảng albums ánh xạ 1-1 Forum Topic
+    │   │   │   ├── AlbumDao.kt           # Truy vấn danh sách Album kèm số lượng mục
+    │   │   │   ├── SyncTargetEntity.kt   # Bảng sync_targets lưu đích đã khoá + threadId 3 chủ đề lõi
+    │   │   │   └── SyncTargetDao.kt      # Lưu/cập nhật đích đồng bộ
+    │   │   ├── telegram/
+    │   │   │   ├── TdLibModels.kt        # Enum TelegramConnectionStatus, TdLibLifecycleState, FloodWaitState, FloodWaitException
+    │   │   │   ├── TelegramPolicyGuard.kt# Chặn hàm Delete* trên Telegram, phân loại đích, tính buffer FLOOD_WAIT
+    │   │   │   └── TdLibManager.kt       # Quản lý client TDLib đơn lệ, single-flight recovery, in-flight map
+    │   │   └── repository/
+    │   │       └── VaultRepository.kt    # Điều phối trung tâm Room <-> MediaStore <-> TdLibManager <-> WorkManager
+    │   ├── worker/
+    │   │   └── TelegramUploadWorker.kt   # Worker upload tuần tự 1 luồng + xử lý FLOOD_WAIT động
+    │   └── ui/
+    │       ├── components/               # MediaGridComponents.kt, TelePhotosSurfaces.kt
+    │       ├── navigation/TelePhotosApp.kt # Bottom Bar / NavigationRail + điều hướng 4 tab & sub-screens
+    │       ├── screens/                  # TimelineScreen, VideosScreen, AlbumsScreen, TrashScreen, SyncStorageScreen, TargetSelectorScreen, TelegramAuthScreen, MediaViewerScreen
+    │       ├── theme/                    # Color.kt, Theme.kt, Type.kt
+    │       └── viewmodel/TelePhotosViewModel.kt # StateFlow cho UI, đếm ngược FLOOD_WAIT, xử lý hành động người dùng
+    └── test/java/com/laughing/telephotos/
+        ├── ExampleUnitTest.kt            # Unit test cho metadata, policy guard, FLOOD_WAIT động, network retry
+        └── ExampleRobolectricTest.kt     # Robolectric test cho Room v2 & luồng dữ liệu cục bộ
 ```
 
 ---
 
-## Thiết lập & Build
+## 3. Luồng Logic Cốt lõi & Dữ liệu Đầu-Cuối
 
-### 1. Cấu hình Telegram API (Tuỳ chọn khi build, hoặc nhập trực tiếp trong app)
-Ứng dụng dùng `secrets-gradle-plugin` để đọc `TELEGRAM_API_ID` và `TELEGRAM_API_HASH` từ tệp `.env` ở thư mục gốc (xem mẫu trong `.env.example`):
+### A. Vòng đời `TdLibManager` (Foreground-Alive, Background-Close) & Single-Flight Recovery
+1. **Khởi tạo & Theo dõi Foreground/Background:**
+   - `TelePhotosApplication` đăng ký `ActivityLifecycleCallbacks` đếm `startedActivityCount` và bỏ qua biến động khi xoay màn hình (`activity.isChangingConfigurations`).
+   - Khi app vào foreground (`0 -> 1`): gọi `tdLibManager.onAppForegrounded()`. Hàm này khôi phục trạng thái `FLOOD_WAIT` từ `SettingsPreferences` (nếu còn hạn) và nếu `isTelegramLoggedIn == true` + có mạng thì tự làm nóng phiên TDLib (`ensureConnected()`).
+   - Khi app xuống background (`1 -> 0`): gọi `tdLibManager.onAppBackgrounded()`. Nếu `activeTransfers == 0 && activeWorkers == 0`, lập tức gọi `closeConnectionIdle()` (`TdApi.OptimizeStorage` + `TdApi.Close()` + dọn LRU cache). Nếu đang có worker hoặc download chạy, đặt cờ `closeWhenIdlePending = true` để tự đóng ngay khi tác vụ cuối cùng trả lease (`endTransfer()` / `endWorkLease()`).
+2. **An toàn đồng thời & Theo dõi yêu cầu (`ensureConnected` & `sendFunction`):**
+   - `lifecycleMutex` + `activeConnectDeferred` đảm bảo **single-flight**: nhiều coroutine gọi đồng thời sẽ chờ cùng một `CompletableDeferred`, không bao giờ tạo hai `Client` TDLib song song.
+   - Mọi request đi qua `sendFunction` -> `sendSuspending` đều được cấp ID từ `AtomicLong` và lưu vào `ConcurrentHashMap<Long, CompletableDeferred<TdApi.Object>>` với `withTimeoutOrNull(timeoutMs)` (mặc định `30s`).
+   - Nếu client đóng bất thường (`AuthorizationStateClosed` khi `isIntentionalShutdown == false`) hoặc lệnh gặp lỗi `"Client is closed"` / `"TDLib chưa sẵn sàng"`, `TdLibManager` tự phục hồi tối đa 1 lần qua `ensureConnected(forceReconnect = true)` (trừ `FLOOD_WAIT` — không bao giờ đóng/kết nối lại khi dính `FLOOD_WAIT`).
 
-```properties
-TELEGRAM_API_ID=12345678
-TELEGRAM_API_HASH=your_api_hash_here
-```
+### B. Luồng Đồng bộ Thủ công, Upload `Document` & Chống trùng lặp 2 lớp
+1. **Hợp nhất nguồn & Chống trùng lặp:**
+   - `VaultRepository.syncDeviceMediaStore()` quét ảnh/video qua `MediaStoreScanner` và gộp với bảng `media_items` theo `localUri` và `(mediaType, fileName.lowercase(), sizeBytes)`.
+   - Khi `TelegramUploadWorker` chuẩn bị upload mục có hash tạm `ms_*`, `MediaHashUtil` sao chép URI ra staging file trong `cacheDir` và tính `SHA-256` thật. Nếu `mediaDao.findUploadedByHash(trueHash)` đã tồn tại, mục này được đánh dấu `UPLOADED` ngay lập tức (không upload trùng).
+2. **Phân luồng Forum Topics & Tải lên Document:**
+   - Nếu đích là Forum Group, `VaultRepository.resolveUploadTopicId()` tự định tuyến: mục trong Album tuỳ chỉnh -> `album.messageThreadId`; ảnh lẻ -> topic **"Ảnh"**; video lẻ -> topic **"Video"** (tạo an toàn qua `topicMutexFor(chatId)` chuẩn hoá dấu tiếng Việt).
+   - `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) kèm `InputThumbnail` (`<= 320px`) và caption `#tele_anh_meta`. Nếu upload bị rớt mạng giữa chừng, giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` khi thử lại để **không gửi trùng tin nhắn**.
+   - Giữa các tệp tuần tự có độ trễ chống khoá tài khoản `2.0–3.5 giây` (`uploadPacingMs + random(0..1500ms)`).
 
-> Bạn có thể lấy `API ID` và `API Hash` tại [my.telegram.org](https://my.telegram.org). Nếu để giá trị mặc định trong `.env.example`, ứng dụng sẽ hiển thị màn hình nhập `API ID` / `API Hash` ngay khi bạn mở phần đăng nhập Telegram trong `Setting`.
+### C. Xử lý `FLOOD_WAIT` Động vs. Lỗi mạng tạm thời (`8s x 2`)
+Hệ thống tách bạch hoàn toàn hai cơ chế này:
+1. **Lỗi mạng tạm thời (chỉ cho rớt mạng / stall `25s`):**
+   - `NetworkRetryPolicy.isTransientNetworkError()` **loại trừ** `FloodWaitException`, chuỗi `"FLOOD_WAIT"` / `"Too Many Requests"` / `"retry after"` và `SecurityException`.
+   - Chỉ khi gặp mất kết nối / stall `25s` khi upload hoặc download, `NetworkRetryTracker` mới chờ `8 giây x 2 lần`, và báo hộp thoại `NetworkInterruptionAlert` ở lần lỗi liên tiếp thứ 3.
+2. **Xử lý `FLOOD_WAIT` động theo đúng thời gian Telegram trả về:**
+   - `TelegramPolicyGuard.parseFloodWaitSeconds()` trích xuất chính xác `retryAfterSec` (từ `FLOOD_WAIT_<N>`, `retry after <N>` hoặc mã lỗi `429`).
+   - Áp dụng **buffer an toàn phân tầng** (`computeFloodWaitBufferSeconds`):
+     - `retryAfterSec <= 30s` -> `+3s`
+     - `31s..300s` -> `+5s`
+     - `> 300s` -> `+10s`
+   - Tính `unlockAtEpochMs = now + (retryAfterSec + bufferSec) * 1000L`, cập nhật đồng thời vào `_floodWaitState` (`StateFlow`), trạng thái `TelegramConnectionStatus.FLOOD_WAIT` / `TdLibLifecycleState.FLOOD_WAIT`, và lưu bền vững vào `SettingsPreferences` (`DataStore`) để sống sót qua khởi động lại app hoặc Worker.
+   - **Giữ nguyên phiên TDLib ở trạng thái nhàn rỗi (idle/alive)** — tuyệt đối không `Close()` hay ép kết nối lại; lập tức khoá hàng đợi (`PAUSED_FLOOD_WAIT` trong Room) để không gửi thêm bất kỳ request upload nào khi `System.currentTimeMillis() < unlockAtEpochMs`.
+   - Trong `TelegramUploadWorker`:
+     - Nếu `retryAfterSec <= 60s` (hoặc thời gian còn lại `<= 65s`): Worker tạm hoãn (`delay`) ngay trong worker, cập nhật tiến độ đếm ngược; hết giờ sẽ xoá cờ `FLOOD_WAIT`, chuyển `PAUSED_FLOOD_WAIT` -> `QUEUED` và **tải tiếp đúng tệp đang dở đầu tiên** với nhịp `2.0–3.5s`.
+     - Nếu `retryAfterSec > 60s`: gọi `VaultRepository.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)` để lên lịch `WorkManager` với `setInitialDelay(remainingMs, TimeUnit.MILLISECONDS)` và thoát Worker sạch sẽ để không giữ wake lock.
 
-### 2. Chạy unit test & build cục bộ
-```bash
-# Chạy unit tests
-gradle :app:testDebugUnitTest
-
-# Build APK debug
-gradle :app:assembleDebug
-```
-
-### 3. Build tự động bằng GitHub Actions
-Repository đã cấu hình sẵn workflow tại `.github/workflows/Main.yml` (kích hoạt khi `push` lên nhánh `main` hoặc `master`):
-- Cài đặt JDK 17 (`temurin`).
-- Gỡ bỏ `google-services` nếu có để build độc lập không cần Firebase.
-- Tự tạo `debug.keystore` khi thiếu và chạy `./gradlew assembleDebug`.
-- Xuất artifact **`app-debug`** (`app/build/outputs/apk/debug/app-debug.apk`).
+### D. Xem trực tuyến, Tải về máy & Giải phóng dung lượng
+- **Xem trực tuyến (`MediaViewerScreen`):** Nếu có `localUri` hợp lệ thì phát/xem ngay từ máy; nếu chỉ có trên Telegram mới gọi `downloadFileOnDemand(fileId)` và lưu vào cache tạm dưới sự kiểm soát của `CacheCleanupManager` (giới hạn **500 MB**, tự xoá tệp cũ nhất theo LRU).
+- **Tải về máy:** Nút **"Tải về máy"** lưu bản gốc vào thư mục công khai `Pictures/Tele Photos` (ảnh) hoặc `Movies/Tele Photos` (video) qua `MediaStoreScanner.saveFileToPublicGallery()`.
+- **Giải phóng dung lượng máy & Thùng rác:** Chỉ cho phép giải phóng các mục đã có tick xanh (`UploadStatus.UPLOADED`), giữ nguyên bản trên Telegram. Xoá mục đã sao lưu chỉ xoá file cục bộ (qua system delete confirmation) và chuyển tiếp bản sao trên Telegram sang chủ đề **"Đã Xoá Gần Đây"** (lưu cục bộ 30 ngày).
 
 ---
 
-## Lưu ý bảo mật & Chính sách sử dụng
+## 4. Các Bất biến Nghiêm ngặt & Ràng buộc Kỹ thuật (DO NOT BREAK)
 
-- Không commit tệp `.env` chứa `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` cá nhân hoặc `my-upload-key.jks` lên repository công khai.
-- Thư mục dữ liệu phiên đăng nhập TDLib được lưu riêng tại `filesDir/tdlib_db` trên thiết bị và tách biệt hoàn toàn với bộ nhớ đệm xem trực tuyến (`cacheDir`).
+1. **Chính sách Chỉ đọc + Tải lên (`TelegramPolicyGuard.assertAllowedFunction`):**
+   - Mọi `TdApi.Function<*>` gửi qua `TdLibManager` (`sendFunction`, `sendSuspending`, `applyTdlibParameters`, `GetMe`, `DownloadFile`, `Close`) **BẮT BUỘC** đi qua `TelegramPolicyGuard.assertAllowedFunction(function)`. Nghiêm cấm xoá hoặc vô hiệu hoá bộ lọc chặn `DeleteMessages`, `DeleteChatHistory`, `DeleteForumTopic`, `DeleteChat`.
+2. **Không tải hàng loạt tự động & Không gắn Firebase:**
+   - Không thêm `google-services` / Firebase dependencies vào `app/build.gradle.kts` (CI `.github/workflows/Main.yml` cũng chủ động loại bỏ `google-services`).
+   - Không tự động tải tệp gốc từ Telegram khi quét lịch sử (`scanHistoryReadOnly` chỉ tải metadata & thumbnail nhỏ `downloadThumbnailQuick`).
+3. **Bất biến Room Schema v2:**
+   - Giữ nguyên `TelePhotosDatabase` `version = 2` và `MIGRATION_1_2` (`photosThreadId`, `videosThreadId` trong `sync_targets`). Mọi thay đổi schema bắt buộc phải tăng version và viết `Migration` mới.
+4. **Ràng buộc Test & Trạng thái UI:**
+   - `TelegramConnectionStatus.DISCONNECTED_IDLE.labelVi` phải giữ chuỗi con `"Đã ngắt kết nối"` (được kiểm tra bởi `ExampleUnitTest.kt`).
+   - Không dùng `NetworkRetryTracker` (`8s x 2`) cho `FloodWaitException`.
+5. **Tên Topic chuẩn hoá & Tiếng Việt tuyệt đối:**
+   - Không tạo album tuỳ chỉnh trùng với 3 topic hệ thống (`Ảnh`, `Video`, `Đã Xoá Gần Đây` sau chuẩn hoá `Formatters.normalizeTopicKey`).
+6. **Bảo toàn Signing & Build Config:**
+   - Không xoá hoặc sửa `signingConfigs` (`release`, `debugConfig`), `applicationId = "com.laughing.telephotos"` trong `app/build.gradle.kts` và không tạo `local.properties` trong repo.
+
+---
+
+## 5. Hướng dẫn Chỉnh sửa & Mở rộng An toàn
+
+- **Thêm hàm TDLib mới:** Thêm phương thức trong `TdLibManager.kt` và gọi thông qua `sendFunction(...)` bên trong `withActiveSession { ... }`. Điều này tự động hưởng single-flight reconnect, timeout, tracking trong `inFlightRequests`, `TelegramPolicyGuard` và cập nhật trạng thái `FLOOD_WAIT` động.
+- **Thay đổi hành vi hàng đợi Upload:** Cập nhật `MediaDao.kt` (giữ thứ tự ưu tiên `QUEUED`), `VaultRepository.startManualUploadBatch()` và `TelegramUploadWorker.kt` đồng thời; luôn bảo đảm giữ `PendingUploadInterruptedException` (`pendingMessageId`) để không gửi trùng tin nhắn Telegram.
+- **Cạm bẫy cần tránh:**
+  - Không gọi `tdLibManager.closeConnectionIdle()` ngay sau mỗi tác vụ khi app đang ở foreground (`appInForeground == true`), vì sẽ phá vỡ kiến trúc phiên tái sử dụng.
+  - Không bỏ kiểm tra `activity.isChangingConfigurations` trong `TelePhotosApplication` nếu không muốn xoay màn hình đóng nhầm TDLib.
+  - Không thay `InputMessageDocument` bằng `InputMessagePhoto`/`InputMessageVideo` vì Telegram sẽ nén giảm chất lượng ảnh/video gốc.
+
+---
+
+## 6. Build, Kiểm thử & Triển khai GitHub
+
+### Chạy Test & Build cục bộ
+- **Trong môi trường container AI Studio (không dùng `./gradlew`):**
+  ```bash
+  gradle :app:testDebugUnitTest
+  gradle :app:assembleDebug
+  ```
+- **Trên máy cá nhân / Linux / macOS có Gradle Wrapper:**
+  ```bash
+  ./gradlew :app:testDebugUnitTest
+  ./gradlew :app:assembleDebug
+  ```
+- **Cấu hình API mặc định (tuỳ chọn):** Tạo tệp `.env` ở thư mục gốc (không commit lên Git) với `TELEGRAM_API_ID` và `TELEGRAM_API_HASH` từ [my.telegram.org](https://my.telegram.org), hoặc nhập trực tiếp tại màn hình đăng nhập Telegram trong app.
+
+### Cập nhật lên GitHub & Kiểm tra GitHub Actions
+1. Kiểm tra trạng thái và đẩy mã nguồn lên nhánh `main` (hoặc `master`):
+   ```bash
+   git status
+   git add .
+   git commit -m "Upgrade persistent TDLib session and dynamic FLOOD_WAIT handling"
+   git push origin main
+   ```
+2. Kiểm tra build tự động trên GitHub Actions (`.github/workflows/Main.yml`):
+   - Mở repository trên GitHub -> chọn tab **Actions** -> chọn workflow **Build Android APK**.
+   - Theo dõi job `build` (chạy `./gradlew assembleDebug` với JDK 17).
+   - Khi job báo thành công (dấu tích xanh), cuộn xuống mục **Artifacts** ở cuối trang run để tải tệp APK **`app-debug`**.

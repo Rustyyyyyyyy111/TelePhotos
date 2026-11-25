@@ -206,14 +206,24 @@ fun TimelineScreen(
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onBackground,
               )
+              val statusText = if (connectionStatus == TelegramConnectionStatus.FLOOD_WAIT && floodWaitRemainingSec > 0L) {
+                "Tạm khoá hàng đợi (${Formatters.formatRemainingSeconds(floodWaitRemainingSec)})"
+              } else {
+                connectionStatus.labelVi
+              }
+              val statusColor = when (connectionStatus) {
+                TelegramConnectionStatus.READY -> StatusUploadedGreen
+                TelegramConnectionStatus.FLOOD_WAIT -> StatusWarningAmber
+                TelegramConnectionStatus.CONNECTING,
+                TelegramConnectionStatus.RECONNECTING,
+                TelegramConnectionStatus.SYNCING -> MaterialTheme.colorScheme.primary
+                TelegramConnectionStatus.DISCONNECTING,
+                TelegramConnectionStatus.DISCONNECTED_IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
+              }
               Text(
-                text = when (connectionStatus) {
-                  TelegramConnectionStatus.CONNECTED_ACTIVE,
-                  TelegramConnectionStatus.CONNECTING -> "Đang kết nối Telegram"
-                  else -> "Thủ công • Đã ngắt kết nối"
-                },
+                text = statusText,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = statusColor,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
               )

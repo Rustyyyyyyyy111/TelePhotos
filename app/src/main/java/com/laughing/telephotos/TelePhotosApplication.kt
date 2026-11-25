@@ -1,6 +1,8 @@
 package com.laughing.telephotos
 
+import android.app.Activity
 import android.app.Application
+import android.os.Bundle
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.VideoFrameDecoder
@@ -11,13 +13,19 @@ import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.data.local.TelePhotosDatabase
 import com.laughing.telephotos.data.repository.VaultRepository
 import com.laughing.telephotos.data.telegram.TdLibManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * Tele Photos application container.
- * Enforces Manual-Only Sync: does NOT trigger Telegram network polling or background workers on startup.
+ * Hosts singleton TdLibManager & VaultRepository; keeps the TDLib session alive while
+ * the app is in foreground and closes it cleanly when moved to background.
  */
 class TelePhotosApplication : Application(), ImageLoaderFactory {
 
+  val applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   val database: TelePhotosDatabase by lazy { TelePhotosDatabase.getInstance(this) }
   val settingsPreferences: SettingsPreferences by lazy { SettingsPreferences(this) }
   val networkAlertCoordinator: NetworkAlertCoordinator by lazy { NetworkAlertCoordinator() }
@@ -31,6 +39,46 @@ class TelePhotosApplication : Application(), ImageLoaderFactory {
       tdLibManager = tdLibManager,
       settingsPreferences = settingsPreferences,
       networkAlertCoordinator = networkAlertCoordinator,
+    )
+  }
+
+  private var startedActivityCount = 0
+  private var isActivityChangingConfigurations = false
+
+  override fun onCreate() {
+    super.onCreate()
+    registerActivityLifecycleCallbacks(
+      object : ActivityLifecycleCallbacks {
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+
+        override fun onActivityStarted(activity: Activity) {
+          if (++startedActivityCount == 1 && !isActivityChangingConfigurations) {
+            applicationScope.launch {
+              tdLibManager.onAppForegrounded()
+            }
+          }
+        }
+
+        override fun onActivityResumed(activity: Activity) = Unit
+
+        override fun onActivityPaused(activity: Activity) = Unit
+
+        override fun onActivityStopped(activity: Activity) {
+          isActivityChangingConfigurations = activity.isChangingConfigurations
+          if (--startedActivityCount <= 0) {
+            startedActivityCount = 0
+            if (!isActivityChangingConfigurations) {
+              applicationScope.launch {
+                tdLibManager.onAppBackgrounded()
+              }
+            }
+          }
+        }
+
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+
+        override fun onActivityDestroyed(activity: Activity) = Unit
+      }
     )
   }
 

@@ -23,6 +23,7 @@ data class AppSettings(
   val wifiOnlyUpload: Boolean = true,
   val uploadPacingMs: Long = 2000L,
   val floodWaitUntilEpochMs: Long = 0L,
+  val floodWaitRetryAfterSec: Int = 0,
   val floodWaitReason: String? = null,
   val lastHistorySyncEpochMs: Long = 0L,
   val customTelegramApiId: Int = 0,
@@ -32,7 +33,10 @@ data class AppSettings(
   val telegramDisplayName: String = "",
   val telegramPhoneNumber: String = "",
   val lastSyncStatusMessage: String = "",
-)
+) {
+  fun isFloodWaitActive(nowMs: Long = System.currentTimeMillis()): Boolean =
+    floodWaitUntilEpochMs > nowMs
+}
 
 class SettingsPreferences(private val context: Context) {
 
@@ -42,6 +46,7 @@ class SettingsPreferences(private val context: Context) {
     val WIFI_ONLY = booleanPreferencesKey("wifi_only_upload")
     val UPLOAD_PACING_MS = longPreferencesKey("upload_pacing_ms")
     val FLOOD_WAIT_UNTIL = longPreferencesKey("flood_wait_until_epoch_ms")
+    val FLOOD_WAIT_RETRY_SEC = intPreferencesKey("flood_wait_retry_after_sec")
     val FLOOD_WAIT_REASON = stringPreferencesKey("flood_wait_reason")
     val LAST_HISTORY_SYNC = longPreferencesKey("last_history_sync_epoch_ms")
     val CUSTOM_API_ID = intPreferencesKey("custom_telegram_api_id")
@@ -64,6 +69,7 @@ class SettingsPreferences(private val context: Context) {
         wifiOnlyUpload = prefs[Keys.WIFI_ONLY] ?: true,
         uploadPacingMs = prefs[Keys.UPLOAD_PACING_MS] ?: 2000L,
         floodWaitUntilEpochMs = prefs[Keys.FLOOD_WAIT_UNTIL] ?: 0L,
+        floodWaitRetryAfterSec = prefs[Keys.FLOOD_WAIT_RETRY_SEC] ?: 0,
         floodWaitReason = prefs[Keys.FLOOD_WAIT_REASON],
         lastHistorySyncEpochMs = prefs[Keys.LAST_HISTORY_SYNC] ?: 0L,
         customTelegramApiId = prefs[Keys.CUSTOM_API_ID] ?: 0,
@@ -145,9 +151,14 @@ class SettingsPreferences(private val context: Context) {
     }
   }
 
-  suspend fun setFloodWaitUntil(untilEpochMs: Long, reason: String?) {
+  suspend fun setFloodWaitUntil(
+    untilEpochMs: Long,
+    reason: String?,
+    retryAfterSeconds: Int = 0,
+  ) {
     context.telePhotosDataStore.edit { prefs ->
       prefs[Keys.FLOOD_WAIT_UNTIL] = untilEpochMs
+      prefs[Keys.FLOOD_WAIT_RETRY_SEC] = retryAfterSeconds.coerceAtLeast(0)
       if (reason != null) {
         prefs[Keys.FLOOD_WAIT_REASON] = reason
       } else {
@@ -159,6 +170,7 @@ class SettingsPreferences(private val context: Context) {
   suspend fun clearFloodWait() {
     context.telePhotosDataStore.edit { prefs ->
       prefs[Keys.FLOOD_WAIT_UNTIL] = 0L
+      prefs.remove(Keys.FLOOD_WAIT_RETRY_SEC)
       prefs.remove(Keys.FLOOD_WAIT_REASON)
     }
   }

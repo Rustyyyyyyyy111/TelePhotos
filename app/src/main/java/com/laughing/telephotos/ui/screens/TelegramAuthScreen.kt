@@ -107,7 +107,6 @@ fun TelegramAuthScreen(
       startedNotReady = true
     } else if (authState is TelegramAuthState.Ready && startedNotReady) {
       delay(700L)
-      onCloseTelegramIdle()
       onAuthReadyNavigate()
     }
   }
@@ -121,10 +120,7 @@ fun TelegramAuthScreen(
       title = { Text("Kết nối Telegram (TDLib)", style = MaterialTheme.typography.titleLarge) },
       navigationIcon = {
         IconButton(
-          onClick = {
-            if (settings.isTelegramLoggedIn) onCloseTelegramIdle()
-            onBack()
-          },
+          onClick = onBack,
           modifier = Modifier.testTag("auth_back_button"),
         ) {
           Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Quay lại")
@@ -195,16 +191,13 @@ fun TelegramAuthScreen(
               )
             }
             Text(
-              text = "ID: $userId • Phiên đang ngắt kết nối nhàn rỗi (tiết kiệm RAM)",
+              text = "ID: $userId • Phiên giữ sống khi mở app, tự đóng khi chạy nền",
               style = MaterialTheme.typography.labelSmall,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(modifier = Modifier.height(16.dp))
             Button(
-              onClick = {
-                onCloseTelegramIdle()
-                onAuthReadyNavigate()
-              },
+              onClick = onAuthReadyNavigate,
               modifier = Modifier
                 .fillMaxWidth()
                 .testTag("auth_continue_button"),

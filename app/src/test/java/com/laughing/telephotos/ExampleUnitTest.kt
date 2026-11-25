@@ -4,6 +4,7 @@ import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.CacheCleanupManager
 import com.laughing.telephotos.core.Formatters
 import com.laughing.telephotos.core.NetworkAlertCoordinator
+import com.laughing.telephotos.core.NetworkInterruptedException
 import com.laughing.telephotos.core.NetworkOperationType
 import com.laughing.telephotos.core.NetworkRetryPolicy
 import com.laughing.telephotos.core.NetworkRetryTracker
@@ -11,9 +12,11 @@ import com.laughing.telephotos.core.RetryDecision
 import com.laughing.telephotos.core.TelegramCaptionMetadata
 import com.laughing.telephotos.core.TelegramCaptionPayload
 import com.laughing.telephotos.data.local.SyncTargetType
+import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
+import org.drinkless.tdlib.TdApi
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -148,5 +151,55 @@ class ExampleUnitTest {
 
     coordinator.dismissAlert()
     assertNull(coordinator.activeAlert.value)
+  }
+
+  @Test
+  fun policyGuard_blocksDestructiveTelegramFunctionsAndAllowsReadUpload() {
+    assertFalse(TelegramPolicyGuard.isAllowedFunction(TdApi.DeleteMessages(1L, longArrayOf(2L), true)))
+    assertFalse(TelegramPolicyGuard.isAllowedFunction(TdApi.DeleteChatHistory(1L, true, true)))
+    assertFalse(TelegramPolicyGuard.isAllowedFunction(TdApi.DeleteForumTopic(1L, 2)))
+    assertFalse(TelegramPolicyGuard.isAllowedFunction(TdApi.DeleteChat(1L)))
+
+    assertTrue(TelegramPolicyGuard.isAllowedFunction(TdApi.GetForumTopics(1L, "", 0, 0L, 0, 10)))
+    assertTrue(TelegramPolicyGuard.isAllowedFunction(TdApi.SendMessage()))
+    assertTrue(TelegramPolicyGuard.isAllowedFunction(TdApi.ForwardMessages()))
+
+    var securityExceptionThrown = false
+    try {
+      TelegramPolicyGuard.assertAllowedFunction(TdApi.DeleteMessages(1L, longArrayOf(2L), true))
+    } catch (_: SecurityException) {
+      securityExceptionThrown = true
+    }
+    assertTrue(securityExceptionThrown)
+  }
+
+  @Test
+  fun dynamicFloodWait_computesTieredSafetyBuffersAndUnlockTimestamp() {
+    assertEquals(3, TelegramPolicyGuard.computeFloodWaitBufferSeconds(12))
+    assertEquals(3, TelegramPolicyGuard.computeFloodWaitBufferSeconds(30))
+    assertEquals(5, TelegramPolicyGuard.computeFloodWaitBufferSeconds(31))
+    assertEquals(5, TelegramPolicyGuard.computeFloodWaitBufferSeconds(300))
+    assertEquals(10, TelegramPolicyGuard.computeFloodWaitBufferSeconds(301))
+
+    val baseNow = 1_700_000_000_000L
+    assertEquals(baseNow + (20 + 3) * 1000L, TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(20, baseNow))
+    assertEquals(baseNow + (120 + 5) * 1000L, TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(120, baseNow))
+    assertEquals(baseNow + (600 + 10) * 1000L, TelegramPolicyGuard.computeFloodWaitUnlockAtEpochMs(600, baseNow))
+
+    val settingsActive = AppSettings(floodWaitUntilEpochMs = baseNow + 10_000L)
+    assertTrue(settingsActive.isFloodWaitActive(baseNow))
+    assertFalse(settingsActive.isFloodWaitActive(baseNow + 10_000L))
+  }
+
+  @Test
+  fun networkRetryPolicy_separatesFloodWaitAndSecurityFromTransientDisconnects() {
+    val floodErr = FloodWaitException(45, 1_700_000_045_000L, "FLOOD_WAIT_45")
+    assertTrue(NetworkRetryPolicy.isFloodWaitError(floodErr))
+    assertFalse(NetworkRetryPolicy.isTransientNetworkError(floodErr))
+    assertFalse(NetworkRetryPolicy.isTransientNetworkError(IllegalStateException("Too Many Requests: retry after 19")))
+    assertFalse(NetworkRetryPolicy.isTransientNetworkError(SecurityException("Blocked")))
+
+    assertTrue(NetworkRetryPolicy.isTransientNetworkError(NetworkInterruptedException("Mất mạng")))
+    assertTrue(NetworkRetryPolicy.isTransientNetworkError(IllegalStateException("Client is closed")))
   }
 }

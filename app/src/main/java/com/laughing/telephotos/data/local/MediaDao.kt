@@ -398,6 +398,34 @@ interface MediaDao {
     updatedAt: Long = System.currentTimeMillis(),
   )
 
+  @Query(
+    """
+    UPDATE media_items
+    SET uploadStatus = 'QUEUED',
+        lastError = NULL,
+        updatedAtEpochMs = :updatedAt
+    WHERE uploadStatus = 'PAUSED_FLOOD_WAIT'
+      AND isTrashed = 0
+    """
+  )
+  suspend fun requeueFloodWaitPaused(updatedAt: Long = System.currentTimeMillis())
+
+  @Query(
+    """
+    UPDATE media_items
+    SET uploadStatus = 'QUEUED',
+        lastError = NULL,
+        updatedAtEpochMs = :updatedAt
+    WHERE uploadStatus = 'PAUSED_FLOOD_WAIT'
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    """
+  )
+  suspend fun requeueFloodWaitPausedByType(
+    mediaTypeName: String,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
   @Query("UPDATE media_items SET contentHash = :contentHash WHERE id = :id")
   suspend fun updateContentHash(id: Long, contentHash: String)
 

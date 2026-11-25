@@ -21,6 +21,8 @@ import com.laughing.telephotos.data.repository.ManualSyncProgressState
 import com.laughing.telephotos.data.repository.SaveToDeviceProgress
 import com.laughing.telephotos.data.telegram.FileDownloadProgress
 import com.laughing.telephotos.data.telegram.FloodWaitException
+import com.laughing.telephotos.data.telegram.FloodWaitState
+import com.laughing.telephotos.data.telegram.TdLibLifecycleState
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
@@ -31,6 +33,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -70,6 +74,8 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
 
   val authState: StateFlow<TelegramAuthState> = repo.authState
   val connectionStatus: StateFlow<TelegramConnectionStatus> = repo.connectionStatus
+  val lifecycleState: StateFlow<TdLibLifecycleState> = repo.lifecycleState
+  val floodWaitState: StateFlow<FloodWaitState?> = repo.floodWaitState
   val networkInterruptionAlert: StateFlow<NetworkInterruptionAlert?> = repo.networkInterruptionAlert
 
   val lockedTarget: StateFlow<SyncTargetEntity?> = repo.lockedTargetFlow.stateIn(
@@ -162,20 +168,24 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
     }
     viewModelScope.launch {
-      settings.collect { appSettings ->
-        val until = appSettings.floodWaitUntilEpochMs
+      combine(settings, floodWaitState) { appSettings, activeFlood ->
+        maxOf(appSettings.floodWaitUntilEpochMs, activeFlood?.unlockAtEpochMs ?: 0L)
+      }.collectLatest { until ->
         if (until > System.currentTimeMillis()) {
           while (true) {
-            val rem = ((until - System.currentTimeMillis()) / 1000L).coerceAtLeast(0L)
+            val rem = ((until - System.currentTimeMillis() + 999L) / 1000L).coerceAtLeast(0L)
             _floodWaitRemainingSec.value = rem
             if (rem <= 0L) {
-              prefs.clearFloodWait()
+              tdLib.clearFloodWait()
               break
             }
             delay(1000L)
           }
         } else {
           _floodWaitRemainingSec.value = 0L
+          if (settings.value.floodWaitUntilEpochMs > 0L || floodWaitState.value != null) {
+            tdLib.clearFloodWait()
+          }
         }
       }
     }
@@ -314,7 +324,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       repo.startManualUploadBatch(selectedOnlyIds = ids)
         .onSuccess { count ->
           _selectedIds.value = emptySet()
-          _statusBanner.value = "Đang kết nối ngắn hạn để tải lên $count mục đã chọn"
+          _statusBanner.value = "Đang tải lên $count mục đã chọn"
         }
         .onFailure { err ->
           _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"
@@ -332,7 +342,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
         .onSuccess { count ->
           val label = if (mediaType == MediaType.VIDEO) "video" else "ảnh"
           _statusBanner.value = if (count > 0) {
-            "Đang kết nối Telegram tải lên $count $label chưa sao lưu"
+            "Đang tải lên $count $label chưa sao lưu"
           } else {
             "Đang đối chiếu $label với chủ đề Telegram..."
           }
@@ -348,7 +358,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true)
       repo.startManualUploadBatch(selectedOnlyIds = null)
         .onSuccess { count ->
-          _statusBanner.value = "Đang kết nối Telegram để tải lên $count mục mới"
+          _statusBanner.value = "Đang tải lên $count mục mới"
         }
         .onFailure { err ->
           _statusBanner.value = err.message ?: "Không thể bắt đầu tải lên"
@@ -360,7 +370,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     viewModelScope.launch {
       repo.stopManualSync()
       _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
-      _statusBanner.value = "Đã dừng đồng bộ — Đã ngắt kết nối Telegram"
+      _statusBanner.value = "Đã dừng đồng bộ"
     }
   }
 
@@ -577,7 +587,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       _isBusy.value = true
       repo.createAlbum(title, iconColor)
         .onSuccess { album ->
-          _statusBanner.value = "Đã tạo album «${album.title}» (đã ngắt kết nối Telegram)"
+          _statusBanner.value = "Đã tạo album «${album.title}»"
         }
         .onFailure { err ->
           if (err is FloodWaitException) {
@@ -594,7 +604,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   fun refreshAllowedTargets() {
     viewModelScope.launch {
       _isLoadingTargets.value = true
-      runCatching { repo.loadAllowedTargetsShortLived() }
+      runCatching { repo.loadAllowedTargets() }
         .onSuccess { list -> _candidateTargets.value = list }
         .onFailure { err ->
           if (err is FloodWaitException) {
@@ -631,9 +641,9 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
         .onSuccess { count ->
           _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
           _statusBanner.value = if (count > 0) {
-            "Đã đồng bộ chỉ đọc $count mục — Đã ngắt kết nối Telegram"
+            "Đã đồng bộ chỉ đọc $count mục mới từ Telegram"
           } else {
-            "Thư viện đã khớp với Telegram — Đã ngắt kết nối Telegram"
+            "Thư viện đã khớp với Telegram"
           }
         }
         .onFailure { err ->
