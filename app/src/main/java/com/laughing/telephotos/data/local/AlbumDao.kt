@@ -17,11 +17,15 @@ interface AlbumDao {
     FROM albums a
     LEFT JOIN media_items m ON m.albumId = a.id AND m.isTrashed = 0
     WHERE a.isTrashTopic = 0
+      AND LOWER(TRIM(a.title)) NOT IN ('ảnh', 'video', 'đã xoá gần đây', 'đã xóa gần đây')
     GROUP BY a.id
     ORDER BY a.createdAtEpochMs DESC
     """
   )
   fun observeAlbumsWithCount(): Flow<List<AlbumWithCount>>
+
+  @Query("SELECT * FROM albums")
+  suspend fun getAllAlbums(): List<AlbumEntity>
 
   @Query("SELECT * FROM albums WHERE id = :albumId LIMIT 1")
   fun observeAlbum(albumId: Long): Flow<AlbumEntity?>
@@ -40,4 +44,7 @@ interface AlbumDao {
 
   @Query("UPDATE albums SET coverUri = :coverUri WHERE id = :albumId")
   suspend fun updateCoverUri(albumId: Long, coverUri: String?)
+
+  @Query("DELETE FROM albums WHERE id IN (:ids)")
+  suspend fun deleteByIds(ids: List<Long>)
 }

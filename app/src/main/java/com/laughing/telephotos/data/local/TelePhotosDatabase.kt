@@ -6,6 +6,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverter
 import androidx.room.TypeConverters
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 class TelePhotosConverters {
   @TypeConverter
@@ -32,7 +34,7 @@ class TelePhotosConverters {
 
 @Database(
   entities = [MediaEntity::class, AlbumEntity::class, SyncTargetEntity::class],
-  version = 1,
+  version = 2,
   exportSchema = false,
 )
 @TypeConverters(TelePhotosConverters::class)
@@ -44,13 +46,22 @@ abstract class TelePhotosDatabase : RoomDatabase() {
   companion object {
     @Volatile private var instance: TelePhotosDatabase? = null
 
+    val MIGRATION_1_2 = object : Migration(1, 2) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sync_targets ADD COLUMN photosThreadId INTEGER")
+        db.execSQL("ALTER TABLE sync_targets ADD COLUMN videosThreadId INTEGER")
+      }
+    }
+
     fun getInstance(context: Context): TelePhotosDatabase =
       instance ?: synchronized(this) {
         instance ?: Room.databaseBuilder(
           context.applicationContext,
           TelePhotosDatabase::class.java,
           "tele_photos_vault.db",
-        ).build().also { instance = it }
+        ).addMigrations(MIGRATION_1_2)
+          .build()
+          .also { instance = it }
       }
   }
 }

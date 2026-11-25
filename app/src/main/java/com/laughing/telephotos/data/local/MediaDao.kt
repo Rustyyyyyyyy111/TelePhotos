@@ -14,6 +14,8 @@ data class StorageStats(
   val trashedCount: Int,
   val totalBytes: Long,
   val uploadedBytes: Long,
+  val freeableCount: Int = 0,
+  val freeableBytes: Long = 0L,
 )
 
 @Dao
@@ -95,9 +97,9 @@ interface MediaDao {
   @Query(
     """
     SELECT * FROM media_items
-    WHERE uploadStatus IN ('LOCAL_ONLY', 'QUEUED', 'FAILED', 'PAUSED_FLOOD_WAIT')
+    WHERE uploadStatus = 'QUEUED'
       AND isTrashed = 0
-    ORDER BY id ASC
+    ORDER BY takenAtEpochMs DESC, id ASC
     LIMIT 1
     """
   )
@@ -106,11 +108,36 @@ interface MediaDao {
   @Query(
     """
     SELECT COUNT(*) FROM media_items
-    WHERE uploadStatus IN ('LOCAL_ONLY', 'QUEUED', 'FAILED', 'PAUSED_FLOOD_WAIT', 'UPLOADING')
+    WHERE uploadStatus IN ('QUEUED', 'UPLOADING')
       AND isTrashed = 0
     """
   )
   suspend fun countPendingUploads(): Int
+
+  @Query("SELECT * FROM media_items")
+  suspend fun getAllMediaSnapshot(): List<MediaEntity>
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE uploadStatus = 'QUEUED'
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    ORDER BY takenAtEpochMs DESC, id ASC
+    LIMIT 1
+    """
+  )
+  suspend fun getNextPendingUploadByType(mediaTypeName: String): MediaEntity?
+
+  @Query(
+    """
+    SELECT COUNT(*) FROM media_items
+    WHERE uploadStatus IN ('QUEUED', 'UPLOADING')
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    """
+  )
+  suspend fun countPendingUploadsByType(mediaTypeName: String): Int
 
   @Query("SELECT * FROM media_items WHERE id = :id LIMIT 1")
   fun observeById(id: Long): Flow<MediaEntity?>
@@ -127,6 +154,20 @@ interface MediaDao {
   @Query("SELECT contentHash FROM media_items WHERE uploadStatus = 'UPLOADED'")
   suspend fun getAllUploadedHashes(): List<String>
 
+  @Query("SELECT * FROM media_items WHERE id IN (:ids)")
+  suspend fun getByIds(ids: List<Long>): List<MediaEntity>
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE isTrashed = 0
+      AND uploadStatus = 'UPLOADED'
+      AND localUri IS NOT NULL
+    ORDER BY takenAtEpochMs ASC, id ASC
+    """
+  )
+  suspend fun getAllFreeableSyncedMedia(): List<MediaEntity>
+
   @Query(
     """
     SELECT
@@ -136,7 +177,9 @@ interface MediaDao {
       COUNT(CASE WHEN isTrashed = 0 AND uploadStatus = 'FAILED' THEN 1 END) AS failedCount,
       COUNT(CASE WHEN isTrashed = 1 THEN 1 END) AS trashedCount,
       COALESCE(SUM(CASE WHEN isTrashed = 0 THEN sizeBytes ELSE 0 END), 0) AS totalBytes,
-      COALESCE(SUM(CASE WHEN isTrashed = 0 AND uploadStatus = 'UPLOADED' THEN sizeBytes ELSE 0 END), 0) AS uploadedBytes
+      COALESCE(SUM(CASE WHEN isTrashed = 0 AND uploadStatus = 'UPLOADED' THEN sizeBytes ELSE 0 END), 0) AS uploadedBytes,
+      COUNT(CASE WHEN isTrashed = 0 AND uploadStatus = 'UPLOADED' AND localUri IS NOT NULL THEN 1 END) AS freeableCount,
+      COALESCE(SUM(CASE WHEN isTrashed = 0 AND uploadStatus = 'UPLOADED' AND localUri IS NOT NULL THEN sizeBytes ELSE 0 END), 0) AS freeableBytes
     FROM media_items
     """
   )
@@ -173,6 +216,7 @@ interface MediaDao {
         telegramFileId = :fileId,
         telegramRemoteFileId = :remoteFileId,
         topicId = :topicId,
+        telegramThumbFileId = COALESCE(:thumbFileId, telegramThumbFileId),
         lastError = NULL,
         updatedAtEpochMs = :updatedAt
     WHERE id = :id
@@ -185,6 +229,23 @@ interface MediaDao {
     fileId: Int?,
     remoteFileId: String?,
     topicId: Long?,
+    thumbFileId: Int? = null,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET telegramThumbFileId = COALESCE(:thumbFileId, telegramThumbFileId),
+        cachedThumbPath = COALESCE(:cachedThumbPath, cachedThumbPath),
+        updatedAtEpochMs = :updatedAt
+    WHERE id = :id
+    """
+  )
+  suspend fun updateThumbInfo(
+    id: Long,
+    thumbFileId: Int?,
+    cachedThumbPath: String?,
     updatedAt: Long = System.currentTimeMillis(),
   )
 
@@ -247,6 +308,30 @@ interface MediaDao {
   @Query(
     """
     UPDATE media_items
+    SET cachedLocalVideoPath = NULL,
+        cachedThumbPath = NULL,
+        updatedAtEpochMs = :updatedAt
+    """
+  )
+  suspend fun clearTemporaryCachePaths(updatedAt: Long = System.currentTimeMillis())
+
+  @Query(
+    """
+    UPDATE media_items
+    SET localUri = :localUri,
+        updatedAtEpochMs = :updatedAt
+    WHERE id = :id
+    """
+  )
+  suspend fun markSavedToDevice(
+    id: Long,
+    localUri: String,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
     SET cachedLocalVideoPath = :localPath,
         updatedAtEpochMs = :updatedAt
     WHERE id = :id
@@ -303,6 +388,32 @@ interface MediaDao {
     SET uploadStatus = 'QUEUED',
         lastError = NULL,
         updatedAtEpochMs = :updatedAt
+    WHERE uploadStatus IN ('LOCAL_ONLY', 'PAUSED_FLOOD_WAIT', 'FAILED')
+      AND isTrashed = 0
+      AND mediaType = :mediaTypeName
+    """
+  )
+  suspend fun requeueAllPendingByType(
+    mediaTypeName: String,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query("UPDATE media_items SET contentHash = :contentHash WHERE id = :id")
+  suspend fun updateContentHash(id: Long, contentHash: String)
+
+  @Query("UPDATE media_items SET localUri = :localUri, updatedAtEpochMs = :updatedAt WHERE id = :id")
+  suspend fun updateLocalUri(
+    id: Long,
+    localUri: String?,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET uploadStatus = 'QUEUED',
+        lastError = NULL,
+        updatedAtEpochMs = :updatedAt
     WHERE id IN (:ids) AND uploadStatus != 'UPLOADED' AND isTrashed = 0
     """
   )
@@ -321,4 +432,29 @@ interface MediaDao {
     """
   )
   suspend fun resetInterruptedUploadsToQueued(updatedAt: Long = System.currentTimeMillis())
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE isTrashed = 1 AND trashedAtEpochMs IS NOT NULL AND trashedAtEpochMs <= :cutoffEpochMs
+    """
+  )
+  suspend fun getExpiredTrashedItems(cutoffEpochMs: Long): List<MediaEntity>
+
+  @Query("SELECT * FROM media_items WHERE isTrashed = 1")
+  suspend fun getAllTrashedItems(): List<MediaEntity>
+
+  @Query("DELETE FROM media_items WHERE id IN (:ids)")
+  suspend fun deleteByIds(ids: List<Long>)
+
+  @Query("DELETE FROM media_items WHERE isTrashed = 1")
+  suspend fun deleteAllTrashed()
+
+  @Query(
+    """
+    DELETE FROM media_items
+    WHERE isTrashed = 1 AND trashedAtEpochMs IS NOT NULL AND trashedAtEpochMs <= :cutoffEpochMs
+    """
+  )
+  suspend fun deleteExpiredTrashed(cutoffEpochMs: Long): Int
 }

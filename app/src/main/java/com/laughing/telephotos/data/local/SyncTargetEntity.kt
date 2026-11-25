@@ -4,9 +4,10 @@ import androidx.room.Entity
 import androidx.room.PrimaryKey
 
 enum class SyncTargetType(val labelVi: String) {
-  SAVED_MESSAGES("Tin nhắn đã lưu"),
-  PRIVATE_CHANNEL("Kênh riêng tư"),
   PRIVATE_SUPERGROUP("Siêu nhóm riêng tư"),
+  BASIC_GROUP("Nhóm thường"),
+  PRIVATE_CHANNEL("Kênh riêng tư"),
+  SAVED_MESSAGES("Tin nhắn đã lưu"),
 }
 
 @Entity(tableName = "sync_targets")
@@ -17,6 +18,8 @@ data class SyncTargetEntity(
   val targetType: SyncTargetType,
   val isForumEnabled: Boolean = false,
   val defaultMessageThreadId: Long? = null,
+  val photosThreadId: Long? = null,
+  val videosThreadId: Long? = null,
   val trashThreadId: Long? = null,
   val isLocked: Boolean = true,
   val confirmedAtEpochMs: Long = System.currentTimeMillis(),

@@ -1,5 +1,9 @@
 package com.laughing.telephotos.ui.navigation
 
+import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
@@ -16,6 +20,8 @@ import androidx.compose.material.icons.outlined.CollectionsBookmark
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.VideoLibrary
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -33,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -43,6 +50,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
+import com.laughing.telephotos.core.MediaStoreScanner
+import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.ui.screens.AlbumDetailScreen
 import com.laughing.telephotos.ui.screens.AlbumsScreen
 import com.laughing.telephotos.ui.screens.MediaViewerScreen
@@ -107,6 +116,7 @@ private val TopDestinations = listOf(
 
 @Composable
 fun TelePhotosApp(viewModel: TelePhotosViewModel) {
+  val context = LocalContext.current
   val navController = rememberNavController()
   val navBackStackEntry by navController.currentBackStackEntryAsState()
   val currentDestination = navBackStackEntry?.destination
@@ -129,6 +139,33 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
   val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
   val floodWaitRemainingSec by viewModel.floodWaitRemainingSec.collectAsStateWithLifecycle()
   val manualSyncProgress by viewModel.manualSyncProgress.collectAsStateWithLifecycle()
+  val networkInterruptionAlert by viewModel.networkInterruptionAlert.collectAsStateWithLifecycle()
+  val hasPromptedMediaPermission by viewModel.hasPromptedMediaPermission.collectAsStateWithLifecycle()
+  val cacheSizeBytes by viewModel.cacheSizeBytes.collectAsStateWithLifecycle()
+  val pendingSystemUriRequest by viewModel.pendingSystemUriRequest.collectAsStateWithLifecycle()
+
+  val systemDeleteLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.StartIntentSenderForResult(),
+    onResult = { activityResult ->
+      val pending = pendingSystemUriRequest
+      if (pending != null) {
+        if (activityResult.resultCode == Activity.RESULT_OK) {
+          viewModel.completeSystemUriRequest(pending)
+        } else {
+          viewModel.cancelSystemUriRequest()
+        }
+      }
+    },
+  )
+
+  LaunchedEffect(pendingSystemUriRequest) {
+    val req = pendingSystemUriRequest ?: return@LaunchedEffect
+    runCatching {
+      systemDeleteLauncher.launch(IntentSenderRequest.Builder(req.intentSender).build())
+    }.onFailure {
+      viewModel.cancelSystemUriRequest()
+    }
+  }
 
   LaunchedEffect(statusBanner) {
     val msg = statusBanner
@@ -235,6 +272,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
             startDestination = TimelineRoute,
           ) {
             composable<TimelineRoute> {
+              val hasPhotoPerm = MediaStoreScanner.hasMediaReadPermission(context, MediaType.PHOTO)
               TimelineScreen(
                 sections = photoSections,
                 selectedIds = selectedIds,
@@ -245,17 +283,22 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 connectionStatus = connectionStatus,
                 floodWaitRemainingSec = floodWaitRemainingSec,
                 manualSyncProgress = manualSyncProgress,
+                hasMediaPermission = hasPhotoPerm,
+                hasPromptedPermission = hasPromptedMediaPermission,
+                onPermissionPrompted = viewModel::markMediaPermissionPrompted,
+                onDevicePermissionGranted = viewModel::syncDevicePhotos,
                 onMediaClick = { media -> navController.navigate(MediaViewerRoute(media.id)) },
                 onToggleSelection = viewModel::toggleSelection,
                 onClearSelection = viewModel::clearSelection,
                 onImportPickedPhotos = { uris -> viewModel.importSelectedMedia(uris, null) },
                 onUploadSelectedItems = viewModel::uploadSelectedItemsNow,
+                onFreeUpSelectedSpace = viewModel::requestFreeUpSpaceSelected,
                 onMoveSelectedToTrash = viewModel::moveSelectedToTrash,
                 onAssignSelectedToAlbum = viewModel::assignSelectedToAlbum,
                 onStopManualSync = viewModel::stopManualSync,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
                 onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },
-                onSyncReadOnly = viewModel::syncHistoryReadOnly,
+                onSyncTab = { viewModel.startTabSync(MediaType.PHOTO) },
               )
             }
 
@@ -268,10 +311,12 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onOpenTrash = { navController.navigate(TrashRoute) },
                 onCreateAlbum = viewModel::createAlbum,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
+                onPurgeExpiredTrash = viewModel::purgeExpiredTrash,
               )
             }
 
             composable<VideosRoute> {
+              val hasVideoPerm = MediaStoreScanner.hasMediaReadPermission(context, MediaType.VIDEO)
               VideosScreen(
                 sections = videoSections,
                 selectedIds = selectedIds,
@@ -279,16 +324,24 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 lockedTarget = lockedTarget,
                 settings = settings,
                 authState = authState,
+                floodWaitRemainingSec = floodWaitRemainingSec,
                 manualSyncProgress = manualSyncProgress,
+                hasMediaPermission = hasVideoPerm,
+                hasPromptedPermission = hasPromptedMediaPermission,
+                onPermissionPrompted = viewModel::markMediaPermissionPrompted,
+                onDevicePermissionGranted = viewModel::syncDeviceVideos,
                 onMediaClick = { media -> navController.navigate(MediaViewerRoute(media.id)) },
                 onToggleSelection = viewModel::toggleSelection,
                 onClearSelection = viewModel::clearSelection,
                 onImportPickedVideos = { uris -> viewModel.importSelectedMedia(uris, null) },
                 onUploadSelectedItems = viewModel::uploadSelectedItemsNow,
+                onFreeUpSelectedSpace = viewModel::requestFreeUpSpaceSelected,
                 onMoveSelectedToTrash = viewModel::moveSelectedToTrash,
                 onAssignSelectedToAlbum = viewModel::assignSelectedToAlbum,
                 onStopManualSync = viewModel::stopManualSync,
-                onSyncReadOnly = viewModel::syncHistoryReadOnly,
+                onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
+                onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },
+                onSyncTab = { viewModel.startTabSync(MediaType.VIDEO) },
               )
             }
 
@@ -307,6 +360,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onBack = { navController.popBackStack() },
                 onMediaClick = { media -> navController.navigate(MediaViewerRoute(media.id)) },
                 onImportIntoAlbum = { uris -> viewModel.importSelectedMedia(uris, route.albumId) },
+                onMoveSelectedToTrash = viewModel::moveMediaIdsToTrash,
               )
             }
 
@@ -315,7 +369,10 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 trashedMedia = trashedMedia,
                 onBack = { navController.popBackStack() },
                 onRestoreItem = viewModel::restoreSingleFromTrash,
+                onPermanentDeleteItem = viewModel::permanentlyDeleteFromTrash,
+                onPermanentDeleteAll = viewModel::permanentlyDeleteAllTrash,
                 onOpenMedia = { media -> navController.navigate(MediaViewerRoute(media.id)) },
+                onPurgeExpired = viewModel::purgeExpiredTrash,
               )
             }
 
@@ -329,6 +386,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 uploadQueue = uploadQueue,
                 floodWaitRemainingSec = floodWaitRemainingSec,
                 manualSyncProgress = manualSyncProgress,
+                cacheSizeBytes = cacheSizeBytes,
                 isBusy = isBusy,
                 onSelectThemeMode = viewModel::setThemeMode,
                 onToggleAdvancedBlur = viewModel::setAdvancedBlurEnabled,
@@ -342,6 +400,9 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onSyncHistoryReadOnly = viewModel::syncHistoryReadOnly,
                 onStartManualUploadBatch = viewModel::startManualUploadBatch,
                 onStopManualSync = viewModel::stopManualSync,
+                onFreeUpAllSynced = viewModel::requestFreeUpAllSynced,
+                onClearCache = viewModel::clearTemporaryCache,
+                onRefreshCacheSize = viewModel::refreshCacheSize,
               )
             }
 
@@ -406,11 +467,30 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onRestoreFromTrash = viewModel::restoreSingleFromTrash,
                 onDownloadVideoOnDemand = viewModel::downloadVideoOnDemand,
                 onSaveDownloadedVideoPath = viewModel::saveDownloadedVideoPath,
+                onSaveToDevice = viewModel::saveMediaToDeviceGallery,
+                onFreeUpSpace = viewModel::requestFreeUpSpaceSingle,
+                onNotifyMessage = viewModel::showBanner,
               )
             }
           }
         }
       }
+    }
+
+    networkInterruptionAlert?.let { alert ->
+      AlertDialog(
+        onDismissRequest = viewModel::dismissNetworkInterruptionAlert,
+        title = { Text(alert.titleVi) },
+        text = { Text(alert.messageVi) },
+        confirmButton = {
+          Button(
+            onClick = viewModel::dismissNetworkInterruptionAlert,
+            modifier = Modifier.testTag("network_alert_confirm_button"),
+          ) {
+            Text(alert.confirmButtonVi)
+          }
+        },
+      )
     }
   }
 }

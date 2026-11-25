@@ -16,11 +16,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestoreFromTrash
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,6 +33,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -38,6 +42,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,12 +58,16 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.MediaStoreScanner
 import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.MediaType
+import com.laughing.telephotos.data.local.UploadStatus
+import com.laughing.telephotos.data.repository.SaveToDeviceProgress
 import com.laughing.telephotos.data.telegram.FileDownloadProgress
 import java.io.File
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -69,9 +78,22 @@ fun MediaViewerScreen(
   onRestoreFromTrash: (Long) -> Unit,
   onDownloadVideoOnDemand: (Int) -> Flow<FileDownloadProgress>,
   onSaveDownloadedVideoPath: (Long, String) -> Unit,
+  onSaveToDevice: (MediaEntity) -> Flow<SaveToDeviceProgress>,
+  onFreeUpSpace: (Long) -> Unit,
+  onNotifyMessage: (String) -> Unit,
   modifier: Modifier = Modifier,
 ) {
+  val context = LocalContext.current
+  val coroutineScope = rememberCoroutineScope()
   var showInfoPanel by remember { mutableStateOf(false) }
+  var showFreeUpConfirmDialog by remember { mutableStateOf(false) }
+  var isSavingToDevice by remember { mutableStateOf(false) }
+  var saveProgressFraction by remember { mutableStateOf(0f) }
+  var saveProgressText by remember { mutableStateOf<String?>(null) }
+
+  val hasLocalDeviceCopy = remember(media?.id, media?.localUri) {
+    media != null && MediaStoreScanner.isLocalUriAccessible(context, media.localUri)
+  }
 
   Box(
     modifier = modifier
@@ -92,10 +114,17 @@ fun MediaViewerScreen(
           modifier = Modifier.fillMaxSize(),
         )
       } else {
-        val imageData = media.localUri ?: media.cachedLocalVideoPath ?: media.cachedThumbPath
-        if (imageData != null) {
+        val localFullPhotoModel = remember(media.id, media.localUri, media.cachedLocalVideoPath) {
+          val localReadable = media.localUri?.takeIf {
+            MediaStoreScanner.isLocalUriAccessible(context, it)
+          }
+          localReadable ?: media.cachedLocalVideoPath
+            ?.takeIf { it.isNotBlank() && File(it).exists() }
+            ?.let { File(it) }
+        }
+        if (localFullPhotoModel != null) {
           AsyncImage(
-            model = imageData,
+            model = localFullPhotoModel,
             contentDescription = media.fileName,
             contentScale = ContentScale.Fit,
             modifier = Modifier.fillMaxSize(),
@@ -126,12 +155,70 @@ fun MediaViewerScreen(
           }
         },
         actions = {
+          if (!hasLocalDeviceCopy && media.telegramFileId != null) {
+            IconButton(
+              enabled = !isSavingToDevice,
+              onClick = {
+                isSavingToDevice = true
+                saveProgressFraction = 0.05f
+                saveProgressText = "Đang tải tệp gốc về máy..."
+                coroutineScope.launch {
+                  onSaveToDevice(media)
+                    .catch { err ->
+                      isSavingToDevice = false
+                      saveProgressText = null
+                      onNotifyMessage(err.message ?: "Không thể tải tệp về máy")
+                    }
+                    .collect { state ->
+                      when (state) {
+                        is SaveToDeviceProgress.Downloading -> {
+                          saveProgressFraction = state.fraction
+                          saveProgressText = state.statusVi
+                        }
+                        is SaveToDeviceProgress.Completed -> {
+                          isSavingToDevice = false
+                          saveProgressText = null
+                          val folder = if (media.mediaType == MediaType.VIDEO) {
+                            "Movies/Tele Photos"
+                          } else {
+                            "Pictures/Tele Photos"
+                          }
+                          onNotifyMessage("Đã lưu «${media.fileName}» vào $folder")
+                        }
+                      }
+                    }
+                }
+              },
+              modifier = Modifier.testTag("viewer_save_to_device_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.Download,
+                contentDescription = "Tải về máy",
+                tint = Color.White,
+              )
+            }
+          }
+
+          if (hasLocalDeviceCopy && media.uploadStatus == UploadStatus.UPLOADED && !media.isTrashed) {
+            IconButton(
+              onClick = { showFreeUpConfirmDialog = true },
+              modifier = Modifier.testTag("viewer_free_up_space_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.CleaningServices,
+                contentDescription = "Giải phóng dung lượng",
+                tint = Color.White,
+              )
+            }
+          }
+
           IconButton(
             onClick = { showInfoPanel = !showInfoPanel },
             modifier = Modifier.testTag("viewer_info_button"),
           ) {
             Icon(Icons.Filled.Info, contentDescription = "Thông tin tệp", tint = Color.White)
           }
+
           if (media.isTrashed) {
             IconButton(
               onClick = {
@@ -159,6 +246,31 @@ fun MediaViewerScreen(
         ),
       )
 
+      if (isSavingToDevice) {
+        Surface(
+          shape = RoundedCornerShape(14.dp),
+          color = Color(0xEE111824),
+          modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .padding(20.dp)
+            .fillMaxWidth()
+            .testTag("viewer_save_progress_card"),
+        ) {
+          Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+              text = saveProgressText ?: "Đang tải về máy...",
+              style = MaterialTheme.typography.titleSmall,
+              color = Color.White,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            LinearProgressIndicator(
+              progress = { saveProgressFraction.coerceIn(0.05f, 1f) },
+              modifier = Modifier.fillMaxWidth(),
+            )
+          }
+        }
+      }
+
       if (showInfoPanel) {
         Surface(
           shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
@@ -171,6 +283,19 @@ fun MediaViewerScreen(
           Column(modifier = Modifier.padding(20.dp)) {
             Text(media.fileName, style = MaterialTheme.typography.titleMedium, color = Color.White)
             Spacer(modifier = Modifier.height(6.dp))
+            val sourceLabel = when {
+              hasLocalDeviceCopy && media.uploadStatus == UploadStatus.UPLOADED ->
+                "Có bản trên máy & Telegram"
+              !hasLocalDeviceCopy && media.uploadStatus == UploadStatus.UPLOADED ->
+                "Chỉ trực tuyến (Telegram)"
+              else ->
+                "Chỉ có trên máy"
+            }
+            Text(
+              text = "Nguồn lưu trữ: $sourceLabel",
+              style = MaterialTheme.typography.bodySmall,
+              color = Color(0xFF4ADE80),
+            )
             Text(
               text = "Thời gian: ${Formatters.formatFullDateTime(media.takenAtEpochMs)}",
               style = MaterialTheme.typography.bodySmall,
@@ -193,8 +318,45 @@ fun MediaViewerScreen(
                 color = Color.White.copy(alpha = 0.7f),
               )
             }
+            if (media.isTrashed) {
+              Spacer(modifier = Modifier.height(4.dp))
+              Text(
+                text = "Trong Đã xóa gần đây • ${Formatters.formatRemainingTrashDays(media.trashedAtEpochMs)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFFFBBF24),
+              )
+            }
           }
         }
+      }
+
+      if (showFreeUpConfirmDialog) {
+        AlertDialog(
+          onDismissRequest = { showFreeUpConfirmDialog = false },
+          title = { Text("Giải phóng dung lượng máy?") },
+          text = {
+            Text(
+              text = "Bản gốc trên bộ nhớ máy (${Formatters.formatFileSize(media.sizeBytes)}) sẽ bị xoá để tiết kiệm dung lượng. Bản sao lưu trên Telegram vẫn được giữ nguyên để bạn xem trực tuyến hoặc tải lại bất cứ lúc nào.",
+              style = MaterialTheme.typography.bodyMedium,
+            )
+          },
+          confirmButton = {
+            Button(
+              onClick = {
+                showFreeUpConfirmDialog = false
+                onFreeUpSpace(media.id)
+              },
+              modifier = Modifier.testTag("confirm_viewer_free_up_button"),
+            ) {
+              Text("Giải phóng")
+            }
+          },
+          dismissButton = {
+            TextButton(onClick = { showFreeUpConfirmDialog = false }) {
+              Text("Huỷ")
+            }
+          },
+        )
       }
     }
   }
@@ -207,14 +369,14 @@ private fun OnDemandVideoPlayerContent(
   onSaveDownloadedVideoPath: (Long, String) -> Unit,
   modifier: Modifier = Modifier,
 ) {
-  val existingLocalUri = remember(media.localUri, media.cachedLocalVideoPath) {
-    when {
-      !media.cachedLocalVideoPath.isNullOrBlank() && File(media.cachedLocalVideoPath).exists() -> {
-        Uri.fromFile(File(media.cachedLocalVideoPath))
-      }
-      !media.localUri.isNullOrBlank() -> Uri.parse(media.localUri)
-      else -> null
-    }
+  val context = LocalContext.current
+  val existingLocalUri = remember(media.id, media.localUri, media.cachedLocalVideoPath) {
+    val localReadableUri = media.localUri?.takeIf {
+      MediaStoreScanner.isLocalUriAccessible(context, it)
+    }?.let { Uri.parse(it) }
+    localReadableUri ?: media.cachedLocalVideoPath
+      ?.takeIf { it.isNotBlank() && File(it).exists() }
+      ?.let { Uri.fromFile(File(it)) }
   }
 
   var playableUri by remember(media.id) { mutableStateOf(existingLocalUri) }
@@ -223,6 +385,10 @@ private fun OnDemandVideoPlayerContent(
   var retryTrigger by remember { mutableStateOf(0) }
 
   LaunchedEffect(media.id, existingLocalUri, retryTrigger) {
+    if (existingLocalUri != null) {
+      playableUri = existingLocalUri
+      return@LaunchedEffect
+    }
     if (playableUri == null && media.telegramFileId != null) {
       downloadError = null
       onDownloadVideoOnDemand(media.telegramFileId)
@@ -244,55 +410,71 @@ private fun OnDemandVideoPlayerContent(
         uri = activeUri,
         modifier = Modifier.fillMaxSize(),
       )
-    } else if (downloadError != null) {
-      Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.padding(24.dp),
-      ) {
-        Text(
-          text = downloadError ?: "Lỗi tải video",
-          style = MaterialTheme.typography.bodyMedium,
-          color = Color.White,
-        )
-        Spacer(modifier = Modifier.height(12.dp))
-        Button(onClick = { retryTrigger++ }) {
-          Text("Thử tải lại")
-        }
-      }
     } else {
-      Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-        modifier = Modifier
-          .padding(28.dp)
-          .testTag("video_download_progress"),
-      ) {
-        Icon(
-          imageVector = Icons.Filled.CloudDownload,
-          contentDescription = null,
-          tint = Color(0xFF38BDF8),
-          modifier = Modifier.size(44.dp),
+      val previewThumb = media.cachedThumbPath?.takeIf { it.isNotBlank() && File(it).exists() }
+      if (previewThumb != null) {
+        AsyncImage(
+          model = File(previewThumb),
+          contentDescription = media.fileName,
+          contentScale = ContentScale.Fit,
+          alpha = 0.42f,
+          modifier = Modifier.fillMaxSize(),
         )
-        Spacer(modifier = Modifier.height(12.dp))
-        val pct = ((downloadProgress?.fraction ?: 0f) * 100).toInt()
-        Text(
-          text = "Đang tải video theo yêu cầu... $pct%",
-          style = MaterialTheme.typography.titleSmall,
-          color = Color.White,
-        )
-        Spacer(modifier = Modifier.height(10.dp))
-        LinearProgressIndicator(
-          progress = { downloadProgress?.fraction ?: 0f },
-          modifier = Modifier.fillMaxWidth(0.7f),
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-          text = "Thời lượng: ${Formatters.formatVideoDuration(media.durationSec)} • ${
-            Formatters.formatFileSize(media.sizeBytes)
-          }",
-          style = MaterialTheme.typography.bodySmall,
-          color = Color.White.copy(alpha = 0.75f),
-        )
+      }
+
+      if (downloadError != null) {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          modifier = Modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(24.dp),
+        ) {
+          Text(
+            text = downloadError ?: "Lỗi tải video",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White,
+          )
+          Spacer(modifier = Modifier.height(12.dp))
+          Button(onClick = { retryTrigger++ }) {
+            Text("Thử tải lại")
+          }
+        }
+      } else {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.Center,
+          modifier = Modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(28.dp)
+            .testTag("video_download_progress"),
+        ) {
+          Icon(
+            imageVector = Icons.Filled.CloudDownload,
+            contentDescription = null,
+            tint = Color(0xFF38BDF8),
+            modifier = Modifier.size(44.dp),
+          )
+          Spacer(modifier = Modifier.height(12.dp))
+          val pct = ((downloadProgress?.fraction ?: 0f) * 100).toInt()
+          Text(
+            text = downloadProgress?.statusMessageVi ?: "Đang tải video gốc từ Telegram... $pct%",
+            style = MaterialTheme.typography.titleSmall,
+            color = Color.White,
+          )
+          Spacer(modifier = Modifier.height(10.dp))
+          LinearProgressIndicator(
+            progress = { downloadProgress?.fraction ?: 0f },
+            modifier = Modifier.fillMaxWidth(0.7f),
+          )
+          Spacer(modifier = Modifier.height(8.dp))
+          Text(
+            text = "Thời lượng: ${Formatters.formatVideoDuration(media.durationSec)} • ${
+              Formatters.formatFileSize(media.sizeBytes)
+            }",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.75f),
+          )
+        }
       }
     }
   }
@@ -349,13 +531,21 @@ private fun OnDemandPhotoDownloadFallback(
 ) {
   var localPath by remember(media.id) { mutableStateOf<String?>(null) }
   var progressFraction by remember(media.id) { mutableStateOf(0f) }
+  var statusMessage by remember(media.id) { mutableStateOf<String?>(null) }
+  var downloadError by remember(media.id) { mutableStateOf<String?>(null) }
+  var retryTrigger by remember { mutableStateOf(0) }
 
-  LaunchedEffect(media.id) {
+  LaunchedEffect(media.id, retryTrigger) {
     val fileId = media.telegramFileId ?: return@LaunchedEffect
+    downloadError = null
+    statusMessage = null
     onDownloadOnDemand(fileId)
-      .catch { }
+      .catch { err ->
+        downloadError = err.message ?: "Không thể tải ảnh từ Telegram"
+      }
       .collect { prog ->
         progressFraction = prog.fraction
+        statusMessage = prog.statusMessageVi
         if (prog.isCompleted && !prog.localPath.isNullOrBlank()) {
           onSaveDownloadedPath(media.id, prog.localPath)
           localPath = prog.localPath
@@ -373,15 +563,50 @@ private fun OnDemandPhotoDownloadFallback(
         modifier = Modifier.fillMaxSize(),
       )
     } else {
-      Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = Color.Transparent)
-        CircularProgressIndicator(progress = { progressFraction.coerceAtLeast(0.05f) }, color = Color.White)
-        Spacer(modifier = Modifier.height(10.dp))
-        Text(
-          text = "Đang tải ảnh gốc từ Telegram...",
-          style = MaterialTheme.typography.bodySmall,
-          color = Color.White,
+      val previewThumb = media.cachedThumbPath?.takeIf { it.isNotBlank() && File(it).exists() }
+      if (previewThumb != null) {
+        AsyncImage(
+          model = File(previewThumb),
+          contentDescription = media.fileName,
+          contentScale = ContentScale.Fit,
+          alpha = 0.55f,
+          modifier = Modifier.fillMaxSize(),
         )
+      }
+
+      if (downloadError != null) {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          modifier = Modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(24.dp),
+        ) {
+          Text(
+            text = downloadError ?: "Không thể tải ảnh từ Telegram",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White,
+          )
+          Spacer(modifier = Modifier.height(12.dp))
+          Button(onClick = { retryTrigger++ }) {
+            Text("Thử tải lại")
+          }
+        }
+      } else {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          modifier = Modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+            .padding(20.dp),
+        ) {
+          Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = Color.Transparent)
+          CircularProgressIndicator(progress = { progressFraction.coerceAtLeast(0.05f) }, color = Color.White)
+          Spacer(modifier = Modifier.height(10.dp))
+          Text(
+            text = statusMessage ?: "Đang tải ảnh gốc từ Telegram...",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White,
+          )
+        }
       }
     }
   }

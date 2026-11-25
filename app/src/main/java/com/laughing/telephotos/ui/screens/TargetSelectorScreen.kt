@@ -14,14 +14,18 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -31,6 +35,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -51,6 +56,7 @@ import com.laughing.telephotos.data.local.SyncTargetEntity
 import com.laughing.telephotos.data.local.SyncTargetType
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
+import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import com.laughing.telephotos.ui.components.TelePhotosGlassCard
 import com.laughing.telephotos.ui.theme.StatusUploadedGreen
 
@@ -70,6 +76,15 @@ fun TargetSelectorScreen(
 ) {
   val isLoggedIn = settings.isTelegramLoggedIn || authState is TelegramAuthState.Ready
   var pendingConfirmation by remember { mutableStateOf<TelegramCandidateTarget?>(null) }
+  var searchQuery by remember { mutableStateOf("") }
+
+  val filteredCandidates = remember(candidates, searchQuery) {
+    if (searchQuery.isBlank()) {
+      candidates
+    } else {
+      candidates.filter { TelegramPolicyGuard.matchesVietnameseSearch(it.title, searchQuery) }
+    }
+  }
 
   LaunchedEffect(isLoggedIn) {
     if (isLoggedIn) {
@@ -98,6 +113,33 @@ fun TargetSelectorScreen(
       colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
     )
 
+    if (isLoggedIn) {
+      OutlinedTextField(
+        value = searchQuery,
+        onValueChange = { searchQuery = it },
+        placeholder = { Text("Tìm kiếm nhóm hoặc kênh Telegram...") },
+        leadingIcon = {
+          Icon(Icons.Filled.Search, contentDescription = "Tìm kiếm nhóm")
+        },
+        trailingIcon = {
+          if (searchQuery.isNotEmpty()) {
+            IconButton(
+              onClick = { searchQuery = "" },
+              modifier = Modifier.testTag("target_search_clear_button"),
+            ) {
+              Icon(Icons.Filled.Close, contentDescription = "Xoá từ khoá")
+            }
+          }
+        },
+        singleLine = true,
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(horizontal = 14.dp, vertical = 6.dp)
+          .testTag("target_search_input"),
+      )
+    }
+
     LazyColumn(
       contentPadding = PaddingValues(14.dp),
       verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -117,7 +159,7 @@ fun TargetSelectorScreen(
             )
             Spacer(modifier = Modifier.width(10.dp))
             Text(
-              text = "Danh sách an toàn (Allowlist): Chỉ cho phép Tin nhắn đã lưu, Kênh riêng tư hoặc Siêu nhóm riêng tư do bạn quản lý. Toàn bộ nhóm/kênh công khai đã được ẩn.",
+              text = "Ưu tiên Nhóm Telegram: Hỗ trợ Nhóm thường, Siêu nhóm riêng tư (tự tách chủ đề Ảnh & Video nếu bật Forum), Kênh riêng tư và Tin nhắn đã lưu.",
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -209,47 +251,88 @@ fun TargetSelectorScreen(
             }
           }
         }
-      } else {
-        items(candidates, key = { it.chatId }) { candidate ->
-          val isCurrent = lockedTarget?.chatId == candidate.chatId
-          val icon = when (candidate.targetType) {
-            SyncTargetType.SAVED_MESSAGES -> Icons.Filled.Bookmark
-            SyncTargetType.PRIVATE_CHANNEL -> Icons.Filled.Campaign
-            SyncTargetType.PRIVATE_SUPERGROUP -> Icons.Filled.Forum
+      } else if (filteredCandidates.isEmpty()) {
+        item(key = "empty_search_targets") {
+          TelePhotosGlassCard(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(18.dp)) {
+              Text("Không tìm thấy nhóm phù hợp", style = MaterialTheme.typography.titleMedium)
+              Spacer(modifier = Modifier.height(6.dp))
+              Text(
+                text = "Không có nhóm hoặc kênh nào khớp với từ khoá «$searchQuery».",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Spacer(modifier = Modifier.height(12.dp))
+              OutlinedButton(onClick = { searchQuery = "" }) {
+                Text("Xoá bộ lọc tìm kiếm")
+              }
+            }
           }
-          TelePhotosGlassCard(
-            onClick = { pendingConfirmation = candidate },
-            modifier = Modifier
-              .fillMaxWidth()
-              .testTag("candidate_target_${candidate.chatId}"),
-          ) {
-            Row(
+        }
+      } else {
+        val groupTargets = filteredCandidates.filter {
+          it.targetType == SyncTargetType.PRIVATE_SUPERGROUP || it.targetType == SyncTargetType.BASIC_GROUP
+        }
+        val channelTargets = filteredCandidates.filter { it.targetType == SyncTargetType.PRIVATE_CHANNEL }
+        val savedTargets = filteredCandidates.filter { it.targetType == SyncTargetType.SAVED_MESSAGES }
+
+        val groupedSections = buildList {
+          if (groupTargets.isNotEmpty()) add("Nhóm Telegram (Ưu tiên)" to groupTargets)
+          if (channelTargets.isNotEmpty()) add("Kênh Telegram" to channelTargets)
+          if (savedTargets.isNotEmpty()) add("Tin nhắn đã lưu" to savedTargets)
+        }
+
+        groupedSections.forEach { (sectionTitle, sectionItems) ->
+          item(key = "header_$sectionTitle") {
+            Text(
+              text = sectionTitle,
+              style = MaterialTheme.typography.titleSmall,
+              color = MaterialTheme.colorScheme.primary,
+              modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+            )
+          }
+          items(sectionItems, key = { it.chatId }) { candidate ->
+            val isCurrent = lockedTarget?.chatId == candidate.chatId
+            val icon = when (candidate.targetType) {
+              SyncTargetType.PRIVATE_SUPERGROUP -> Icons.Filled.Forum
+              SyncTargetType.BASIC_GROUP -> Icons.Filled.Groups
+              SyncTargetType.PRIVATE_CHANNEL -> Icons.Filled.Campaign
+              SyncTargetType.SAVED_MESSAGES -> Icons.Filled.Bookmark
+            }
+            TelePhotosGlassCard(
+              onClick = { pendingConfirmation = candidate },
               modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
-              verticalAlignment = Alignment.CenterVertically,
+                .testTag("candidate_target_${candidate.chatId}"),
             ) {
-              Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(28.dp),
-              )
-              Spacer(modifier = Modifier.width(12.dp))
-              Column(modifier = Modifier.weight(1f)) {
-                Text(candidate.title, style = MaterialTheme.typography.titleSmall)
-                Text(
-                  text = candidate.subtitleVi,
-                  style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-              }
-              if (isCurrent) {
+              Row(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+              ) {
                 Icon(
-                  imageVector = Icons.Filled.CheckCircle,
-                  contentDescription = "Đang sử dụng",
-                  tint = StatusUploadedGreen,
+                  imageVector = icon,
+                  contentDescription = null,
+                  tint = MaterialTheme.colorScheme.primary,
+                  modifier = Modifier.size(28.dp),
                 )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                  Text(candidate.title, style = MaterialTheme.typography.titleSmall)
+                  Text(
+                    text = candidate.subtitleVi,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                if (isCurrent) {
+                  Icon(
+                    imageVector = Icons.Filled.CheckCircle,
+                    contentDescription = "Đang sử dụng",
+                    tint = StatusUploadedGreen,
+                  )
+                }
               }
             }
           }
@@ -278,7 +361,7 @@ fun TargetSelectorScreen(
           if (candidate.isForumEnabled) {
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-              text = "Siêu nhóm có bật Chủ đề: ứng dụng sẽ tự động tìm hoặc tạo chủ đề «Đã xoá gần đây» rồi ngắt kết nối ngay.",
+              text = "Nhóm có bật Chủ đề (Forum): ứng dụng sẽ tự động tạo/dùng các chủ đề «Ảnh», «Video» cho tệp tải lên và «Đã xoá gần đây».",
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.primary,
             )

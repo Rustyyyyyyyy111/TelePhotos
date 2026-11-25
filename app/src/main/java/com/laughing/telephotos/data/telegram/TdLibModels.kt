@@ -48,6 +48,7 @@ data class SentDocumentResult(
   val fileId: Int?,
   val remoteFileId: String?,
   val messageThreadId: Long?,
+  val thumbFileId: Int? = null,
 )
 
 data class ScannedTelegramMedia(
@@ -73,6 +74,7 @@ data class FileDownloadProgress(
   val totalBytes: Long,
   val isCompleted: Boolean,
   val localPath: String?,
+  val statusMessageVi: String? = null,
 ) {
   val fraction: Float
     get() = if (totalBytes > 0L) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f

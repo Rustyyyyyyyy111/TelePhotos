@@ -1,5 +1,6 @@
 package com.laughing.telephotos.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,7 +28,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CollectionsBookmark
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.VideoCall
@@ -47,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -79,9 +83,14 @@ fun AlbumsScreen(
   onOpenTrash: () -> Unit,
   onCreateAlbum: (String, Int) -> Unit,
   onOpenTargetSelector: () -> Unit,
+  onPurgeExpiredTrash: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   var showCreateDialog by remember { mutableStateOf(false) }
+
+  LaunchedEffect(Unit) {
+    onPurgeExpiredTrash()
+  }
 
   Box(modifier = modifier.fillMaxSize()) {
     Column(modifier = Modifier.fillMaxSize()) {
@@ -105,144 +114,73 @@ fun AlbumsScreen(
         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
       )
 
-      // Dedicated "Thùng rác" row at the top of Albums
-      TelePhotosGlassCard(
-        onClick = onOpenTrash,
+      LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = 156.dp),
+        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 96.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier
-          .fillMaxWidth()
-          .padding(horizontal = 14.dp, vertical = 6.dp)
-          .testTag("albums_trash_card"),
+          .fillMaxSize()
+          .testTag("albums_grid"),
       ) {
-        Row(
-          modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-          Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.weight(1f),
-          ) {
-            Surface(
-              shape = RoundedCornerShape(12.dp),
-              color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f),
-              modifier = Modifier.size(40.dp),
-            ) {
-              Box(contentAlignment = Alignment.Center) {
-                Icon(
-                  imageVector = Icons.Filled.DeleteSweep,
-                  contentDescription = "Thùng rác",
-                  tint = MaterialTheme.colorScheme.onErrorContainer,
-                )
-              }
-            }
-            Spacer(modifier = Modifier.width(12.dp))
-            Column {
-              Text("Thùng rác", style = MaterialTheme.typography.titleMedium)
-              Text(
-                text = "Đã xoá gần đây • Không xoá khỏi Telegram",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-              )
-            }
-          }
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Surface(
-              shape = RoundedCornerShape(10.dp),
-              color = MaterialTheme.colorScheme.surfaceVariant,
-            ) {
-              Text(
-                text = "$trashedCount mục",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-              )
-            }
-            Spacer(modifier = Modifier.width(4.dp))
-            Icon(
-              imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-              contentDescription = "Mở Thùng rác",
-              tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-          }
-        }
-      }
-
-      if (lockedTarget == null) {
-        TelePhotosGlassCard(
-          modifier = Modifier
-            .fillMaxWidth()
-            .padding(14.dp),
-          onClick = onOpenTargetSelector,
-        ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Text("Chưa khoá đích lưu trữ", style = MaterialTheme.typography.titleMedium)
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-              text = "Hãy chọn và khoá một Siêu nhóm riêng tư (có bật Forum) hoặc Kênh/Tin nhắn đã lưu để tạo Album.",
-              style = MaterialTheme.typography.bodyMedium,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            Button(
+        if (lockedTarget == null) {
+          item(span = { GridItemSpan(maxLineSpan) }, key = "albums_no_target") {
+            TelePhotosGlassCard(
+              modifier = Modifier.fillMaxWidth(),
               onClick = onOpenTargetSelector,
-              modifier = Modifier.testTag("albums_open_target_button"),
             ) {
-              Text("Chọn đích lưu trữ")
-            }
-          }
-        }
-      } else if (albums.isEmpty()) {
-        Box(
-          modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-          contentAlignment = Alignment.Center,
-        ) {
-          TelePhotosGlassCard(modifier = Modifier.fillMaxWidth()) {
-            Column(
-              modifier = Modifier.padding(22.dp),
-              horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-              Icon(
-                imageVector = Icons.Filled.CollectionsBookmark,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(44.dp),
-              )
-              Spacer(modifier = Modifier.height(12.dp))
-              Text("Chưa có Album nào", style = MaterialTheme.typography.titleLarge)
-              Spacer(modifier = Modifier.height(6.dp))
-              Text(
-                text = "Tạo album mới để phân loại ảnh và video theo chủ đề Telegram Forum Topic (tự động giãn nhịp để tránh FLOOD_WAIT).",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-              )
-              Spacer(modifier = Modifier.height(14.dp))
-              Button(
-                onClick = { showCreateDialog = true },
-                modifier = Modifier.testTag("empty_create_album_button"),
-              ) {
-                Icon(Icons.Filled.Add, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Tạo album mới")
+              Column(modifier = Modifier.padding(18.dp)) {
+                Text("Chưa khoá đích lưu trữ", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                  text = "Hãy chọn và khoá một Nhóm Telegram, Kênh riêng tư hoặc Tin nhắn đã lưu để tạo Album.",
+                  style = MaterialTheme.typography.bodyMedium,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                  onClick = onOpenTargetSelector,
+                  modifier = Modifier.testTag("albums_open_target_button"),
+                ) {
+                  Text("Chọn đích lưu trữ")
+                }
               }
             }
           }
-        }
-      } else {
-        LazyVerticalGrid(
-          columns = GridCells.Adaptive(minSize = 156.dp),
-          contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 96.dp),
-          horizontalArrangement = Arrangement.spacedBy(12.dp),
-          verticalArrangement = Arrangement.spacedBy(12.dp),
-          modifier = Modifier
-            .fillMaxSize()
-            .testTag("albums_grid"),
-        ) {
+        } else if (albums.isEmpty()) {
+          item(span = { GridItemSpan(maxLineSpan) }, key = "albums_empty_state") {
+            TelePhotosGlassCard(modifier = Modifier.fillMaxWidth()) {
+              Column(
+                modifier = Modifier.padding(22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+              ) {
+                Icon(
+                  imageVector = Icons.Filled.CollectionsBookmark,
+                  contentDescription = null,
+                  tint = MaterialTheme.colorScheme.primary,
+                  modifier = Modifier.size(44.dp),
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Chưa có Album nào", style = MaterialTheme.typography.titleLarge)
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                  text = "Tạo album mới để phân loại ảnh và video theo chủ đề riêng (chỉ đồng bộ khi bạn bấm tải lên).",
+                  style = MaterialTheme.typography.bodyMedium,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Button(
+                  onClick = { showCreateDialog = true },
+                  modifier = Modifier.testTag("empty_create_album_button"),
+                ) {
+                  Icon(Icons.Filled.Add, contentDescription = null)
+                  Spacer(modifier = Modifier.width(6.dp))
+                  Text("Tạo album mới")
+                }
+              }
+            }
+          }
+        } else {
           item(span = { GridItemSpan(maxLineSpan) }, key = "albums_section_title") {
             Text(
               text = "Album của bạn (${albums.size})",
@@ -310,6 +248,14 @@ fun AlbumsScreen(
             }
           }
         }
+
+        // Dedicated "Đã xóa gần đây" card positioned cleanly at the bottom of the Album list
+        item(span = { GridItemSpan(maxLineSpan) }, key = "albums_recently_deleted_footer") {
+          RecentlyDeletedAlbumFooterCard(
+            trashedCount = trashedCount,
+            onClick = onOpenTrash,
+          )
+        }
       }
     }
 
@@ -334,6 +280,77 @@ fun AlbumsScreen(
         showCreateDialog = false
       },
     )
+  }
+}
+
+@Composable
+private fun RecentlyDeletedAlbumFooterCard(
+  trashedCount: Int,
+  onClick: () -> Unit,
+) {
+  TelePhotosGlassCard(
+    onClick = onClick,
+    modifier = Modifier
+      .fillMaxWidth()
+      .padding(top = 6.dp)
+      .testTag("albums_trash_card"),
+  ) {
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(horizontal = 16.dp, vertical = 14.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.weight(1f),
+      ) {
+        Surface(
+          shape = RoundedCornerShape(12.dp),
+          color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f),
+          modifier = Modifier.size(40.dp),
+        ) {
+          Box(contentAlignment = Alignment.Center) {
+            Icon(
+              imageVector = Icons.Filled.DeleteSweep,
+              contentDescription = "Đã xóa gần đây",
+              tint = MaterialTheme.colorScheme.onErrorContainer,
+            )
+          }
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column {
+          Text("Đã xóa gần đây", style = MaterialTheme.typography.titleMedium)
+          Text(
+            text = "Giữ 30 ngày trên máy • Không xoá khỏi Telegram",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+        }
+      }
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Surface(
+          shape = RoundedCornerShape(10.dp),
+          color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+          Text(
+            text = "$trashedCount mục",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+          )
+        }
+        Spacer(modifier = Modifier.width(4.dp))
+        Icon(
+          imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+          contentDescription = "Mở Đã xóa gần đây",
+          tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
+    }
   }
 }
 
@@ -401,7 +418,8 @@ private fun CreateAlbumDialog(
 }
 
 /**
- * Album detail with strict segmented tab separation between Ảnh (tab 0) and Video (tab 1).
+ * Album detail with strict segmented tab separation between Ảnh (tab 0) and Video (tab 1),
+ * plus multi-select support to move selected items to "Đã xóa gần đây".
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -412,10 +430,17 @@ fun AlbumDetailScreen(
   onBack: () -> Unit,
   onMediaClick: (MediaEntity) -> Unit,
   onImportIntoAlbum: (List<android.net.Uri>) -> Unit,
+  onMoveSelectedToTrash: (List<Long>) -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   var selectedTabIndex by remember { mutableIntStateOf(0) }
+  var selectedIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+  val isSelectionMode = selectedIds.isNotEmpty()
   val activeList = if (selectedTabIndex == 0) photos else videos
+
+  if (isSelectionMode) {
+    BackHandler { selectedIds = emptySet() }
+  }
 
   val picker = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.PickMultipleVisualMedia(50),
@@ -431,33 +456,73 @@ fun AlbumDetailScreen(
     picker.launch(PickVisualMediaRequest(type))
   }
 
+  fun toggleItemSelection(id: Long) {
+    selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id
+  }
+
   Box(modifier = modifier.fillMaxSize()) {
     Column(modifier = Modifier.fillMaxSize()) {
-      TopAppBar(
-        title = {
-          Column {
+      if (isSelectionMode) {
+        TopAppBar(
+          title = {
             Text(
-              text = album?.title ?: "Chi tiết Album",
-              style = MaterialTheme.typography.titleLarge,
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis,
+              text = "Đã chọn ${selectedIds.size} mục",
+              style = MaterialTheme.typography.titleMedium,
             )
-            if (album != null) {
-              Text(
-                text = "Topic #${album.messageThreadId} • ${photos.size} ảnh • ${videos.size} video",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+          },
+          navigationIcon = {
+            IconButton(
+              onClick = { selectedIds = emptySet() },
+              modifier = Modifier.testTag("album_clear_selection_button"),
+            ) {
+              Icon(Icons.Filled.Close, contentDescription = "Bỏ chọn")
+            }
+          },
+          actions = {
+            IconButton(
+              onClick = {
+                onMoveSelectedToTrash(selectedIds.toList())
+                selectedIds = emptySet()
+              },
+              modifier = Modifier.testTag("album_trash_selected_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.DeleteOutline,
+                contentDescription = "Chuyển vào Đã xóa gần đây",
               )
             }
-          }
-        },
-        navigationIcon = {
-          IconButton(onClick = onBack, modifier = Modifier.testTag("album_detail_back")) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Quay lại")
-          }
-        },
-        colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
-      )
+          },
+          colors = TopAppBarDefaults.topAppBarColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f),
+          ),
+        )
+      } else {
+        TopAppBar(
+          title = {
+            Column {
+              Text(
+                text = album?.title ?: "Chi tiết Album",
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+              if (album != null) {
+                Text(
+                  text = "Topic #${album.messageThreadId} • ${photos.size} ảnh • ${videos.size} video",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+            }
+          },
+          navigationIcon = {
+            IconButton(onClick = onBack, modifier = Modifier.testTag("album_detail_back")) {
+              Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Quay lại")
+            }
+          },
+          colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+        )
+      }
 
       PrimaryTabRow(
         selectedTabIndex = selectedTabIndex,
@@ -538,29 +603,37 @@ fun AlbumDetailScreen(
           ) { item ->
             MediaGridTile(
               media = item,
-              isSelected = false,
-              isSelectionMode = false,
-              onClick = { onMediaClick(item) },
-              onLongPress = { onMediaClick(item) },
+              isSelected = item.id in selectedIds,
+              isSelectionMode = isSelectionMode,
+              onClick = {
+                if (isSelectionMode) {
+                  toggleItemSelection(item.id)
+                } else {
+                  onMediaClick(item)
+                }
+              },
+              onLongPress = { toggleItemSelection(item.id) },
             )
           }
         }
       }
     }
 
-    ExtendedFloatingActionButton(
-      onClick = { launchTabSpecificPicker() },
-      icon = {
-        Icon(
-          imageVector = if (selectedTabIndex == 0) Icons.Filled.AddPhotoAlternate else Icons.Filled.VideoCall,
-          contentDescription = null,
-        )
-      },
-      text = { Text(if (selectedTabIndex == 0) "Thêm ảnh" else "Thêm video") },
-      modifier = Modifier
-        .align(Alignment.BottomEnd)
-        .padding(16.dp)
-        .testTag("fab_album_add_media"),
-    )
+    if (!isSelectionMode) {
+      ExtendedFloatingActionButton(
+        onClick = { launchTabSpecificPicker() },
+        icon = {
+          Icon(
+            imageVector = if (selectedTabIndex == 0) Icons.Filled.AddPhotoAlternate else Icons.Filled.VideoCall,
+            contentDescription = null,
+          )
+        },
+        text = { Text(if (selectedTabIndex == 0) "Thêm ảnh" else "Thêm video") },
+        modifier = Modifier
+          .align(Alignment.BottomEnd)
+          .padding(16.dp)
+          .testTag("fab_album_add_media"),
+      )
+    }
   }
 }

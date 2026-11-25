@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
@@ -31,8 +32,9 @@ import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PauseCircleFilled
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.PermMedia
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -65,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import com.laughing.telephotos.R
 import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.MediaStoreScanner
 import com.laughing.telephotos.data.local.AlbumWithCount
 import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.SyncTargetEntity
@@ -78,7 +82,7 @@ import com.laughing.telephotos.ui.theme.StatusWarningAmber
 import com.laughing.telephotos.ui.viewmodel.TimelineSection
 
 /**
- * "Ảnh" tab: displays PHOTOS ONLY (mediaType == PHOTO, excluding trashed items).
+ * "Ảnh" tab: displays PHOTOS ONLY (unified local MediaStore + Telegram "Ảnh" Topic).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -92,17 +96,22 @@ fun TimelineScreen(
   connectionStatus: TelegramConnectionStatus,
   floodWaitRemainingSec: Long,
   manualSyncProgress: ManualSyncProgressState,
+  hasMediaPermission: Boolean,
+  hasPromptedPermission: Boolean,
+  onPermissionPrompted: () -> Unit,
+  onDevicePermissionGranted: () -> Unit,
   onMediaClick: (MediaEntity) -> Unit,
   onToggleSelection: (Long) -> Unit,
   onClearSelection: () -> Unit,
   onImportPickedPhotos: (List<android.net.Uri>) -> Unit,
   onUploadSelectedItems: () -> Unit,
+  onFreeUpSelectedSpace: () -> Unit,
   onMoveSelectedToTrash: () -> Unit,
   onAssignSelectedToAlbum: (Long) -> Unit,
   onStopManualSync: () -> Unit,
   onOpenTargetSelector: () -> Unit,
   onOpenTelegramAuth: () -> Unit,
-  onSyncReadOnly: () -> Unit,
+  onSyncTab: () -> Unit,
   modifier: Modifier = Modifier,
 ) {
   val isSelectionMode = selectedIds.isNotEmpty()
@@ -111,6 +120,24 @@ fun TimelineScreen(
 
   if (isSelectionMode) {
     BackHandler { onClearSelection() }
+  }
+
+  val permissionLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.RequestMultiplePermissions(),
+    onResult = { grants ->
+      if (grants.values.any { it }) {
+        onDevicePermissionGranted()
+      }
+    },
+  )
+
+  LaunchedEffect(hasMediaPermission) {
+    if (hasMediaPermission) {
+      onDevicePermissionGranted()
+    } else if (!hasPromptedPermission) {
+      onPermissionPrompted()
+      permissionLauncher.launch(MediaStoreScanner.requiredMediaPermissions())
+    }
   }
 
   val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -148,6 +175,12 @@ fun TimelineScreen(
               Icon(Icons.Filled.CloudUpload, contentDescription = "Tải lên mục đã chọn")
             }
             IconButton(
+              onClick = onFreeUpSelectedSpace,
+              modifier = Modifier.testTag("free_up_selected_button"),
+            ) {
+              Icon(Icons.Filled.CleaningServices, contentDescription = "Giải phóng dung lượng")
+            }
+            IconButton(
               onClick = { showAlbumPickerDialog = true },
               modifier = Modifier.testTag("assign_album_button"),
             ) {
@@ -167,43 +200,44 @@ fun TimelineScreen(
       } else {
         TopAppBar(
           title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Column {
               Text(
                 text = "Tele Photos",
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onBackground,
               )
-              Spacer(modifier = Modifier.width(8.dp))
-              Surface(
-                shape = RoundedCornerShape(10.dp),
-                color = MaterialTheme.colorScheme.primaryContainer,
-              ) {
-                Text(
-                  text = when (connectionStatus) {
-                    TelegramConnectionStatus.CONNECTED_ACTIVE,
-                    TelegramConnectionStatus.CONNECTING -> "Đang kết nối"
-                    else -> "Thủ công • Đã ngắt"
-                  },
-                  style = MaterialTheme.typography.labelMedium,
-                  color = MaterialTheme.colorScheme.onPrimaryContainer,
-                  maxLines = 1,
-                  overflow = TextOverflow.Ellipsis,
-                  modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                )
-              }
+              Text(
+                text = when (connectionStatus) {
+                  TelegramConnectionStatus.CONNECTED_ACTIVE,
+                  TelegramConnectionStatus.CONNECTING -> "Đang kết nối Telegram"
+                  else -> "Thủ công • Đã ngắt kết nối"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
             }
           },
           actions = {
-            if (isLoggedIn && lockedTarget != null) {
-              IconButton(
-                onClick = onSyncReadOnly,
-                modifier = Modifier.testTag("timeline_sync_button"),
-              ) {
-                Icon(
-                  imageVector = Icons.Filled.Refresh,
-                  contentDescription = "Quét lịch sử Telegram",
-                )
-              }
+            TextButton(
+              onClick = {
+                when {
+                  manualSyncProgress.isRunning -> onStopManualSync()
+                  !isLoggedIn -> onOpenTelegramAuth()
+                  lockedTarget == null -> onOpenTargetSelector()
+                  else -> onSyncTab()
+                }
+              },
+              modifier = Modifier.testTag("timeline_sync_button"),
+            ) {
+              Icon(
+                imageVector = if (manualSyncProgress.isRunning) Icons.Filled.Stop else Icons.Filled.Sync,
+                contentDescription = if (manualSyncProgress.isRunning) "Dừng đồng bộ" else "Đồng bộ Ảnh",
+                modifier = Modifier.size(18.dp),
+              )
+              Spacer(modifier = Modifier.width(4.dp))
+              Text(if (manualSyncProgress.isRunning) "Dừng" else "Đồng bộ")
             }
             IconButton(
               onClick = onOpenTargetSelector,
@@ -227,6 +261,49 @@ fun TimelineScreen(
         )
       }
 
+      if (!hasMediaPermission) {
+        TelePhotosGlassCard(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 4.dp),
+        ) {
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+          ) {
+            Row(
+              verticalAlignment = Alignment.CenterVertically,
+              modifier = Modifier.weight(1f).padding(end = 8.dp),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.PermMedia,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(20.dp),
+              )
+              Spacer(modifier = Modifier.width(10.dp))
+              Column {
+                Text("Hiển thị ảnh trên thiết bị", style = MaterialTheme.typography.titleSmall)
+                Text(
+                  text = "Cấp quyền thư viện để gộp ảnh máy với ảnh trên Telegram",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
+            }
+            TextButton(
+              onClick = { permissionLauncher.launch(MediaStoreScanner.requiredMediaPermissions()) },
+              modifier = Modifier.testTag("timeline_grant_permission_button"),
+            ) {
+              Text("Cấp quyền")
+            }
+          }
+        }
+      }
+
       if (floodWaitRemainingSec > 0L) {
         TelePhotosGlassCard(
           modifier = Modifier
@@ -247,7 +324,7 @@ fun TimelineScreen(
             Text(
               text = "Telegram đang giới hạn tốc độ. Vui lòng đợi thêm ${
                 Formatters.formatRemainingSeconds(floodWaitRemainingSec)
-              } trước khi bấm tải lên lại.",
+              } trước khi bấm đồng bộ lại.",
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.onSurface,
             )
@@ -293,7 +370,7 @@ fun TimelineScreen(
                   text = if (!isLoggedIn) {
                     "Chạm để đăng nhập TDLib hoặc quản lý ảnh ngoại tuyến trước"
                   } else {
-                    "Chọn Tin nhắn đã lưu, Kênh hoặc Siêu nhóm riêng tư"
+                    "Chọn Nhóm Telegram, Kênh hoặc Tin nhắn đã lưu"
                   },
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -344,7 +421,7 @@ fun TimelineScreen(
               )
               Spacer(modifier = Modifier.height(8.dp))
               Text(
-                text = "Chọn ảnh từ máy bằng Trình chọn an toàn (ngoại tuyến, không cần kết nối Telegram). Ảnh trùng SHA-256 được tự động bỏ qua và chỉ tải lên khi bạn bấm đồng bộ.",
+                text = "Cấp quyền thư viện để hiển thị toàn bộ ảnh trên máy, hoặc chọn ảnh thêm thủ công. Chỉ tải lên dạng tệp gốc kèm ảnh thu nhỏ khi bạn bấm Đồng bộ.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -367,10 +444,10 @@ fun TimelineScreen(
               if (isLoggedIn && lockedTarget != null) {
                 Spacer(modifier = Modifier.height(8.dp))
                 OutlinedButton(
-                  onClick = onSyncReadOnly,
+                  onClick = onSyncTab,
                   modifier = Modifier.fillMaxWidth(),
                 ) {
-                  Text("Khôi phục mục lục từ Telegram (Chỉ đọc)")
+                  Text("Đồng bộ ảnh với Telegram")
                 }
               }
             }
@@ -446,11 +523,16 @@ internal fun ManualSyncProgressStrip(
         horizontalArrangement = Arrangement.SpaceBetween,
       ) {
         Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+          val countSuffix = if (progress.totalCount > 0) {
+            " (${progress.completedCount}/${progress.totalCount})"
+          } else {
+            ""
+          }
           Text(
             text = if (progress.currentFileName.isNotBlank()) {
-              "Đang tải lên: ${progress.currentFileName}"
+              "Đang tải lên$countSuffix: ${progress.currentFileName}"
             } else {
-              "Đang kết nối Telegram để tải lên..."
+              "Đang kết nối Telegram để đồng bộ$countSuffix..."
             },
             style = MaterialTheme.typography.titleSmall,
             maxLines = 1,
@@ -458,7 +540,7 @@ internal fun ManualSyncProgressStrip(
           )
           if (progress.totalCount > 0) {
             Text(
-              text = "Tiến độ: ${progress.completedCount}/${progress.totalCount} mục",
+              text = "Đang tải lên ${progress.completedCount}/${progress.totalCount} mục",
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -470,7 +552,7 @@ internal fun ManualSyncProgressStrip(
         ) {
           Icon(Icons.Filled.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
           Spacer(modifier = Modifier.width(4.dp))
-          Text("Dừng đồng bộ")
+          Text("Dừng")
         }
       }
       Spacer(modifier = Modifier.height(6.dp))

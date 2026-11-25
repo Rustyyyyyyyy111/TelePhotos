@@ -1,6 +1,10 @@
 package com.laughing.telephotos.core
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -8,8 +12,15 @@ import com.laughing.telephotos.data.local.MediaType
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+
+data class GeneratedUploadThumbnail(
+  val file: File,
+  val width: Int,
+  val height: Int,
+)
 
 data class ExtractedMediaMetadata(
   val contentHash: String,
@@ -164,15 +175,156 @@ object MediaHashUtil {
 
   suspend fun copyUriToStagingFile(context: Context, uri: Uri, fileName: String): File =
     withContext(Dispatchers.IO) {
-      val stagingDir = File(context.cacheDir, "upload_staging").apply { mkdirs() }
-      val safeName = fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
-      val outFile = File(stagingDir, "${System.currentTimeMillis()}_$safeName")
+      val stagingParent = File(
+        File(context.cacheDir, "upload_staging"),
+        "${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}",
+      ).apply { mkdirs() }
+      val cleanFileName = fileName
+        .replace(Regex("[/\\\\\\u0000:*?\"<>|]"), "_")
+        .trim()
+        .ifBlank { "media_${System.currentTimeMillis()}" }
+      val outFile = File(stagingParent, cleanFileName)
       context.contentResolver.openInputStream(uri)?.use { input ->
         FileOutputStream(outFile).use { output ->
           input.copyTo(output, bufferSize = 64 * 1024)
         }
       } ?: error("Không thể mở tệp nguồn để tải lên")
       outFile
+    }
+
+  /**
+   * Generates a lightweight <= 320px JPEG preview thumbnail from a local staged photo or video
+   * for attaching to TdApi.InputMessageDocument without memory leaks.
+   */
+  suspend fun generateUploadThumbnail(
+    context: Context,
+    localFile: File,
+    mediaType: MediaType,
+    maxEdgePx: Int = 320,
+  ): GeneratedUploadThumbnail? = withContext(Dispatchers.IO) {
+    if (!localFile.exists()) return@withContext null
+    val thumbDir = File(context.cacheDir, "upload_thumbs").apply { mkdirs() }
+    val outFile = File(thumbDir, "thumb_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.jpg")
+
+    var sourceBitmap: Bitmap? = null
+    var scaledBitmap: Bitmap? = null
+    try {
+      sourceBitmap = if (mediaType == MediaType.VIDEO) {
+        val retriever = MediaMetadataRetriever()
+        try {
+          retriever.setDataSource(localFile.absolutePath)
+          retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            ?: retriever.getFrameAtTime(0L)
+        } finally {
+          runCatching { retriever.release() }
+        }
+      } else {
+        decodeSampledPhotoWithExif(localFile.absolutePath, maxEdgePx)
+      }
+
+      val validSource = sourceBitmap ?: return@withContext null
+      val maxSide = maxOf(validSource.width, validSource.height)
+      val targetBitmap = if (maxSide > maxEdgePx && maxSide > 0) {
+        val ratio = maxEdgePx.toFloat() / maxSide.toFloat()
+        val targetW = (validSource.width * ratio).toInt().coerceAtLeast(1)
+        val targetH = (validSource.height * ratio).toInt().coerceAtLeast(1)
+        Bitmap.createScaledBitmap(validSource, targetW, targetH, true).also {
+          scaledBitmap = it
+        }
+      } else {
+        validSource
+      }
+
+      val width = targetBitmap.width
+      val height = targetBitmap.height
+      FileOutputStream(outFile).use { fos ->
+        targetBitmap.compress(Bitmap.CompressFormat.JPEG, 82, fos)
+      }
+      if (outFile.exists() && outFile.length() > 0L) {
+        GeneratedUploadThumbnail(file = outFile, width = width, height = height)
+      } else {
+        outFile.delete()
+        null
+      }
+    } catch (_: Throwable) {
+      outFile.delete()
+      null
+    } finally {
+      if (scaledBitmap != null && scaledBitmap !== sourceBitmap && scaledBitmap?.isRecycled == false) {
+        scaledBitmap?.recycle()
+      }
+      if (sourceBitmap != null && sourceBitmap.isRecycled == false) {
+        sourceBitmap.recycle()
+      }
+    }
+  }
+
+  private fun decodeSampledPhotoWithExif(path: String, maxEdgePx: Int): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+    val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+    var sampleSize = 1
+    while (maxDim / sampleSize > maxEdgePx * 2) {
+      sampleSize *= 2
+    }
+    val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+    val decoded = BitmapFactory.decodeFile(path, opts) ?: return null
+
+    val degrees = runCatching {
+      val exif = ExifInterface(path)
+      when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+        ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+        ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+        else -> 0f
+      }
+    }.getOrDefault(0f)
+
+    if (degrees == 0f) return decoded
+
+    val matrix = Matrix().apply { postRotate(degrees) }
+    val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+    if (rotated !== decoded) {
+      decoded.recycle()
+    }
+    return rotated
+  }
+
+  suspend fun computeFileSha256(file: File): String =
+    withContext(Dispatchers.IO) {
+      val digest = MessageDigest.getInstance("SHA-256")
+      val fileSize = file.length()
+      if (fileSize > SAMPLED_THRESHOLD_BYTES) {
+        java.io.FileInputStream(file).use { stream ->
+          val channel = stream.channel
+          val buffer = ByteArray(64 * 1024)
+          readSampleWindow(stream, digest, buffer, SAMPLE_CHUNK_BYTES.toLong())
+          val midPos = (fileSize / 2L) - (SAMPLE_CHUNK_BYTES / 2L)
+          if (midPos > SAMPLE_CHUNK_BYTES) {
+            channel.position(midPos)
+            readSampleWindow(stream, digest, buffer, SAMPLE_CHUNK_BYTES.toLong())
+          }
+          val tailPos = (fileSize - SAMPLE_CHUNK_BYTES).coerceAtLeast(0L)
+          if (tailPos > midPos + SAMPLE_CHUNK_BYTES) {
+            channel.position(tailPos)
+            readSampleWindow(stream, digest, buffer, SAMPLE_CHUNK_BYTES.toLong())
+          }
+          digest.update("SIZE:$fileSize".toByteArray())
+          return@withContext "sampled_" + digest.digest().toHexString()
+        }
+      }
+      java.io.FileInputStream(file).use { input ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+          val read = input.read(buffer)
+          if (read <= 0) break
+          digest.update(buffer, 0, read)
+        }
+      }
+      digest.digest().toHexString()
     }
 
   private fun ByteArray.toHexString(): String =

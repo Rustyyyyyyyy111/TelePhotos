@@ -30,11 +30,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDone
-import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.PauseCircleOutline
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -235,6 +236,7 @@ fun MediaGridTile(
 
     if (!isSelectionMode) {
       UploadStatusMiniBadge(
+        mediaId = media.id,
         status = media.uploadStatus,
         modifier = Modifier
           .align(Alignment.TopEnd)
@@ -286,30 +288,72 @@ fun MediaGridTile(
 
 @Composable
 private fun UploadStatusMiniBadge(
+  mediaId: Long,
   status: UploadStatus,
   modifier: Modifier = Modifier,
 ) {
-  val (icon, tint) = when (status) {
-    UploadStatus.UPLOADED -> Icons.Filled.CloudDone to StatusUploadedGreen
-    UploadStatus.QUEUED, UploadStatus.UPLOADING -> Icons.Filled.CloudQueue to Color.White
-    UploadStatus.PAUSED_FLOOD_WAIT -> Icons.Filled.PauseCircleOutline to StatusWarningAmber
-    UploadStatus.FAILED -> Icons.Filled.ErrorOutline to StatusErrorRed
-    UploadStatus.LOCAL_ONLY -> return
-  }
-
   Box(
     modifier = modifier
-      .size(20.dp)
+      .size(22.dp)
       .clip(CircleShape)
-      .background(Color.Black.copy(alpha = 0.48f)),
+      .background(
+        when (status) {
+          UploadStatus.UPLOADED -> Color.Black.copy(alpha = 0.56f)
+          else -> Color.Black.copy(alpha = 0.42f)
+        }
+      )
+      .testTag("sync_badge_${mediaId}_${status.name}"),
     contentAlignment = Alignment.Center,
   ) {
-    Icon(
-      imageVector = icon,
-      contentDescription = status.labelVi,
-      tint = tint,
-      modifier = Modifier.size(13.dp),
-    )
+    when (status) {
+      UploadStatus.UPLOADED -> {
+        Icon(
+          imageVector = Icons.Filled.CheckCircle,
+          contentDescription = "Đã đồng bộ lên Telegram",
+          tint = StatusUploadedGreen,
+          modifier = Modifier.size(16.dp),
+        )
+      }
+      UploadStatus.UPLOADING -> {
+        CircularProgressIndicator(
+          color = Color.White,
+          strokeWidth = 2.dp,
+          modifier = Modifier.size(13.dp),
+        )
+      }
+      UploadStatus.QUEUED -> {
+        Icon(
+          imageVector = Icons.Outlined.CheckCircle,
+          contentDescription = "Đang chờ đồng bộ",
+          tint = Color(0xFF93C5FD),
+          modifier = Modifier.size(15.dp),
+        )
+      }
+      UploadStatus.PAUSED_FLOOD_WAIT -> {
+        Icon(
+          imageVector = Icons.Filled.PauseCircleOutline,
+          contentDescription = status.labelVi,
+          tint = StatusWarningAmber,
+          modifier = Modifier.size(15.dp),
+        )
+      }
+      UploadStatus.FAILED -> {
+        Icon(
+          imageVector = Icons.Filled.ErrorOutline,
+          contentDescription = status.labelVi,
+          tint = StatusErrorRed,
+          modifier = Modifier.size(15.dp),
+        )
+      }
+      UploadStatus.LOCAL_ONLY -> {
+        Icon(
+          imageVector = Icons.Outlined.CheckCircle,
+          contentDescription = "Chưa đồng bộ lên Telegram",
+          tint = Color(0xFFD1D5DB).copy(alpha = 0.85f),
+          modifier = Modifier.size(15.dp),
+        )
+      }
+    }
   }
 }
 

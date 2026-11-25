@@ -1,5 +1,6 @@
 package com.laughing.telephotos.core
 
+import java.text.Normalizer
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -91,4 +92,45 @@ object Formatters {
       else -> "+84$compact"
     }
   }
+
+  const val TRASH_RETENTION_DAYS = 30
+  const val DAY_MS = 86_400_000L
+
+  fun computeRemainingTrashDays(
+    trashedAtEpochMs: Long?,
+    nowMs: Long = System.currentTimeMillis(),
+  ): Int {
+    if (trashedAtEpochMs == null) return TRASH_RETENTION_DAYS
+    val expiresAt = trashedAtEpochMs + TRASH_RETENTION_DAYS * DAY_MS
+    val remainingMs = (expiresAt - nowMs).coerceAtLeast(0L)
+    if (remainingMs == 0L) return 0
+    return ((remainingMs + DAY_MS - 1L) / DAY_MS).toInt().coerceIn(1, TRASH_RETENTION_DAYS)
+  }
+
+  fun formatRemainingTrashDays(
+    trashedAtEpochMs: Long?,
+    nowMs: Long = System.currentTimeMillis(),
+  ): String {
+    val days = computeRemainingTrashDays(trashedAtEpochMs, nowMs)
+    return if (days <= 0) "Sắp tự động xoá" else "Còn lại $days ngày"
+  }
+
+  private val combiningMarksRegex = Regex("\\p{InCombiningDiacriticalMarks}+")
+  private val whitespaceRegex = Regex("\\s+")
+
+  /**
+   * Strips Vietnamese accents/diacritics and folds 'đ'/'Đ' -> 'd' for search & topic comparison.
+   * Ensures tone placement variants such as "xoá" and "xóa" produce identical normalized text.
+   */
+  fun removeVietnameseDiacritics(raw: String): String {
+    val nfd = Normalizer.normalize(raw.trim(), Normalizer.Form.NFD)
+    return combiningMarksRegex.replace(nfd, "")
+      .replace('đ', 'd')
+      .replace('Đ', 'D')
+      .replace(whitespaceRegex, " ")
+      .lowercase(Locale.ROOT)
+      .trim()
+  }
+
+  fun normalizeTopicKey(title: String): String = removeVietnameseDiacritics(title)
 }

@@ -1,24 +1,30 @@
 package com.laughing.telephotos.ui.viewmodel
 
 import android.app.Application
+import android.content.IntentSender
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.laughing.telephotos.TelePhotosApplication
 import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.Formatters
+import com.laughing.telephotos.core.LocalDeletePrepResult
+import com.laughing.telephotos.core.NetworkInterruptionAlert
 import com.laughing.telephotos.core.ThemeMode
 import com.laughing.telephotos.data.local.AlbumEntity
 import com.laughing.telephotos.data.local.AlbumWithCount
 import com.laughing.telephotos.data.local.MediaEntity
+import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.StorageStats
 import com.laughing.telephotos.data.local.SyncTargetEntity
 import com.laughing.telephotos.data.repository.ManualSyncProgressState
+import com.laughing.telephotos.data.repository.SaveToDeviceProgress
 import com.laughing.telephotos.data.telegram.FileDownloadProgress
 import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
+import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,6 +39,20 @@ data class TimelineSection(
   val headerTitle: String,
   val monthLabel: String,
   val items: List<MediaEntity>,
+)
+
+enum class SystemUriActionType {
+  MOVE_TO_TRASH,
+  FREE_UP_SPACE,
+}
+
+data class PendingSystemUriRequest(
+  val actionType: SystemUriActionType,
+  val mediaIds: List<Long>,
+  val intentSender: IntentSender,
+  val targetUris: Set<String>,
+  val thumbOverrides: Map<Long, String>,
+  val skippedUnsyncedCount: Int = 0,
 )
 
 class TelePhotosViewModel(application: Application) : AndroidViewModel(application) {
@@ -50,6 +70,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
 
   val authState: StateFlow<TelegramAuthState> = repo.authState
   val connectionStatus: StateFlow<TelegramConnectionStatus> = repo.connectionStatus
+  val networkInterruptionAlert: StateFlow<NetworkInterruptionAlert?> = repo.networkInterruptionAlert
 
   val lockedTarget: StateFlow<SyncTargetEntity?> = repo.lockedTargetFlow.stateIn(
     scope = viewModelScope,
@@ -71,11 +92,14 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       initialValue = emptyList(),
     )
 
-  val albums: StateFlow<List<AlbumWithCount>> = repo.albumsWithCountFlow.stateIn(
-    scope = viewModelScope,
-    started = SharingStarted.WhileSubscribed(5000),
-    initialValue = emptyList(),
-  )
+  val albums: StateFlow<List<AlbumWithCount>> =
+    repo.albumsWithCountFlow.map { list ->
+      list.filterNot { TelegramPolicyGuard.isSystemAutoTopicTitle(it.title) || it.isTrashTopic }
+    }.stateIn(
+      scope = viewModelScope,
+      started = SharingStarted.WhileSubscribed(5000),
+      initialValue = emptyList(),
+    )
 
   val trashedMedia: StateFlow<List<MediaEntity>> = repo.trashedMediaFlow.stateIn(
     scope = viewModelScope,
@@ -92,7 +116,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   val storageStats: StateFlow<StorageStats> = repo.storageStatsFlow.stateIn(
     scope = viewModelScope,
     started = SharingStarted.WhileSubscribed(5000),
-    initialValue = StorageStats(0, 0, 0, 0, 0, 0L, 0L),
+    initialValue = StorageStats(0, 0, 0, 0, 0, 0L, 0L, 0, 0L),
   )
 
   val manualSyncProgress: StateFlow<ManualSyncProgressState> =
@@ -120,7 +144,23 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   private val _floodWaitRemainingSec = MutableStateFlow(0L)
   val floodWaitRemainingSec: StateFlow<Long> = _floodWaitRemainingSec.asStateFlow()
 
+  private val _hasPromptedMediaPermission = MutableStateFlow(false)
+  val hasPromptedMediaPermission: StateFlow<Boolean> = _hasPromptedMediaPermission.asStateFlow()
+
+  private val _cacheSizeBytes = MutableStateFlow(0L)
+  val cacheSizeBytes: StateFlow<Long> = _cacheSizeBytes.asStateFlow()
+
+  private val _pendingSystemUriRequest = MutableStateFlow<PendingSystemUriRequest?>(null)
+  val pendingSystemUriRequest: StateFlow<PendingSystemUriRequest?> =
+    _pendingSystemUriRequest.asStateFlow()
+
   init {
+    viewModelScope.launch {
+      repo.purgeExpiredTrashedMedia()
+      repo.pruneSystemTopicAlbums()
+      repo.enforceCacheLimit()
+      _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+    }
     viewModelScope.launch {
       settings.collect { appSettings ->
         val until = appSettings.floodWaitUntilEpochMs
@@ -143,6 +183,68 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
 
   fun dismissBanner() {
     _statusBanner.value = null
+  }
+
+  fun showBanner(message: String) {
+    _statusBanner.value = message
+  }
+
+  fun dismissNetworkInterruptionAlert() {
+    repo.dismissNetworkInterruptionAlert()
+  }
+
+  fun markMediaPermissionPrompted() {
+    _hasPromptedMediaPermission.value = true
+  }
+
+  fun purgeExpiredTrash() {
+    viewModelScope.launch {
+      repo.purgeExpiredTrashedMedia()
+    }
+  }
+
+  fun refreshCacheSize() {
+    viewModelScope.launch {
+      repo.enforceCacheLimit()
+      _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+    }
+  }
+
+  fun clearTemporaryCache() {
+    viewModelScope.launch {
+      _isBusy.value = true
+      repo.clearTemporaryCache()
+        .onSuccess { freed ->
+          _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+          _statusBanner.value = if (freed > 0L) {
+            "Đã xoá ${Formatters.formatFileSize(freed)} bộ nhớ đệm xem trực tuyến"
+          } else {
+            "Bộ nhớ đệm đã trống"
+          }
+        }
+        .onFailure { err ->
+          _statusBanner.value = err.message ?: "Không thể xoá bộ nhớ đệm"
+        }
+      _isBusy.value = false
+    }
+  }
+
+  fun syncDevicePhotos() {
+    viewModelScope.launch {
+      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = false)
+    }
+  }
+
+  fun syncDeviceVideos() {
+    viewModelScope.launch {
+      repo.syncDeviceMediaStore(scanPhotos = false, scanVideos = true)
+    }
+  }
+
+  fun syncDeviceAllMedia() {
+    viewModelScope.launch {
+      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true)
+    }
   }
 
   fun toggleSelection(mediaId: Long) {
@@ -220,8 +322,30 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
+  fun startTabSync(mediaType: MediaType) {
+    viewModelScope.launch {
+      repo.syncDeviceMediaStore(
+        scanPhotos = mediaType == MediaType.PHOTO,
+        scanVideos = mediaType == MediaType.VIDEO,
+      )
+      repo.startManualUploadBatch(selectedOnlyIds = null, filterMediaType = mediaType)
+        .onSuccess { count ->
+          val label = if (mediaType == MediaType.VIDEO) "video" else "ảnh"
+          _statusBanner.value = if (count > 0) {
+            "Đang kết nối Telegram tải lên $count $label chưa sao lưu"
+          } else {
+            "Đang đối chiếu $label với chủ đề Telegram..."
+          }
+        }
+        .onFailure { err ->
+          _statusBanner.value = err.message ?: "Không thể đồng bộ"
+        }
+    }
+  }
+
   fun startManualUploadBatch() {
     viewModelScope.launch {
+      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true)
       repo.startManualUploadBatch(selectedOnlyIds = null)
         .onSuccess { count ->
           _statusBanner.value = "Đang kết nối Telegram để tải lên $count mục mới"
@@ -235,6 +359,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   fun stopManualSync() {
     viewModelScope.launch {
       repo.stopManualSync()
+      _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
       _statusBanner.value = "Đã dừng đồng bộ — Đã ngắt kết nối Telegram"
     }
   }
@@ -242,31 +367,198 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   fun moveSelectedToTrash() {
     val ids = _selectedIds.value.toList()
     if (ids.isEmpty()) return
-    viewModelScope.launch {
-      repo.moveMediaToRecentlyDeleted(ids)
-        .onSuccess { count ->
-          _selectedIds.value = emptySet()
-          _statusBanner.value = "Đã chuyển $count mục vào «Đã xoá gần đây» (không xoá trên Telegram)"
-        }
-        .onFailure { err ->
-          _statusBanner.value = err.message ?: "Không thể chuyển vào Đã xoá gần đây"
-        }
-    }
+    requestMoveToTrash(ids)
   }
 
   fun moveSingleToTrash(mediaId: Long) {
+    requestMoveToTrash(listOf(mediaId))
+  }
+
+  fun moveMediaIdsToTrash(ids: List<Long>) {
+    if (ids.isEmpty()) return
+    requestMoveToTrash(ids)
+  }
+
+  private fun requestMoveToTrash(ids: List<Long>) {
     viewModelScope.launch {
-      repo.moveMediaToRecentlyDeleted(listOf(mediaId))
-        .onSuccess {
-          _statusBanner.value = "Đã chuyển vào «Đã xoá gần đây» (vẫn giữ bản gốc trên Telegram)"
+      _isBusy.value = true
+      val prep = repo.prepareSystemDelete(ids)
+      _isBusy.value = false
+      when (val result = prep.prepResult) {
+        is LocalDeletePrepResult.NeedsSystemConfirmation -> {
+          _pendingSystemUriRequest.value = PendingSystemUriRequest(
+            actionType = SystemUriActionType.MOVE_TO_TRASH,
+            mediaIds = prep.mediaIds,
+            intentSender = result.intentSender,
+            targetUris = result.targetUris,
+            thumbOverrides = prep.thumbPathOverrides,
+          )
         }
+        is LocalDeletePrepResult.NoSystemPromptNeeded -> {
+          repo.finalizeConfirmedDelete(
+            mediaIds = prep.mediaIds,
+            deletedLocalUris = result.deletedUris,
+            thumbOverrides = prep.thumbPathOverrides,
+          )
+            .onSuccess { msg ->
+              _selectedIds.value = _selectedIds.value - prep.mediaIds.toSet()
+              _statusBanner.value = msg
+            }
+            .onFailure { err ->
+              _statusBanner.value = err.message ?: "Không thể xoá mục đã chọn"
+            }
+        }
+      }
+    }
+  }
+
+  /**
+   * "Giải phóng dung lượng máy" for selected items in Ảnh/Video multi-select mode.
+   */
+  fun requestFreeUpSpaceSelected() {
+    val ids = _selectedIds.value.toList()
+    if (ids.isEmpty()) return
+    requestFreeUpSpaceInternal(ids)
+  }
+
+  /**
+   * "Giải phóng dung lượng máy" for a single synced item inside MediaViewerScreen.
+   */
+  fun requestFreeUpSpaceSingle(mediaId: Long) {
+    requestFreeUpSpaceInternal(listOf(mediaId))
+  }
+
+  /**
+   * "Giải phóng dung lượng đã đồng bộ" bulk action in Setting.
+   */
+  fun requestFreeUpAllSynced() {
+    requestFreeUpSpaceInternal(null)
+  }
+
+  private fun requestFreeUpSpaceInternal(mediaIds: List<Long>?) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      val prep = repo.prepareFreeUpSpace(mediaIds)
+      _isBusy.value = false
+
+      if (prep.eligibleMediaIds.isEmpty()) {
+        _statusBanner.value = if (prep.skippedUnsyncedCount > 0) {
+          "Chỉ có thể giải phóng mục đã sao lưu trên Telegram (tick xanh)"
+        } else {
+          "Không có tệp cục bộ đã đồng bộ nào cần giải phóng"
+        }
+        return@launch
+      }
+
+      when (val result = prep.prepResult) {
+        is LocalDeletePrepResult.NeedsSystemConfirmation -> {
+          _pendingSystemUriRequest.value = PendingSystemUriRequest(
+            actionType = SystemUriActionType.FREE_UP_SPACE,
+            mediaIds = prep.eligibleMediaIds,
+            intentSender = result.intentSender,
+            targetUris = result.targetUris,
+            thumbOverrides = prep.thumbPathOverrides,
+            skippedUnsyncedCount = prep.skippedUnsyncedCount,
+          )
+        }
+        is LocalDeletePrepResult.NoSystemPromptNeeded -> {
+          repo.finalizeFreeUpSpace(
+            eligibleMediaIds = prep.eligibleMediaIds,
+            deletedLocalUris = result.deletedUris,
+            thumbOverrides = prep.thumbPathOverrides,
+          )
+            .onSuccess { freedCount ->
+              _selectedIds.value = _selectedIds.value - prep.eligibleMediaIds.toSet()
+              _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+              _statusBanner.value = buildFreeUpSuccessBanner(freedCount, prep.skippedUnsyncedCount)
+            }
+            .onFailure { err ->
+              _statusBanner.value = err.message ?: "Không thể giải phóng dung lượng máy"
+            }
+        }
+      }
+    }
+  }
+
+  fun completeSystemUriRequest(pending: PendingSystemUriRequest) {
+    _pendingSystemUriRequest.value = null
+    viewModelScope.launch {
+      _isBusy.value = true
+      when (pending.actionType) {
+        SystemUriActionType.MOVE_TO_TRASH -> {
+          repo.finalizeConfirmedDelete(
+            mediaIds = pending.mediaIds,
+            deletedLocalUris = pending.targetUris,
+            thumbOverrides = pending.thumbOverrides,
+          )
+            .onSuccess { msg ->
+              _selectedIds.value = _selectedIds.value - pending.mediaIds.toSet()
+              _statusBanner.value = msg
+            }
+            .onFailure { err ->
+              _statusBanner.value = err.message ?: "Không thể hoàn tất thao tác xoá"
+            }
+        }
+        SystemUriActionType.FREE_UP_SPACE -> {
+          repo.finalizeFreeUpSpace(
+            eligibleMediaIds = pending.mediaIds,
+            deletedLocalUris = pending.targetUris,
+            thumbOverrides = pending.thumbOverrides,
+          )
+            .onSuccess { freedCount ->
+              _selectedIds.value = _selectedIds.value - pending.mediaIds.toSet()
+              _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+              _statusBanner.value = buildFreeUpSuccessBanner(freedCount, pending.skippedUnsyncedCount)
+            }
+            .onFailure { err ->
+              _statusBanner.value = err.message ?: "Không thể hoàn tất giải phóng dung lượng"
+            }
+        }
+      }
+      _isBusy.value = false
+    }
+  }
+
+  fun cancelSystemUriRequest() {
+    _pendingSystemUriRequest.value = null
+    _statusBanner.value = "Đã huỷ thao tác xoá tệp trên máy"
+  }
+
+  private fun buildFreeUpSuccessBanner(freedCount: Int, skippedUnsyncedCount: Int): String {
+    val base = if (freedCount > 0) {
+      "Đã giải phóng $freedCount mục khỏi máy — vẫn xem trực tuyến trên Telegram"
+    } else {
+      "Không có bản cục bộ nào bị xoá"
+    }
+    return if (skippedUnsyncedCount > 0) {
+      "$base (đã giữ lại $skippedUnsyncedCount mục chưa sao lưu)"
+    } else {
+      base
     }
   }
 
   fun restoreSingleFromTrash(mediaId: Long) {
     viewModelScope.launch {
       repo.restoreFromRecentlyDeleted(listOf(mediaId))
-      _statusBanner.value = "Đã khôi phục về thư viện và album trước đó"
+      _statusBanner.value = "Đã khôi phục về danh sách trực tuyến (không ép tải lại về máy)"
+    }
+  }
+
+  fun permanentlyDeleteFromTrash(mediaId: Long) {
+    viewModelScope.launch {
+      repo.permanentlyDeleteLocalMedia(listOf(mediaId))
+      _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+      _statusBanner.value = "Đã xoá vĩnh viễn khỏi thiết bị (vẫn giữ trên Telegram)"
+    }
+  }
+
+  fun permanentlyDeleteAllTrash() {
+    viewModelScope.launch {
+      val count = repo.permanentlyDeleteAllTrashed()
+      _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+      if (count > 0) {
+        _statusBanner.value = "Đã xoá vĩnh viễn $count mục trên thiết bị (không xoá trên Telegram)"
+      }
     }
   }
 
@@ -337,6 +629,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       _isBusy.value = true
       repo.syncHistoryReadOnly()
         .onSuccess { count ->
+          _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
           _statusBanner.value = if (count > 0) {
             "Đã đồng bộ chỉ đọc $count mục — Đã ngắt kết nối Telegram"
           } else {
@@ -412,8 +705,14 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     repo.downloadMediaOnDemand(fileId)
 
   fun saveDownloadedVideoPath(mediaId: Long, path: String) {
-    viewModelScope.launch { repo.saveDownloadedVideoPath(mediaId, path) }
+    viewModelScope.launch {
+      repo.saveDownloadedVideoPath(mediaId, path)
+      _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+    }
   }
+
+  fun saveMediaToDeviceGallery(media: MediaEntity): Flow<SaveToDeviceProgress> =
+    repo.saveMediaToDeviceGallery(media)
 
   private fun groupMediaByDay(items: List<MediaEntity>): List<TimelineSection> {
     if (items.isEmpty()) return emptyList()

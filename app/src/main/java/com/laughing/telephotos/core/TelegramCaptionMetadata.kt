@@ -15,6 +15,7 @@ data class TelegramCaptionPayload(
   @SerialName("trash") val isTrashed: Boolean = false,
   @SerialName("name") val fileName: String = "",
   @SerialName("type") val mediaKind: String = "PHOTO",
+  @SerialName("size") val sizeBytes: Long = 0L,
 )
 
 object TelegramCaptionMetadata {
