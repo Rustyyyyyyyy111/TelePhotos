@@ -36,7 +36,7 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `caption metadata round trip preserves hash and topic`() {
+  fun `caption metadata round trip preserves hash and legacy topic`() {
     val payload = TelegramCaptionPayload(
       contentHash = "abc123def456",
       takenAtEpochMs = 1732400000000L,
@@ -47,11 +47,22 @@ class ExampleRobolectricTest {
       mediaKind = "VIDEO",
     )
     val caption = TelegramCaptionMetadata.buildCaption(payload)
+    assertFalse(caption.contains("{"))
+    assertFalse(caption.contains("#tele_anh_meta"))
     val parsed = TelegramCaptionMetadata.parseFromCaption(caption)
     assertNotNull(parsed)
     assertEquals(payload.contentHash, parsed?.contentHash)
-    assertEquals(payload.topicId, parsed?.topicId)
-    assertEquals(65, parsed?.durationSec)
+    assertEquals("clip.mp4", parsed?.fileName)
+    assertEquals("VIDEO", parsed?.mediaKind)
+
+    val legacyCaption = """
+      clip.mp4
+      #tele_anh_meta {"v":1,"hash":"abc123def456","ts":1732400000000,"dur":65,"topic":999,"trash":false,"name":"clip.mp4","type":"VIDEO"}
+    """.trimIndent()
+    val parsedLegacy = TelegramCaptionMetadata.parseFromCaption(legacyCaption)
+    assertNotNull(parsedLegacy)
+    assertEquals(999L, parsedLegacy?.topicId)
+    assertEquals(65, parsedLegacy?.durationSec)
     assertEquals("1:05", Formatters.formatVideoDuration(65))
     assertEquals("0:14", Formatters.formatVideoDuration(14))
   }

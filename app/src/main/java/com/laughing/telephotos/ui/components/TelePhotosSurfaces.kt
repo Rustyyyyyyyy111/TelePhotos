@@ -1,6 +1,5 @@
 package com.laughing.telephotos.ui.components
 
-import android.os.Build
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -15,7 +14,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
@@ -42,16 +40,16 @@ fun TelePhotosBackdrop(
   }
 
   Box(modifier = modifier.fillMaxSize().then(bgModifier)) {
-    if (tokens.isGlass && tokens.advancedBlurEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    // Lightweight gradient accent without expensive RenderEffect blur so Dimensity GPUs stay responsive
+    if (tokens.isGlass && tokens.advancedBlurEnabled) {
       Box(
         modifier = Modifier
           .fillMaxWidth()
-          .height(220.dp)
-          .blur(28.dp)
+          .height(180.dp)
           .background(
-            Brush.radialGradient(
+            Brush.verticalGradient(
               colors = listOf(
-                MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
                 Color.Transparent,
               )
             )

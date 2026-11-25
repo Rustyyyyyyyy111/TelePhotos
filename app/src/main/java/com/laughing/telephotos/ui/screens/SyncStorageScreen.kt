@@ -57,6 +57,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.laughing.telephotos.core.AppIconPreset
 import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.CacheCleanupManager
 import com.laughing.telephotos.core.Formatters
@@ -87,6 +88,7 @@ fun SyncStorageScreen(
   cacheSizeBytes: Long,
   isBusy: Boolean,
   onSelectThemeMode: (ThemeMode) -> Unit,
+  onSelectAppIconPreset: (AppIconPreset) -> Unit = {},
   onToggleAdvancedBlur: (Boolean) -> Unit,
   onToggleWifiOnly: (Boolean) -> Unit,
   onOpenTelegramAuth: () -> Unit,
@@ -522,6 +524,30 @@ fun SyncStorageScreen(
                 modifier = Modifier.testTag("advanced_blur_switch"),
               )
             }
+            Spacer(modifier = Modifier.height(14.dp))
+            Text("Biểu tượng ứng dụng", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              AppIconPreset.entries.forEach { preset ->
+                FilterChip(
+                  selected = settings.appIconPreset == preset,
+                  onClick = { onSelectAppIconPreset(preset) },
+                  label = { Text(preset.labelVi, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                  modifier = Modifier
+                    .weight(1f)
+                    .testTag("icon_preset_${preset.name}"),
+                )
+              }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+              text = settings.appIconPreset.descriptionVi,
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
           }
         }
       }

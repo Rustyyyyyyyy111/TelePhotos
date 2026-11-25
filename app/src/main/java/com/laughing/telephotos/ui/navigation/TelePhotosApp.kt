@@ -4,6 +4,8 @@ import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
@@ -52,6 +54,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.laughing.telephotos.core.MediaStoreScanner
 import com.laughing.telephotos.data.local.MediaType
+import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.ui.screens.AlbumDetailScreen
 import com.laughing.telephotos.ui.screens.AlbumsScreen
 import com.laughing.telephotos.ui.screens.MediaViewerScreen
@@ -267,9 +270,14 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
         }
 
         Box(modifier = Modifier.weight(1f).fillMaxSize()) {
+          val isLoggedIn = settings.isTelegramLoggedIn || authState is TelegramAuthState.Ready
           NavHost(
             navController = navController,
             startDestination = TimelineRoute,
+            enterTransition = { EnterTransition.None },
+            exitTransition = { ExitTransition.None },
+            popEnterTransition = { EnterTransition.None },
+            popExitTransition = { ExitTransition.None },
           ) {
             composable<TimelineRoute> {
               val hasPhotoPerm = MediaStoreScanner.hasMediaReadPermission(context, MediaType.PHOTO)
@@ -289,6 +297,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onDevicePermissionGranted = viewModel::syncDevicePhotos,
                 onMediaClick = { media -> navController.navigate(MediaViewerRoute(media.id)) },
                 onToggleSelection = viewModel::toggleSelection,
+                onToggleDateGroup = viewModel::toggleDateGroupSelection,
                 onClearSelection = viewModel::clearSelection,
                 onImportPickedPhotos = { uris -> viewModel.importSelectedMedia(uris, null) },
                 onUploadSelectedItems = viewModel::uploadSelectedItemsNow,
@@ -307,10 +316,13 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 albums = albums,
                 trashedCount = trashedMedia.size,
                 lockedTarget = lockedTarget,
+                isLoggedIn = isLoggedIn,
+                isBusy = isBusy,
                 onAlbumClick = { albumId -> navController.navigate(AlbumDetailRoute(albumId)) },
                 onOpenTrash = { navController.navigate(TrashRoute) },
                 onCreateAlbum = viewModel::createAlbum,
                 onOpenTargetSelector = { navController.navigate(TargetSelectorRoute) },
+                onRefreshAlbums = { viewModel.syncAlbumsFromTelegram(specificAlbumId = null, silent = false) },
                 onPurgeExpiredTrash = viewModel::purgeExpiredTrash,
               )
             }
@@ -332,6 +344,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onDevicePermissionGranted = viewModel::syncDeviceVideos,
                 onMediaClick = { media -> navController.navigate(MediaViewerRoute(media.id)) },
                 onToggleSelection = viewModel::toggleSelection,
+                onToggleDateGroup = viewModel::toggleDateGroupSelection,
                 onClearSelection = viewModel::clearSelection,
                 onImportPickedVideos = { uris -> viewModel.importSelectedMedia(uris, null) },
                 onUploadSelectedItems = viewModel::uploadSelectedItemsNow,
@@ -357,10 +370,13 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 album = album,
                 photos = albumPhotos,
                 videos = albumVideos,
+                isLoggedIn = isLoggedIn,
+                isBusy = isBusy,
                 onBack = { navController.popBackStack() },
                 onMediaClick = { media -> navController.navigate(MediaViewerRoute(media.id)) },
                 onImportIntoAlbum = { uris -> viewModel.importSelectedMedia(uris, route.albumId) },
                 onMoveSelectedToTrash = viewModel::moveMediaIdsToTrash,
+                onRefreshAlbum = { viewModel.syncAlbumsFromTelegram(specificAlbumId = route.albumId, silent = false) },
               )
             }
 
@@ -389,6 +405,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 cacheSizeBytes = cacheSizeBytes,
                 isBusy = isBusy,
                 onSelectThemeMode = viewModel::setThemeMode,
+                onSelectAppIconPreset = viewModel::setAppIconPreset,
                 onToggleAdvancedBlur = viewModel::setAdvancedBlurEnabled,
                 onToggleWifiOnly = viewModel::setWifiOnlyUpload,
                 onOpenTelegramAuth = { navController.navigate(TelegramAuthRoute) },

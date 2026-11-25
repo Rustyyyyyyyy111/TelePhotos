@@ -102,6 +102,7 @@ fun TimelineScreen(
   onDevicePermissionGranted: () -> Unit,
   onMediaClick: (MediaEntity) -> Unit,
   onToggleSelection: (Long) -> Unit,
+  onToggleDateGroup: (List<Long>) -> Unit,
   onClearSelection: () -> Unit,
   onImportPickedPhotos: (List<android.net.Uri>) -> Unit,
   onUploadSelectedItems: () -> Unit,
@@ -478,6 +479,7 @@ fun TimelineScreen(
           onItemLongPress = { media ->
             onToggleSelection(media.id)
           },
+          onToggleDateGroup = onToggleDateGroup,
           modifier = Modifier.weight(1f),
         )
       }

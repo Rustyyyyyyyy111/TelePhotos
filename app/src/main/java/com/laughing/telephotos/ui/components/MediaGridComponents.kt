@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -46,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,14 +82,18 @@ fun ChronologicalMediaGrid(
   isSelectionMode: Boolean,
   onItemClick: (MediaEntity) -> Unit,
   onItemLongPress: (MediaEntity) -> Unit,
+  onToggleDateGroup: (List<Long>) -> Unit = {},
   modifier: Modifier = Modifier,
   contentPadding: PaddingValues = PaddingValues(bottom = 96.dp),
 ) {
   val gridState = rememberLazyGridState()
   val coroutineScope = rememberCoroutineScope()
+  val currentItemClick by rememberUpdatedState(onItemClick)
+  val currentItemLongPress by rememberUpdatedState(onItemLongPress)
+  val currentToggleDateGroup by rememberUpdatedState(onToggleDateGroup)
 
   val headerIndexMap = remember(sections) {
-    val map = mutableListOf<Pair<Int, String>>()
+    val map = ArrayList<Pair<Int, String>>(sections.size)
     var cursor = 0
     for (section in sections) {
       map.add(cursor to section.monthLabel)
@@ -116,10 +123,16 @@ fun ChronologicalMediaGrid(
           span = { GridItemSpan(maxLineSpan) },
           contentType = "timeline_header",
         ) {
+          val sectionIds = remember(section.items) { section.items.map { it.id } }
+          val selectedCountInSection = remember(sectionIds, selectedIds) {
+            if (selectedIds.isEmpty()) 0 else sectionIds.count { it in selectedIds }
+          }
+          val allSelectedInSection = sectionIds.isNotEmpty() && selectedCountInSection == sectionIds.size
+
           Row(
             modifier = Modifier
               .fillMaxWidth()
-              .padding(horizontal = 14.dp, vertical = 10.dp),
+              .padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
           ) {
@@ -128,11 +141,45 @@ fun ChronologicalMediaGrid(
               style = MaterialTheme.typography.titleSmall,
               color = MaterialTheme.colorScheme.onBackground,
             )
-            Text(
-              text = "${section.items.size} mục",
-              style = MaterialTheme.typography.labelMedium,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+              Text(
+                text = if (selectedCountInSection > 0) {
+                  "$selectedCountInSection/${section.items.size} mục"
+                } else {
+                  "${section.items.size} mục"
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Spacer(modifier = Modifier.width(2.dp))
+              IconButton(
+                onClick = { currentToggleDateGroup(sectionIds) },
+                modifier = Modifier
+                  .size(48.dp)
+                  .testTag("date_group_select_${section.headerTitle}"),
+              ) {
+                Icon(
+                  imageVector = if (allSelectedInSection) {
+                    Icons.Filled.CheckCircle
+                  } else {
+                    Icons.Outlined.RadioButtonUnchecked
+                  },
+                  contentDescription = if (allSelectedInSection) {
+                    "Bỏ chọn ngày ${section.headerTitle}"
+                  } else {
+                    "Chọn tất cả mục ngày ${section.headerTitle}"
+                  },
+                  tint = if (allSelectedInSection) {
+                    MaterialTheme.colorScheme.primary
+                  } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                      alpha = if (isSelectionMode) 0.9f else 0.55f
+                    )
+                  },
+                  modifier = Modifier.size(20.dp),
+                )
+              }
+            }
           }
         }
 
@@ -145,8 +192,8 @@ fun ChronologicalMediaGrid(
             media = media,
             isSelected = media.id in selectedIds,
             isSelectionMode = isSelectionMode,
-            onClick = { onItemClick(media) },
-            onLongPress = { onItemLongPress(media) },
+            onMediaClick = currentItemClick,
+            onMediaLongPress = currentItemLongPress,
           )
         }
       }
@@ -172,22 +219,33 @@ fun MediaGridTile(
   media: MediaEntity,
   isSelected: Boolean,
   isSelectionMode: Boolean,
-  onClick: () -> Unit,
-  onLongPress: () -> Unit,
+  onMediaClick: (MediaEntity) -> Unit,
+  onMediaLongPress: (MediaEntity) -> Unit,
   modifier: Modifier = Modifier,
 ) {
-  val context = LocalContext.current
+  val appContext = LocalContext.current.applicationContext
+  val latestMedia by rememberUpdatedState(media)
+  val latestClick by rememberUpdatedState(onMediaClick)
+  val latestLongPress by rememberUpdatedState(onMediaLongPress)
+
   val modelData = remember(media.id, media.localUri, media.cachedThumbPath, media.cachedLocalVideoPath) {
     media.localUri ?: media.cachedThumbPath ?: media.cachedLocalVideoPath
   }
 
   val imageRequest = remember(modelData) {
-    ImageRequest.Builder(context)
-      .data(modelData)
-      .size(280)
-      .crossfade(false)
-      .build()
+    if (modelData == null) null
+    else {
+      ImageRequest.Builder(appContext)
+        .data(modelData)
+        .size(256)
+        .allowRgb565(true)
+        .crossfade(false)
+        .build()
+    }
   }
+
+  val tileClick = remember(media.id) { { latestClick(latestMedia) } }
+  val tileLongClick = remember(media.id) { { latestLongPress(latestMedia) } }
 
   Box(
     modifier = modifier
@@ -202,12 +260,12 @@ fun MediaGridTile(
         }
       )
       .combinedClickable(
-        onClick = onClick,
-        onLongClick = onLongPress,
+        onClick = tileClick,
+        onLongClick = tileLongClick,
       )
       .testTag("media_tile_${media.id}"),
   ) {
-    if (modelData != null) {
+    if (imageRequest != null) {
       AsyncImage(
         model = imageRequest,
         contentDescription = media.fileName,
@@ -234,6 +292,14 @@ fun MediaGridTile(
       }
     }
 
+    if (isSelected) {
+      Box(
+        modifier = Modifier
+          .fillMaxSize()
+          .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
+      )
+    }
+
     if (!isSelectionMode) {
       UploadStatusMiniBadge(
         mediaId = media.id,
@@ -249,7 +315,9 @@ fun MediaGridTile(
           .padding(5.dp)
           .size(22.dp)
           .clip(CircleShape)
-          .background(Color.Black.copy(alpha = 0.45f)),
+          .background(
+            if (isSelected) Color.White else Color.Black.copy(alpha = 0.45f)
+          ),
         contentAlignment = Alignment.Center,
       ) {
         Icon(

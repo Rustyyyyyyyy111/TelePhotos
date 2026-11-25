@@ -90,6 +90,7 @@ fun VideosScreen(
   onDevicePermissionGranted: () -> Unit,
   onMediaClick: (MediaEntity) -> Unit,
   onToggleSelection: (Long) -> Unit,
+  onToggleDateGroup: (List<Long>) -> Unit,
   onClearSelection: () -> Unit,
   onImportPickedVideos: (List<android.net.Uri>) -> Unit,
   onUploadSelectedItems: () -> Unit,
@@ -449,6 +450,7 @@ fun VideosScreen(
           onItemLongPress = { media ->
             onToggleSelection(media.id)
           },
+          onToggleDateGroup = onToggleDateGroup,
           modifier = Modifier.weight(1f),
         )
       }

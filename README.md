@@ -9,9 +9,11 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
 ## 1. Tổng quan Dự án & Tech Stack
 
 ### Mục tiêu cốt lõi
-- Gộp danh sách ảnh (`Ảnh`) và video (`Video`) từ thiết bị (`MediaStore`) và lịch sử đã sao lưu trên Telegram (chống trùng lặp để mỗi mục chỉ xuất hiện một lần).
-- Tải lên thủ công theo hàng đợi tuần tự 1 luồng dưới dạng **Tệp gốc (`TdApi.InputMessageDocument`)** kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và metadata JSON `#tele_anh_meta` để bảo toàn 100% chất lượng gốc và EXIF.
+- Gộp danh sách ảnh (`Ảnh`) và video (`Video`) từ thiết bị (`MediaStore`) và lịch sử đã sao lưu trên Telegram (chống trùng lặp theo `localUri`, `(mediaType, fileName, sizeBytes)`, `(chatId, messageId)` và prefix SHA-256).
+- Tải lên thủ công theo hàng đợi tuần tự 1 luồng dưới dạng **Tệp gốc (`TdApi.InputMessageDocument`)** kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và caption tối giản 2 dòng (`🖼️/🎞️ <fileName>\n📅 dd/MM/yyyy HH:mm • #tele_anh [#h_<16hex>] [#trash]`), đọc kích thước/loại tệp/thời lượng/chủ đề trực tiếp từ đối tượng `MessageDocument`/`MessagePhoto`/`MessageVideo` của Telegram và vẫn tương thích ngược hoàn toàn với caption JSON `#tele_anh_meta` cũ.
+- Quét và hiển thị cả ảnh/video có sẵn từ trước trên nhóm/kênh Telegram (`TdApi.MessagePhoto`, `TdApi.MessageVideo`, `TdApi.MessageDocument` kể cả khi không có caption metadata) vào cả tab `Ảnh` và tab `Album`.
 - Quản lý vòng đời kết nối **TDLib tái sử dụng theo Foreground/Background**: giữ một phiên `TdLibManager` duy nhất sống khi người dùng mở ứng dụng (loại bỏ chi phí kết nối lại liên tục), và tự động chạy `TdApi.OptimizeStorage` + `TdApi.Close()` khi ứng dụng chuyển sang chạy nền (sau khi mọi tác vụ/worker hoàn tất).
+- Tối ưu hiệu năng cho máy cấu hình thấp (Dimensity giá rẻ), hỗ trợ chọn nhiều theo nhóm ngày kiểu Google Photos, reset trạng thái giao diện khi bị đóng hẳn khỏi Recents, và biểu tượng launcher 4 cánh chong chóng tối giản (hỗ trợ đổi 3 preset qua `<activity-alias>`).
 - Tuân thủ chính sách **Chỉ đọc + Tải lên (`TelegramPolicyGuard`)**: tuyệt đối không gọi các hàm TDLib có khả năng xoá tin nhắn, lịch sử chat hoặc Forum Topic trên Telegram.
 
 ### Ngôn ngữ, Build & Thư viện (xác thực từ `gradle/libs.versions.toml` & `app/build.gradle.kts`)
@@ -37,16 +39,17 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
 ├── app/build.gradle.kts                  # Cấu hình Android app, signingConfigs, KSP, secrets
 └── app/src/
     ├── main/java/com/laughing/telephotos/
-    │   ├── TelePhotosApplication.kt      # DI singleton cấp Application + ActivityLifecycleCallbacks
-    │   ├── MainActivity.kt               # Entry point edge-to-edge, gắn TelePhotosTheme
+    │   ├── TelePhotosApplication.kt      # DI singleton cấp Application + ActivityLifecycleCallbacks + cờ cold process launch + cấu hình Coil RGB565
+    │   ├── MainActivity.kt               # Entry point edge-to-edge, reset savedInstanceState & selection khi bị kill từ Recents
     │   ├── core/
+    │   │   ├── AppIconManager.kt         # Đổi preset launcher icon (DEFAULT / DARK / MONO) qua <activity-alias>
     │   │   ├── CacheCleanupManager.kt    # Giới hạn cache 500 MB LRU & dọn bộ nhớ đệm
     │   │   ├── Formatters.kt             # Định dạng ngày/dung lượng/thời lượng, chuẩn hoá +84 & tên Topic
     │   │   ├── MediaHashUtil.kt          # SHA-256 (lấy mẫu 16MB với tệp lớn), staging upload, thumbnail <=320px
     │   │   ├── MediaStoreScanner.kt      # Quét MediaStore, xin quyền, xoá hệ thống, lưu Pictures/Movies
     │   │   ├── NetworkRetryHelper.kt     # Retry mạng tạm thời (8s x 2 + 25s stall) & NetworkAlertCoordinator
-    │   │   ├── SettingsPreferences.kt    # DataStore lưu AppSettings & unlockAtEpochMs cho FLOOD_WAIT
-    │   │   ├── TelegramCaptionMetadata.kt# Đóng gói/giải mã JSON #tele_anh_meta trong caption Document
+    │   │   ├── SettingsPreferences.kt    # DataStore lưu AppSettings, AppIconPreset & unlockAtEpochMs cho FLOOD_WAIT
+    │   │   ├── TelegramCaptionMetadata.kt# Tạo caption sạch 2 dòng & giải mã tương thích ngược JSON #tele_anh_meta cũ
     │   │   └── ThemeMode.kt              # Enum 3 chế độ giao diện: LIGHT, DARK, LIQUID_GLASS
     │   ├── data/
     │   │   ├── local/
@@ -90,13 +93,15 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
    - Mọi request đi qua `sendFunction` -> `sendSuspending` đều được cấp ID từ `AtomicLong` và lưu vào `ConcurrentHashMap<Long, CompletableDeferred<TdApi.Object>>` với `withTimeoutOrNull(timeoutMs)` (mặc định `30s`).
    - Nếu client đóng bất thường (`AuthorizationStateClosed` khi `isIntentionalShutdown == false`) hoặc lệnh gặp lỗi `"Client is closed"` / `"TDLib chưa sẵn sàng"`, `TdLibManager` tự phục hồi tối đa 1 lần qua `ensureConnected(forceReconnect = true)` (trừ `FLOOD_WAIT` — không bao giờ đóng/kết nối lại khi dính `FLOOD_WAIT`).
 
-### B. Luồng Đồng bộ Thủ công, Upload `Document` & Chống trùng lặp 2 lớp
+### B. Luồng Đồng bộ Thủ công, Quét Ảnh/Album Có Sẵn & Chống trùng lặp
 1. **Hợp nhất nguồn & Chống trùng lặp:**
    - `VaultRepository.syncDeviceMediaStore()` quét ảnh/video qua `MediaStoreScanner` và gộp với bảng `media_items` theo `localUri` và `(mediaType, fileName.lowercase(), sizeBytes)`.
+   - Khi quét lịch sử Telegram (`TdLibManager.scanHistoryReadOnly` phân trang `GetForumTopicHistory` / `GetChatHistory`), ứng dụng đọc cả `MessageDocument`, `MessagePhoto` và `MessageVideo` (kể cả ảnh có sẵn trên Telegram trước khi cài app), đối chiếu chống trùng lặp theo `(chatId, messageId)` và prefix SHA-256 (`#h_<16hex>`).
    - Khi `TelegramUploadWorker` chuẩn bị upload mục có hash tạm `ms_*`, `MediaHashUtil` sao chép URI ra staging file trong `cacheDir` và tính `SHA-256` thật. Nếu `mediaDao.findUploadedByHash(trueHash)` đã tồn tại, mục này được đánh dấu `UPLOADED` ngay lập tức (không upload trùng).
-2. **Phân luồng Forum Topics & Tải lên Document:**
+2. **Phân luồng Album / Forum Topics & Caption Sạch 2 Dòng:**
    - Nếu đích là Forum Group, `VaultRepository.resolveUploadTopicId()` tự định tuyến: mục trong Album tuỳ chỉnh -> `album.messageThreadId`; ảnh lẻ -> topic **"Ảnh"**; video lẻ -> topic **"Video"** (tạo an toàn qua `topicMutexFor(chatId)` chuẩn hoá dấu tiếng Việt).
-   - `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) kèm `InputThumbnail` (`<= 320px`) và caption `#tele_anh_meta`. Nếu upload bị rớt mạng giữa chừng, giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` khi thử lại để **không gửi trùng tin nhắn**.
+   - Nếu đích là Kênh/Nhóm thường (`!isForumEnabled`), `lockSyncTarget` / `syncAlbumsFromTelegram` tự tạo Album đại diện (`messageThreadId = 0L`) để hiển thị toàn bộ ảnh/video trên kênh/nhóm trong tab `Album`.
+   - `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) kèm `InputThumbnail` (`<= 320px`) và caption sạch tối đa 2 dòng từ `TelegramCaptionMetadata.buildCaption()` (không nhúng chuỗi JSON thô). Nếu upload bị rớt mạng giữa chừng, giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` khi thử lại để **không gửi trùng tin nhắn**.
    - Giữa các tệp tuần tự có độ trễ chống khoá tài khoản `2.0–3.5 giây` (`uploadPacingMs + random(0..1500ms)`).
 
 ### C. Xử lý `FLOOD_WAIT` Động vs. Lỗi mạng tạm thời (`8s x 2`)
@@ -116,10 +121,12 @@ Hệ thống tách bạch hoàn toàn hai cơ chế này:
      - Nếu `retryAfterSec <= 60s` (hoặc thời gian còn lại `<= 65s`): Worker tạm hoãn (`delay`) ngay trong worker, cập nhật tiến độ đếm ngược; hết giờ sẽ xoá cờ `FLOOD_WAIT`, chuyển `PAUSED_FLOOD_WAIT` -> `QUEUED` và **tải tiếp đúng tệp đang dở đầu tiên** với nhịp `2.0–3.5s`.
      - Nếu `retryAfterSec > 60s`: gọi `VaultRepository.scheduleUploadAfterFloodWait(remainingMs, filterMediaType)` để lên lịch `WorkManager` với `setInitialDelay(remainingMs, TimeUnit.MILLISECONDS)` và thoát Worker sạch sẽ để không giữ wake lock.
 
-### D. Xem trực tuyến, Tải về máy & Giải phóng dung lượng
-- **Xem trực tuyến (`MediaViewerScreen`):** Nếu có `localUri` hợp lệ thì phát/xem ngay từ máy; nếu chỉ có trên Telegram mới gọi `downloadFileOnDemand(fileId)` và lưu vào cache tạm dưới sự kiểm soát của `CacheCleanupManager` (giới hạn **500 MB**, tự xoá tệp cũ nhất theo LRU).
-- **Tải về máy:** Nút **"Tải về máy"** lưu bản gốc vào thư mục công khai `Pictures/Tele Photos` (ảnh) hoặc `Movies/Tele Photos` (video) qua `MediaStoreScanner.saveFileToPublicGallery()`.
-- **Giải phóng dung lượng máy & Thùng rác:** Chỉ cho phép giải phóng các mục đã có tick xanh (`UploadStatus.UPLOADED`), giữ nguyên bản trên Telegram. Xoá mục đã sao lưu chỉ xoá file cục bộ (qua system delete confirmation) và chuyển tiếp bản sao trên Telegram sang chủ đề **"Đã Xoá Gần Đây"** (lưu cục bộ 30 ngày).
+### D. Xem trực tuyến, Chọn nhiều kiểu Google Photos & Tối ưu Thiết bị Yếu
+- **Xem trực tuyến (`MediaViewerScreen`):** Nếu có `localUri` hợp lệ thì phát/xem ngay từ máy; nếu chỉ có trên Telegram mới gọi `downloadFileOnDemand(fileId)` và lưu vào cache tạm dưới sự kiểm soát của `CacheCleanupManager` (giới hạn **500 MB**, tự xoá tệp xem cũ nhất theo LRU).
+- **Chọn nhiều & Reset khi bị kill từ Recents:** Hỗ trợ nhấn giữ từng ảnh hoặc chạm nút tròn ở tiêu đề ngày để chọn/bỏ chọn cả nhóm ngày (`toggleDateGroupSelection`), kèm thanh hành động `X` (`clearSelection`) ở trên cùng. Khi app bị tắt hẳn khỏi Recents (`!app.hasInitializedUiInCurrentProcess`), `MainActivity` loại bỏ `savedInstanceState` cũ để mở sạch lại tab `Ảnh` và xoá trạng thái chọn tạm thời (vẫn giữ trạng thái khi chỉ xoay màn hình).
+- **Tối ưu Dimensity cấu hình thấp:** Dùng `android:windowSoftInputMode="adjustResize"` + `imePadding()`, tắt animation chuyển tab `NavHost` (`EnterTransition.None`/`ExitTransition.None`), loại bỏ `Modifier.blur` tốn GPU, gom nhóm timeline trên `Dispatchers.Default`, tái sử dụng `SimpleDateFormat`/`Calendar`, dùng `rememberUpdatedState` trong `MediaGridTile` và decode thumbnail Coil `256px` `RGB_565`.
+- **Biểu tượng Launcher & Chuyển Preset:** Icon thích ứng hình chong chóng 4 cánh tối giản kèm 3 `<activity-alias>` (`.LauncherIconDefault`, `.LauncherIconDark`, `.LauncherIconMono`) có thể chuyển đổi trong tab `Setting`.
+- **Tải về máy & Giải phóng dung lượng:** Nút **"Tải về máy"** lưu bản gốc vào `Pictures/Tele Photos` hoặc `Movies/Tele Photos`. Chỉ giải phóng mục đã sao lưu (`UploadStatus.UPLOADED`); xoá mục chỉ xoá cục bộ và gắn cờ `#trash` / chuyển tiếp sang **"Đã Xoá Gần Đây"** (30 ngày).
 
 ---
 

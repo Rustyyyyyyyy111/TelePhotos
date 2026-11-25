@@ -6,6 +6,8 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.laughing.telephotos.TelePhotosApplication
+import com.laughing.telephotos.core.AppIconManager
+import com.laughing.telephotos.core.AppIconPreset
 import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.Formatters
 import com.laughing.telephotos.core.LocalDeletePrepResult
@@ -27,6 +29,11 @@ import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,9 +42,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class TimelineSection(
   val headerTitle: String,
@@ -85,27 +94,36 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   )
 
   val photosTimelineSections: StateFlow<List<TimelineSection>> =
-    repo.photosTimelineFlow.map { items -> groupMediaByDay(items) }.stateIn(
-      scope = viewModelScope,
-      started = SharingStarted.WhileSubscribed(5000),
-      initialValue = emptyList(),
-    )
+    repo.photosTimelineFlow
+      .map { items -> groupMediaByDay(items) }
+      .flowOn(Dispatchers.Default)
+      .stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList(),
+      )
 
   val videosTimelineSections: StateFlow<List<TimelineSection>> =
-    repo.videosTimelineFlow.map { items -> groupMediaByDay(items) }.stateIn(
-      scope = viewModelScope,
-      started = SharingStarted.WhileSubscribed(5000),
-      initialValue = emptyList(),
-    )
+    repo.videosTimelineFlow
+      .map { items -> groupMediaByDay(items) }
+      .flowOn(Dispatchers.Default)
+      .stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList(),
+      )
 
   val albums: StateFlow<List<AlbumWithCount>> =
-    repo.albumsWithCountFlow.map { list ->
-      list.filterNot { TelegramPolicyGuard.isSystemAutoTopicTitle(it.title) || it.isTrashTopic }
-    }.stateIn(
-      scope = viewModelScope,
-      started = SharingStarted.WhileSubscribed(5000),
-      initialValue = emptyList(),
-    )
+    repo.albumsWithCountFlow
+      .map { list ->
+        list.filterNot { TelegramPolicyGuard.isSystemAutoTopicTitle(it.title) || it.isTrashTopic }
+      }
+      .flowOn(Dispatchers.Default)
+      .stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList(),
+      )
 
   val trashedMedia: StateFlow<List<MediaEntity>> = repo.trashedMediaFlow.stateIn(
     scope = viewModelScope,
@@ -161,7 +179,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     _pendingSystemUriRequest.asStateFlow()
 
   init {
-    viewModelScope.launch {
+    viewModelScope.launch(Dispatchers.IO) {
       repo.purgeExpiredTrashedMedia()
       repo.pruneSystemTopicAlbums()
       repo.enforceCacheLimit()
@@ -240,19 +258,19 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   }
 
   fun syncDevicePhotos() {
-    viewModelScope.launch {
+    viewModelScope.launch(Dispatchers.IO) {
       repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = false)
     }
   }
 
   fun syncDeviceVideos() {
-    viewModelScope.launch {
+    viewModelScope.launch(Dispatchers.IO) {
       repo.syncDeviceMediaStore(scanPhotos = false, scanVideos = true)
     }
   }
 
   fun syncDeviceAllMedia() {
-    viewModelScope.launch {
+    viewModelScope.launch(Dispatchers.IO) {
       repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true)
     }
   }
@@ -260,6 +278,17 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   fun toggleSelection(mediaId: Long) {
     val current = _selectedIds.value
     _selectedIds.value = if (mediaId in current) current - mediaId else current + mediaId
+  }
+
+  fun toggleDateGroupSelection(itemIds: List<Long>) {
+    if (itemIds.isEmpty()) return
+    val current = _selectedIds.value
+    val allSelected = itemIds.all { it in current }
+    _selectedIds.value = if (allSelected) {
+      current - itemIds.toSet()
+    } else {
+      current + itemIds
+    }
   }
 
   fun clearSelection() {
@@ -637,9 +666,9 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   fun syncHistoryReadOnly() {
     viewModelScope.launch {
       _isBusy.value = true
-      repo.syncHistoryReadOnly()
+      withContext(Dispatchers.IO) { repo.syncHistoryReadOnly() }
         .onSuccess { count ->
-          _cacheSizeBytes.value = repo.calculateCacheSizeBytes()
+          _cacheSizeBytes.value = withContext(Dispatchers.IO) { repo.calculateCacheSizeBytes() }
           _statusBanner.value = if (count > 0) {
             "Đã đồng bộ chỉ đọc $count mục mới từ Telegram"
           } else {
@@ -656,12 +685,50 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
+  fun syncAlbumsFromTelegram(specificAlbumId: Long? = null, silent: Boolean = false) {
+    viewModelScope.launch {
+      if (!silent) _isBusy.value = true
+      withContext(Dispatchers.IO) { repo.syncAlbumsFromTelegram(specificAlbumId) }
+        .onSuccess { count ->
+          if (!silent) {
+            _statusBanner.value = if (count > 0) {
+              "Đã cập nhật $count mục từ Telegram vào Album"
+            } else {
+              "Album đã đồng bộ mới nhất với Telegram"
+            }
+          }
+        }
+        .onFailure { err ->
+          if (err is FloodWaitException) {
+            repo.handleFloodWait(err)
+          }
+          if (!silent) {
+            _statusBanner.value = err.message ?: "Không thể tải ảnh từ Telegram"
+          }
+        }
+      if (!silent) _isBusy.value = false
+    }
+  }
+
   fun setThemeMode(mode: ThemeMode) {
     viewModelScope.launch { prefs.setThemeMode(mode) }
   }
 
   fun setAdvancedBlurEnabled(enabled: Boolean) {
     viewModelScope.launch { prefs.setAdvancedBlurEnabled(enabled) }
+  }
+
+  fun setAppIconPreset(preset: AppIconPreset) {
+    viewModelScope.launch {
+      runCatching { AppIconManager.applyIconPreset(app, preset) }
+        .onSuccess {
+          prefs.setAppIconPreset(preset)
+          _statusBanner.value = "Đã đổi biểu tượng ứng dụng sang «${preset.labelVi}»"
+        }
+        .onFailure {
+          _statusBanner.value = "Không thể thay đổi biểu tượng trên trình khởi chạy này"
+        }
+    }
   }
 
   fun setWifiOnlyUpload(wifiOnly: Boolean) {
@@ -726,16 +793,40 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
 
   private fun groupMediaByDay(items: List<MediaEntity>): List<TimelineSection> {
     if (items.isEmpty()) return emptyList()
-    val now = System.currentTimeMillis()
+    val viLocale = Locale.forLanguageTag("vi-VN")
+    val calNow = Calendar.getInstance()
+    val nowYear = calNow.get(Calendar.YEAR)
+    val nowDay = calNow.get(Calendar.DAY_OF_YEAR)
+    val calTarget = Calendar.getInstance()
+    val sameYearFmt = SimpleDateFormat("EEE, d 'thg' M", viLocale)
+    val otherYearFmt = SimpleDateFormat("d 'thg' M, yyyy", viLocale)
+    val monthFmt = SimpleDateFormat("'Tháng' M, yyyy", viLocale)
+    val dateReuse = Date()
+
     val grouped = LinkedHashMap<String, MutableList<MediaEntity>>()
-    val monthByHeader = mutableMapOf<String, String>()
+    val monthByHeader = HashMap<String, String>()
+
     for (item in items) {
-      val header = Formatters.formatTimelineDayHeader(item.takenAtEpochMs, now)
+      calTarget.timeInMillis = item.takenAtEpochMs
+      val targetYear = calTarget.get(Calendar.YEAR)
+      val targetDay = calTarget.get(Calendar.DAY_OF_YEAR)
+      dateReuse.time = item.takenAtEpochMs
+
+      val header = when {
+        targetYear == nowYear && targetDay == nowDay -> "Hôm nay"
+        targetYear == nowYear && targetDay == nowDay - 1 -> "Hôm qua"
+        targetYear == nowYear ->
+          sameYearFmt.format(dateReuse).replaceFirstChar { it.titlecase(viLocale) }
+        else ->
+          otherYearFmt.format(dateReuse)
+      }
+
       grouped.getOrPut(header) { mutableListOf() }.add(item)
       if (!monthByHeader.containsKey(header)) {
-        monthByHeader[header] = Formatters.formatMonthYearLabel(item.takenAtEpochMs)
+        monthByHeader[header] = monthFmt.format(dateReuse)
       }
     }
+
     return grouped.map { (header, list) ->
       TimelineSection(
         headerTitle = header,

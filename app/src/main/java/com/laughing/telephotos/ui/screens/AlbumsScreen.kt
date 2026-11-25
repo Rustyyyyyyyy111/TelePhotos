@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.CollectionsBookmark
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VideoCall
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -55,6 +57,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,17 +82,28 @@ fun AlbumsScreen(
   albums: List<AlbumWithCount>,
   trashedCount: Int,
   lockedTarget: SyncTargetEntity?,
+  isLoggedIn: Boolean = false,
+  isBusy: Boolean = false,
   onAlbumClick: (Long) -> Unit,
   onOpenTrash: () -> Unit,
   onCreateAlbum: (String, Int) -> Unit,
   onOpenTargetSelector: () -> Unit,
+  onRefreshAlbums: () -> Unit = {},
   onPurgeExpiredTrash: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   var showCreateDialog by remember { mutableStateOf(false) }
+  var hasAutoSyncedOnce by remember(lockedTarget?.chatId) { mutableStateOf(false) }
 
   LaunchedEffect(Unit) {
     onPurgeExpiredTrash()
+  }
+
+  LaunchedEffect(lockedTarget?.chatId, isLoggedIn, albums.isEmpty()) {
+    if (lockedTarget != null && isLoggedIn && albums.isEmpty() && !hasAutoSyncedOnce) {
+      hasAutoSyncedOnce = true
+      onRefreshAlbums()
+    }
   }
 
   Box(modifier = modifier.fillMaxSize()) {
@@ -101,6 +115,8 @@ fun AlbumsScreen(
             Text(
               text = if (lockedTarget?.isForumEnabled == true) {
                 "Đồng bộ 1-1 với Forum Topics trong ${lockedTarget.chatTitle}"
+              } else if (lockedTarget != null) {
+                "Tải ảnh & chủ đề từ ${lockedTarget.chatTitle}"
               } else {
                 "Mỗi album ánh xạ một chủ đề lưu trữ riêng"
               },
@@ -109,6 +125,20 @@ fun AlbumsScreen(
               maxLines = 1,
               overflow = TextOverflow.Ellipsis,
             )
+          }
+        },
+        actions = {
+          if (lockedTarget != null && isLoggedIn) {
+            IconButton(
+              onClick = onRefreshAlbums,
+              enabled = !isBusy,
+              modifier = Modifier.testTag("albums_refresh_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.Refresh,
+                contentDescription = "Làm mới Album từ Telegram",
+              )
+            }
           }
         },
         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
@@ -224,7 +254,7 @@ fun AlbumsScreen(
                     .padding(8.dp),
                 ) {
                   Text(
-                    text = "Topic #${album.messageThreadId}",
+                    text = if (album.messageThreadId > 0L) "Topic #${album.messageThreadId}" else "Kênh / Nhóm",
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White,
                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
@@ -366,7 +396,7 @@ private fun CreateAlbumDialog(
     onDismissRequest = onDismiss,
     title = { Text("Tạo Album / Forum Topic mới") },
     text = {
-      Column {
+      Column(modifier = Modifier.imePadding()) {
         OutlinedTextField(
           value = title,
           onValueChange = { title = it },
@@ -396,7 +426,7 @@ private fun CreateAlbumDialog(
         }
         Spacer(modifier = Modifier.height(10.dp))
         Text(
-          text = "Lưu ý: Tạo chủ đề trên Telegram dùng kết nối ngắn hạn và tự ngắt ngay sau khi tạo xong.",
+          text = "Lưu ý: Tên album đồng bộ 1-1 với chủ đề Telegram của đích lưu trữ đã khoá.",
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -427,10 +457,13 @@ fun AlbumDetailScreen(
   album: AlbumEntity?,
   photos: List<MediaEntity>,
   videos: List<MediaEntity>,
+  isLoggedIn: Boolean = false,
+  isBusy: Boolean = false,
   onBack: () -> Unit,
   onMediaClick: (MediaEntity) -> Unit,
   onImportIntoAlbum: (List<android.net.Uri>) -> Unit,
   onMoveSelectedToTrash: (List<Long>) -> Unit = {},
+  onRefreshAlbum: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   var selectedTabIndex by remember { mutableIntStateOf(0) }
@@ -458,6 +491,21 @@ fun AlbumDetailScreen(
 
   fun toggleItemSelection(id: Long) {
     selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id
+  }
+
+  val latestIsSelectionMode by rememberUpdatedState(isSelectionMode)
+  val latestMediaClick by rememberUpdatedState(onMediaClick)
+  val stableTileClick = remember {
+    { item: MediaEntity ->
+      if (latestIsSelectionMode) {
+        toggleItemSelection(item.id)
+      } else {
+        latestMediaClick(item)
+      }
+    }
+  }
+  val stableTileLongPress = remember {
+    { item: MediaEntity -> toggleItemSelection(item.id) }
   }
 
   Box(modifier = modifier.fillMaxSize()) {
@@ -507,8 +555,9 @@ fun AlbumDetailScreen(
                 overflow = TextOverflow.Ellipsis,
               )
               if (album != null) {
+                val scopeLabel = if (album.messageThreadId > 0L) "Topic #${album.messageThreadId}" else "Kênh / Nhóm"
                 Text(
-                  text = "Topic #${album.messageThreadId} • ${photos.size} ảnh • ${videos.size} video",
+                  text = "$scopeLabel • ${photos.size} ảnh • ${videos.size} video",
                   style = MaterialTheme.typography.bodySmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -518,6 +567,20 @@ fun AlbumDetailScreen(
           navigationIcon = {
             IconButton(onClick = onBack, modifier = Modifier.testTag("album_detail_back")) {
               Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Quay lại")
+            }
+          },
+          actions = {
+            if (isLoggedIn) {
+              IconButton(
+                onClick = onRefreshAlbum,
+                enabled = !isBusy,
+                modifier = Modifier.testTag("album_detail_refresh_button"),
+              ) {
+                Icon(
+                  imageVector = Icons.Filled.Refresh,
+                  contentDescription = "Tải ảnh từ Telegram vào Album",
+                )
+              }
             }
           },
           colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
@@ -605,14 +668,8 @@ fun AlbumDetailScreen(
               media = item,
               isSelected = item.id in selectedIds,
               isSelectionMode = isSelectionMode,
-              onClick = {
-                if (isSelectionMode) {
-                  toggleItemSelection(item.id)
-                } else {
-                  onMediaClick(item)
-                }
-              },
-              onLongPress = { toggleItemSelection(item.id) },
+              onMediaClick = stableTileClick,
+              onMediaLongPress = stableTileLongPress,
             )
           }
         }

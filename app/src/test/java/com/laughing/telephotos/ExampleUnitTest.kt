@@ -1,5 +1,6 @@
 package com.laughing.telephotos
 
+import com.laughing.telephotos.core.AppIconPreset
 import com.laughing.telephotos.core.AppSettings
 import com.laughing.telephotos.core.CacheCleanupManager
 import com.laughing.telephotos.core.Formatters
@@ -27,24 +28,65 @@ import org.junit.Test
 class ExampleUnitTest {
 
   @Test
-  fun captionMetadata_roundTrip_preservesHashTopicAndSize() {
+  fun captionMetadata_cleanTwoLineFormat_hasNoJsonAndParsesTags() {
     val payload = TelegramCaptionPayload(
-      contentHash = "abc123def456",
+      contentHash = "abc123def4567890fedcba9876543210",
       takenAtEpochMs = 1732400000000L,
       durationSec = 65,
       topicId = 999L,
-      isTrashed = false,
+      isTrashed = true,
       fileName = "clip.mp4",
       mediaKind = "VIDEO",
       sizeBytes = 12_345_678L,
     )
     val caption = TelegramCaptionMetadata.buildCaption(payload)
+    assertFalse(caption.contains("{"))
+    assertFalse(caption.contains("}"))
+    assertFalse(caption.contains("#tele_anh_meta"))
+    assertTrue(caption.lines().size <= 2)
+    assertTrue(caption.contains("#tele_anh"))
+    assertTrue(caption.contains("#h_abc123def4567890"))
+    assertTrue(caption.contains("#trash"))
+
     val parsed = TelegramCaptionMetadata.parseFromCaption(caption)
     assertNotNull(parsed)
-    assertEquals(payload.contentHash, parsed?.contentHash)
-    assertEquals(payload.topicId, parsed?.topicId)
+    assertEquals("abc123def4567890", parsed?.contentHash)
+    assertEquals("clip.mp4", parsed?.fileName)
+    assertEquals("VIDEO", parsed?.mediaKind)
+    assertTrue(parsed?.isTrashed == true)
+    assertTrue((parsed?.takenAtEpochMs ?: 0L) > 0L)
+  }
+
+  @Test
+  fun captionMetadata_legacyJsonFormat_remainsBackwardCompatible() {
+    val legacyCaption = """
+      clip.mp4
+      #tele_anh_meta {"v":1,"hash":"abc123def456","ts":1732400000000,"dur":65,"topic":999,"trash":false,"name":"clip.mp4","type":"VIDEO","size":12345678}
+    """.trimIndent()
+    val parsed = TelegramCaptionMetadata.parseFromCaption(legacyCaption)
+    assertNotNull(parsed)
+    assertEquals("abc123def456", parsed?.contentHash)
+    assertEquals(999L, parsed?.topicId)
     assertEquals(65, parsed?.durationSec)
     assertEquals(12_345_678L, parsed?.sizeBytes)
+  }
+
+  @Test
+  fun captionMetadata_extractReadableTitle_andAppIconPresets_workCleanly() {
+    assertEquals(
+      "Du lịch Đà Lạt.jpg",
+      TelegramCaptionMetadata.extractReadableTitle("Du lịch Đà Lạt\n#dulich", "tg_1001.jpg"),
+    )
+    assertEquals(
+      "tg_1001.jpg",
+      TelegramCaptionMetadata.extractReadableTitle("#onlytag", "tg_1001.jpg"),
+    )
+
+    val aliases = AppIconPreset.entries.map { it.aliasClassName }.toSet()
+    assertEquals(3, aliases.size)
+    assertTrue(aliases.any { it.endsWith(".LauncherIconDefault") })
+    assertTrue(aliases.any { it.endsWith(".LauncherIconDark") })
+    assertTrue(aliases.any { it.endsWith(".LauncherIconMono") })
   }
 
   @Test

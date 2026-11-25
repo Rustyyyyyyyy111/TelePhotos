@@ -391,6 +391,20 @@ class VaultRepository(
 
       pruneSystemTopicAlbums()
 
+      if (!candidate.isForumEnabled &&
+        albumDao.getByChatAndThread(candidate.chatId, 0L) == null
+      ) {
+        albumDao.upsert(
+          AlbumEntity(
+            title = candidate.title,
+            chatId = candidate.chatId,
+            messageThreadId = 0L,
+            isTrashTopic = false,
+            iconColor = 0x6FB9F0,
+          )
+        )
+      }
+
       val target = SyncTargetEntity(
         id = 1,
         chatId = candidate.chatId,
@@ -799,18 +813,28 @@ class VaultRepository(
           val scanned = tdLibManager.scanHistoryReadOnly(
             chatId = target.chatId,
             messageThreadId = topic.messageThreadId,
-            limit = 40,
+            limit = 60,
           )
           totalAdded += ingestScannedItems(scanned, albumId, isTrash, existingHashes)
-          delay(300L)
+          delay(200L)
         }
       } else {
+        val streamAlbum = albumDao.getByChatAndThread(target.chatId, 0L)
+          ?: albumDao.upsert(
+            AlbumEntity(
+              title = target.chatTitle,
+              chatId = target.chatId,
+              messageThreadId = 0L,
+              isTrashTopic = false,
+              iconColor = 0x6FB9F0,
+            )
+          ).let { insertedId -> albumDao.getAlbum(insertedId) }
         val scanned = tdLibManager.scanHistoryReadOnly(
           chatId = target.chatId,
           messageThreadId = target.defaultMessageThreadId,
-          limit = 50,
+          limit = 80,
         )
-        totalAdded += ingestScannedItems(scanned, null, false, existingHashes)
+        totalAdded += ingestScannedItems(scanned, streamAlbum?.id, false, existingHashes)
       }
       totalAdded
     }
@@ -821,6 +845,90 @@ class VaultRepository(
       "Đã quét chỉ đọc xong ($reconstructedCount mục mới)"
     )
     reconstructedCount
+  }
+
+  /**
+   * Refreshes Album topics and pre-existing Telegram photos/videos/documents (including native
+   * MessagePhoto without #tele_anh_meta captions) directly for the Album tab or AlbumDetailScreen.
+   */
+  suspend fun syncAlbumsFromTelegram(specificAlbumId: Long? = null): Result<Int> = runCatching {
+    val target = syncTargetDao.getTarget()
+      ?: error("Chưa khoá đích lưu trữ Telegram")
+    val settings = settingsPreferences.getCurrentSettings()
+    if (!settings.isTelegramLoggedIn) {
+      error("Vui lòng đăng nhập Telegram trong Setting")
+    }
+
+    val existingHashes = mediaDao.getAllMediaSnapshot()
+      .filter { it.uploadStatus == UploadStatus.UPLOADED }
+      .map { it.contentHash }
+      .toHashSet()
+
+    val addedCount = tdLibManager.withActiveSession(markSyncing = true) {
+      var totalAdded = 0
+      if (specificAlbumId != null) {
+        val album = albumDao.getAlbum(specificAlbumId) ?: return@withActiveSession 0
+        val threadId = album.messageThreadId.takeIf { target.isForumEnabled && it != 0L }
+        val scanned = tdLibManager.scanHistoryReadOnly(
+          chatId = target.chatId,
+          messageThreadId = threadId,
+          limit = 80,
+        )
+        totalAdded += ingestScannedItems(scanned, album.id, album.isTrashTopic, existingHashes)
+      } else if (target.isForumEnabled) {
+        val topics = tdLibManager.getForumTopics(target.chatId)
+        for (topic in topics) {
+          if (TelegramPolicyGuard.isSystemAutoTopicTitle(topic.title)) {
+            if (TelegramPolicyGuard.isPhotosAutoTopicTitle(topic.title)) {
+              syncTargetDao.updatePhotosThreadId(topic.messageThreadId)
+            } else if (TelegramPolicyGuard.isVideosAutoTopicTitle(topic.title)) {
+              syncTargetDao.updateVideosThreadId(topic.messageThreadId)
+            } else if (TelegramPolicyGuard.isTrashTopicTitle(topic.title)) {
+              syncTargetDao.updateTrashThreadId(topic.messageThreadId)
+            }
+            continue
+          }
+          val albumId = albumDao.getByChatAndThread(target.chatId, topic.messageThreadId)?.id
+            ?: albumDao.upsert(
+              AlbumEntity(
+                title = topic.title,
+                chatId = target.chatId,
+                messageThreadId = topic.messageThreadId,
+                isTrashTopic = false,
+                iconColor = topic.iconColor,
+              )
+            )
+          val scanned = tdLibManager.scanHistoryReadOnly(
+            chatId = target.chatId,
+            messageThreadId = topic.messageThreadId,
+            limit = 60,
+          )
+          totalAdded += ingestScannedItems(scanned, albumId, false, existingHashes)
+          delay(150L)
+        }
+      } else {
+        val streamAlbumId = albumDao.getByChatAndThread(target.chatId, 0L)?.id
+          ?: albumDao.upsert(
+            AlbumEntity(
+              title = target.chatTitle,
+              chatId = target.chatId,
+              messageThreadId = 0L,
+              isTrashTopic = false,
+              iconColor = 0x6FB9F0,
+            )
+          )
+        val scanned = tdLibManager.scanHistoryReadOnly(
+          chatId = target.chatId,
+          messageThreadId = target.defaultMessageThreadId,
+          limit = 80,
+        )
+        totalAdded += ingestScannedItems(scanned, streamAlbumId, false, existingHashes)
+      }
+      totalAdded
+    }
+
+    pruneSystemTopicAlbums()
+    addedCount
   }
 
   /**
@@ -837,12 +945,13 @@ class VaultRepository(
       .toHashSet()
 
     if (!target.isForumEnabled) {
+      val streamAlbumId = albumDao.getByChatAndThread(target.chatId, 0L)?.id
       val scanned = tdLibManager.scanHistoryReadOnly(
         chatId = target.chatId,
         messageThreadId = target.defaultMessageThreadId,
-        limit = 50,
+        limit = 60,
       )
-      return ingestScannedItems(scanned, null, false, existingHashes)
+      return ingestScannedItems(scanned, streamAlbumId, false, existingHashes)
     }
 
     val core = tdLibManager.ensureThreeCoreTopics(target.chatId)
@@ -854,14 +963,14 @@ class VaultRepository(
     if (filterMediaType == null || filterMediaType == MediaType.PHOTO) {
       val pTopic = core.photosThreadId
       if (pTopic != null) {
-        val scannedPhotos = tdLibManager.scanHistoryReadOnly(target.chatId, pTopic, limit = 50)
+        val scannedPhotos = tdLibManager.scanHistoryReadOnly(target.chatId, pTopic, limit = 60)
         added += ingestScannedItems(scannedPhotos, null, false, existingHashes)
       }
     }
     if (filterMediaType == null || filterMediaType == MediaType.VIDEO) {
       val vTopic = core.videosThreadId
       if (vTopic != null) {
-        val scannedVideos = tdLibManager.scanHistoryReadOnly(target.chatId, vTopic, limit = 50)
+        val scannedVideos = tdLibManager.scanHistoryReadOnly(target.chatId, vTopic, limit = 60)
         added += ingestScannedItems(scannedVideos, null, false, existingHashes)
       }
     }
@@ -875,17 +984,44 @@ class VaultRepository(
     existingHashes: MutableSet<String>,
   ): Int {
     var added = 0
+    var thumbFetchCount = 0
+    val maxQuickThumbsPerBatch = 24
     val localSnapshot = mediaDao.getAllMediaSnapshot()
     val byNameSize = HashMap<String, MediaEntity>()
+    val byMessageKey = HashMap<String, MediaEntity>()
+    val byShortHashPrefix = HashMap<String, MediaEntity>()
+    var albumCoverNeeded = albumId?.let { id -> albumDao.getAlbum(id)?.coverUri == null } ?: false
+
     for (m in localSnapshot) {
       if (m.sizeBytes > 0L) {
         byNameSize["${m.mediaType.name}|${m.fileName.lowercase()}|${m.sizeBytes}"] = m
       }
+      if (m.telegramChatId != null && m.telegramMessageId != null) {
+        byMessageKey["${m.telegramChatId}_${m.telegramMessageId}"] = m
+      }
+      if (m.contentHash.length >= 12 && !m.contentHash.startsWith("ms_") && !m.contentHash.startsWith("tg_")) {
+        byShortHashPrefix[m.contentHash.take(16)] = m
+      }
     }
 
     for (item in scanned) {
-      if (existingHashes.contains(item.contentHash)) continue
-      val existingByHash = mediaDao.findByHash(item.contentHash)
+      val msgMatch = byMessageKey["${item.chatId}_${item.messageId}"]
+      if (msgMatch != null) {
+        if (albumId != null && msgMatch.albumId == null && !isTrashTopic) {
+          mediaDao.assignToAlbum(listOf(msgMatch.id), albumId, item.topicId ?: msgMatch.topicId)
+        }
+        if (albumCoverNeeded && albumId != null) {
+          val coverCandidate = msgMatch.localUri ?: msgMatch.cachedThumbPath
+          if (!coverCandidate.isNullOrBlank()) {
+            albumDao.updateCoverUri(albumId, coverCandidate)
+            albumCoverNeeded = false
+          }
+        }
+        continue
+      }
+
+      val prefixMatch = if (item.contentHash.length in 12..31) byShortHashPrefix[item.contentHash.take(16)] else null
+      val existingByHash = prefixMatch ?: mediaDao.findByHash(item.contentHash)
       if (existingByHash != null) {
         if (existingByHash.uploadStatus != UploadStatus.UPLOADED) {
           mediaDao.markUploaded(
@@ -898,17 +1034,33 @@ class VaultRepository(
             thumbFileId = item.thumbFileId,
           )
         }
+        if (albumId != null && existingByHash.albumId == null && !isTrashTopic) {
+          mediaDao.assignToAlbum(listOf(existingByHash.id), albumId, item.topicId ?: existingByHash.topicId)
+        }
+        var currentThumb = existingByHash.cachedThumbPath
         if (existingByHash.localUri == null &&
-          existingByHash.cachedThumbPath.isNullOrBlank() &&
-          item.thumbFileId != null
+          currentThumb.isNullOrBlank() &&
+          item.thumbFileId != null &&
+          thumbFetchCount < maxQuickThumbsPerBatch
         ) {
+          thumbFetchCount++
           tdLibManager.downloadThumbnailQuick(item.thumbFileId)?.let { thumbPath ->
+            currentThumb = thumbPath
             mediaDao.updateThumbInfo(existingByHash.id, item.thumbFileId, thumbPath)
+          }
+        }
+        if (albumCoverNeeded && albumId != null) {
+          val coverCandidate = existingByHash.localUri ?: currentThumb
+          if (!coverCandidate.isNullOrBlank()) {
+            albumDao.updateCoverUri(albumId, coverCandidate)
+            albumCoverNeeded = false
           }
         }
         existingHashes.add(item.contentHash)
         continue
       }
+
+      if (existingHashes.contains(item.contentHash)) continue
 
       // Deduplicate against MediaStore items matched by (mediaType, fileName, sizeBytes)
       val nameSizeKey = "${item.mediaType.name}|${item.fileName.lowercase()}|${item.sizeBytes}"
@@ -924,15 +1076,30 @@ class VaultRepository(
             topicId = item.topicId,
             thumbFileId = item.thumbFileId,
           )
-          mediaDao.updateContentHash(existingLocalMatch.id, item.contentHash)
+          if (existingLocalMatch.contentHash.startsWith("ms_") || item.contentHash.length >= 32) {
+            mediaDao.updateContentHash(existingLocalMatch.id, item.contentHash)
+          }
+        }
+        if (albumId != null && existingLocalMatch.albumId == null && !isTrashTopic) {
+          mediaDao.assignToAlbum(listOf(existingLocalMatch.id), albumId, item.topicId ?: existingLocalMatch.topicId)
+        }
+        if (albumCoverNeeded && albumId != null) {
+          val coverCandidate = existingLocalMatch.localUri ?: existingLocalMatch.cachedThumbPath
+          if (!coverCandidate.isNullOrBlank()) {
+            albumDao.updateCoverUri(albumId, coverCandidate)
+            albumCoverNeeded = false
+          }
         }
         existingHashes.add(item.contentHash)
         continue
       }
 
       val isTrashed = item.isTrashed || isTrashTopic
-      val downloadedThumbPath = item.thumbFileId?.let { thumbId ->
-        tdLibManager.downloadThumbnailQuick(thumbId)
+      val downloadedThumbPath = if (item.thumbFileId != null && thumbFetchCount < maxQuickThumbsPerBatch) {
+        thumbFetchCount++
+        tdLibManager.downloadThumbnailQuick(item.thumbFileId)
+      } else {
+        null
       }
       mediaDao.insertIgnore(
         MediaEntity(
@@ -957,6 +1124,10 @@ class VaultRepository(
           trashedAtEpochMs = if (isTrashed) System.currentTimeMillis() else null,
         )
       )
+      if (albumCoverNeeded && albumId != null && !downloadedThumbPath.isNullOrBlank()) {
+        albumDao.updateCoverUri(albumId, downloadedThumbPath)
+        albumCoverNeeded = false
+      }
       existingHashes.add(item.contentHash)
       added++
     }

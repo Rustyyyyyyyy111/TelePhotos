@@ -20,6 +20,7 @@ private val Context.telePhotosDataStore: DataStore<Preferences> by preferencesDa
 data class AppSettings(
   val themeMode: ThemeMode = ThemeMode.LIGHT,
   val advancedBlurEnabled: Boolean = false,
+  val appIconPreset: AppIconPreset = AppIconPreset.DEFAULT,
   val wifiOnlyUpload: Boolean = true,
   val uploadPacingMs: Long = 2000L,
   val floodWaitUntilEpochMs: Long = 0L,
@@ -43,6 +44,7 @@ class SettingsPreferences(private val context: Context) {
   private object Keys {
     val THEME_MODE = stringPreferencesKey("theme_mode")
     val ADVANCED_BLUR = booleanPreferencesKey("advanced_blur")
+    val APP_ICON_PRESET = stringPreferencesKey("app_icon_preset")
     val WIFI_ONLY = booleanPreferencesKey("wifi_only_upload")
     val UPLOAD_PACING_MS = longPreferencesKey("upload_pacing_ms")
     val FLOOD_WAIT_UNTIL = longPreferencesKey("flood_wait_until_epoch_ms")
@@ -63,9 +65,13 @@ class SettingsPreferences(private val context: Context) {
       val modeName = prefs[Keys.THEME_MODE] ?: ThemeMode.LIGHT.name
       val themeMode =
         ThemeMode.entries.firstOrNull { it.name == modeName } ?: ThemeMode.LIGHT
+      val iconName = prefs[Keys.APP_ICON_PRESET] ?: AppIconPreset.DEFAULT.name
+      val appIconPreset =
+        AppIconPreset.entries.firstOrNull { it.name == iconName } ?: AppIconPreset.DEFAULT
       AppSettings(
         themeMode = themeMode,
         advancedBlurEnabled = prefs[Keys.ADVANCED_BLUR] ?: false,
+        appIconPreset = appIconPreset,
         wifiOnlyUpload = prefs[Keys.WIFI_ONLY] ?: true,
         uploadPacingMs = prefs[Keys.UPLOAD_PACING_MS] ?: 2000L,
         floodWaitUntilEpochMs = prefs[Keys.FLOOD_WAIT_UNTIL] ?: 0L,
@@ -136,6 +142,12 @@ class SettingsPreferences(private val context: Context) {
   suspend fun setAdvancedBlurEnabled(enabled: Boolean) {
     context.telePhotosDataStore.edit { prefs ->
       prefs[Keys.ADVANCED_BLUR] = enabled
+    }
+  }
+
+  suspend fun setAppIconPreset(preset: AppIconPreset) {
+    context.telePhotosDataStore.edit { prefs ->
+      prefs[Keys.APP_ICON_PRESET] = preset.name
     }
   }
 

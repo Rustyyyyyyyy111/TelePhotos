@@ -44,6 +44,7 @@ class TelePhotosApplication : Application(), ImageLoaderFactory {
 
   private var startedActivityCount = 0
   private var isActivityChangingConfigurations = false
+  @Volatile var hasInitializedUiInCurrentProcess: Boolean = false
 
   override fun onCreate() {
     super.onCreate()
@@ -87,9 +88,11 @@ class TelePhotosApplication : Application(), ImageLoaderFactory {
       .components {
         add(VideoFrameDecoder.Factory())
       }
+      .allowRgb565(true)
+      .crossfade(false)
       .memoryCache {
         MemoryCache.Builder(this)
-          .maxSizePercent(0.15)
+          .maxSizePercent(0.14)
           .build()
       }
       .diskCache {
