@@ -113,6 +113,8 @@ class ExampleRobolectricTest {
           takenAtEpochMs = 1000L,
           albumId = travelAlbumId,
           topicId = 10L,
+          telegramChatId = -100123L,
+          telegramMessageId = 900L,
           uploadStatus = UploadStatus.UPLOADED,
         )
       )
@@ -130,7 +132,7 @@ class ExampleRobolectricTest {
           uploadStatus = UploadStatus.QUEUED,
         )
       )
-      val duplicateId = mediaDao.insertIgnore(
+      val duplicateTelegramId = mediaDao.insertIgnore(
         MediaEntity(
           contentHash = "sha256_unique_1",
           fileName = "photo_1_copy.jpg",
@@ -138,11 +140,14 @@ class ExampleRobolectricTest {
           mediaType = MediaType.PHOTO,
           sizeBytes = 1024L,
           takenAtEpochMs = 2000L,
+          telegramChatId = -100123L,
+          telegramMessageId = 900L,
         )
       )
       assertTrue(photoId > 0L)
       assertTrue(videoId > 0L)
-      assertEquals(-1L, duplicateId)
+      assertEquals(-1L, duplicateTelegramId)
+      assertEquals(photoId, mediaDao.findUploadedByHash("sha256_unique_1")?.id)
 
       assertEquals(1, mediaDao.observePhotosTimeline().first().size)
       assertEquals(1, mediaDao.observeVideosTimeline().first().size)
@@ -294,6 +299,7 @@ class ExampleRobolectricTest {
       val mediaDao = db.mediaDao()
       val repo = VaultRepository(
         context = app,
+        database = db,
         mediaDao = mediaDao,
         albumDao = db.albumDao(),
         syncTargetDao = db.syncTargetDao(),
@@ -413,6 +419,7 @@ class ExampleRobolectricTest {
       val mediaDao = db.mediaDao()
       val repo = VaultRepository(
         context = app,
+        database = db,
         mediaDao = mediaDao,
         albumDao = db.albumDao(),
         syncTargetDao = db.syncTargetDao(),
@@ -506,6 +513,89 @@ class ExampleRobolectricTest {
       assertEquals(TelegramUploadMode.AS_FILE, prefs.getActiveUploadBatchMode())
     } finally {
       prefs.clearActiveUploadBatchMode()
+    }
+  }
+
+  @Test
+  fun `album checkpoints and cached metadata persist cleanly in Room v4`() = runTest {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val db = Room.inMemoryDatabaseBuilder(context, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val mediaDao = db.mediaDao()
+      val albumDao = db.albumDao()
+
+      val albumId = albumDao.upsert(
+        AlbumEntity(
+          title = "Du lịch",
+          chatId = -100777L,
+          messageThreadId = 45L,
+          isTrashTopic = false,
+        )
+      )
+      val m1 = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "cache_meta_1",
+          fileName = "trip_1.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 2048L,
+          takenAtEpochMs = 1_700_000_000_000L,
+          albumId = albumId,
+          topicId = 45L,
+          telegramChatId = -100777L,
+          telegramMessageId = 100L,
+          uploadStatus = UploadStatus.UPLOADED,
+          syncMode = TelegramUploadMode.HD_MEDIA.name,
+          userCaption = "Bình minh",
+        )
+      )
+      mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "cache_meta_2",
+          fileName = "trip_2.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 4096L,
+          takenAtEpochMs = 1_700_000_060_000L,
+          albumId = albumId,
+          topicId = 45L,
+          telegramChatId = -100777L,
+          telegramMessageId = 250L,
+          uploadStatus = UploadStatus.UPLOADED,
+          syncMode = TelegramUploadMode.AS_FILE.name,
+        )
+      )
+
+      assertEquals(250L, mediaDao.getMaxTelegramMessageId(-100777L, albumId, 45L))
+      assertEquals(100L, mediaDao.getMinTelegramMessageId(-100777L, albumId, 45L))
+
+      albumDao.updateSyncCheckpoints(
+        albumId = albumId,
+        latestMessageId = 250L,
+        oldestMessageId = 100L,
+        backfillExhausted = false,
+        lastSyncedAtEpochMs = 1_700_001_000_000L,
+      )
+      val album = albumDao.getAlbum(albumId)!!
+      assertEquals(250L, album.latestMessageId)
+      assertEquals(100L, album.oldestMessageId)
+      assertEquals(0L, album.pendingForwardCursor)
+      assertFalse(album.backfillExhausted)
+
+      mediaDao.updateCachedMetadata(
+        id = m1,
+        takenAtEpochMs = 1_700_000_010_000L,
+        syncMode = null,
+        userCaption = "Bình minh trên đồi",
+      )
+      val updatedMedia = mediaDao.getById(m1)!!
+      assertEquals(1_700_000_010_000L, updatedMedia.takenAtEpochMs)
+      assertEquals("HD_MEDIA", updatedMedia.syncMode)
+      assertEquals("Bình minh trên đồi", updatedMedia.userCaption)
+    } finally {
+      db.close()
     }
   }
 }

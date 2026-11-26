@@ -386,8 +386,18 @@ fun MediaViewerScreen(
               style = MaterialTheme.typography.bodySmall,
               color = Color.White.copy(alpha = 0.8f),
             )
+            val identityDisplay = when {
+              !currentMedia.contentHash.isNullOrBlank() ->
+                "SHA-256: ${currentMedia.contentHash.take(24)}..."
+              !currentMedia.shortHashHint.isNullOrBlank() ->
+                "Mã rút gọn: ${currentMedia.shortHashHint}"
+              !currentMedia.telegramFileUniqueId.isNullOrBlank() ->
+                "Telegram File UID: ${currentMedia.telegramFileUniqueId}"
+              else ->
+                "SHA-256: Chưa tính (chờ đồng bộ)"
+            }
             Text(
-              text = "SHA-256: ${currentMedia.contentHash.take(24)}...",
+              text = identityDisplay,
               style = MaterialTheme.typography.labelSmall,
               color = Color(0xFF38BDF8),
             )

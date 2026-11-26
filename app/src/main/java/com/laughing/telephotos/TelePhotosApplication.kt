@@ -11,6 +11,7 @@ import coil.memory.MemoryCache
 import com.laughing.telephotos.core.NetworkAlertCoordinator
 import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.data.local.TelePhotosDatabase
+import com.laughing.telephotos.data.repository.SyncCoordinator
 import com.laughing.telephotos.data.repository.VaultRepository
 import com.laughing.telephotos.data.telegram.TdLibManager
 import kotlinx.coroutines.CoroutineScope
@@ -29,16 +30,19 @@ class TelePhotosApplication : Application(), ImageLoaderFactory {
   val database: TelePhotosDatabase by lazy { TelePhotosDatabase.getInstance(this) }
   val settingsPreferences: SettingsPreferences by lazy { SettingsPreferences(this) }
   val networkAlertCoordinator: NetworkAlertCoordinator by lazy { NetworkAlertCoordinator() }
+  val syncCoordinator: SyncCoordinator by lazy { SyncCoordinator() }
   val tdLibManager: TdLibManager by lazy { TdLibManager(this, settingsPreferences, networkAlertCoordinator) }
   val vaultRepository: VaultRepository by lazy {
     VaultRepository(
       context = this,
+      database = database,
       mediaDao = database.mediaDao(),
       albumDao = database.albumDao(),
       syncTargetDao = database.syncTargetDao(),
       tdLibManager = tdLibManager,
       settingsPreferences = settingsPreferences,
       networkAlertCoordinator = networkAlertCoordinator,
+      syncCoordinator = syncCoordinator,
     )
   }
 

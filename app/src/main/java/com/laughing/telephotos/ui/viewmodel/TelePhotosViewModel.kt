@@ -14,13 +14,17 @@ import com.laughing.telephotos.core.LocalDeletePrepResult
 import com.laughing.telephotos.core.NetworkInterruptionAlert
 import com.laughing.telephotos.core.ThemeMode
 import com.laughing.telephotos.data.local.AlbumEntity
+import com.laughing.telephotos.data.local.AlbumSyncStatus
 import com.laughing.telephotos.data.local.AlbumWithCount
+import com.laughing.telephotos.data.local.BackfillState
 import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.StorageStats
 import com.laughing.telephotos.data.local.SyncTargetEntity
 import com.laughing.telephotos.data.repository.ManualSyncProgressState
 import com.laughing.telephotos.data.repository.SaveToDeviceProgress
+import com.laughing.telephotos.data.repository.TopicSyncKey
+import com.laughing.telephotos.data.repository.TopicSyncUiState
 import com.laughing.telephotos.data.telegram.FileDownloadProgress
 import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.FloodWaitState
@@ -98,6 +102,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
   val lifecycleState: StateFlow<TdLibLifecycleState> = repo.lifecycleState
   val floodWaitState: StateFlow<FloodWaitState?> = repo.floodWaitState
   val networkInterruptionAlert: StateFlow<NetworkInterruptionAlert?> = repo.networkInterruptionAlert
+  val topicSyncStates: StateFlow<Map<TopicSyncKey, TopicSyncUiState>> = repo.topicSyncStates
 
   val lockedTarget: StateFlow<SyncTargetEntity?> = repo.lockedTargetFlow.stateIn(
     scope = viewModelScope,
@@ -201,6 +206,7 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
 
   init {
     viewModelScope.launch(Dispatchers.IO) {
+      repo.resetStaleTopicSyncStatuses()
       repo.purgeExpiredTrashedMedia()
       repo.pruneSystemTopicAlbums()
       repo.enforceCacheLimit()
@@ -278,21 +284,33 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
     }
   }
 
+  fun ensureSessionPhotosScanned() {
+    viewModelScope.launch(Dispatchers.IO) {
+      repo.syncDeviceMediaStoreIfNeededForSession(MediaType.PHOTO)
+    }
+  }
+
+  fun ensureSessionVideosScanned() {
+    viewModelScope.launch(Dispatchers.IO) {
+      repo.syncDeviceMediaStoreIfNeededForSession(MediaType.VIDEO)
+    }
+  }
+
   fun syncDevicePhotos() {
     viewModelScope.launch(Dispatchers.IO) {
-      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = false)
+      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = false, force = true)
     }
   }
 
   fun syncDeviceVideos() {
     viewModelScope.launch(Dispatchers.IO) {
-      repo.syncDeviceMediaStore(scanPhotos = false, scanVideos = true)
+      repo.syncDeviceMediaStore(scanPhotos = false, scanVideos = true, force = true)
     }
   }
 
   fun syncDeviceAllMedia() {
     viewModelScope.launch(Dispatchers.IO) {
-      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true)
+      repo.syncDeviceMediaStore(scanPhotos = true, scanVideos = true, force = true)
     }
   }
 
@@ -775,6 +793,29 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
           }
         }
       if (!silent) _isBusy.value = false
+    }
+  }
+
+  fun backfillOlderAlbumHistory(albumId: Long) {
+    viewModelScope.launch {
+      _isBusy.value = true
+      withContext(Dispatchers.IO) { repo.backfillOlderAlbumHistory(albumId) }
+        .onSuccess { res ->
+          _statusBanner.value = when {
+            res.addedCount > 0 -> "Đã tải thêm ${res.addedCount} mục cũ từ Telegram"
+            res.backfillState == BackfillState.CONFIRMED_END -> "Đã tải hết lịch sử của chủ đề này"
+            res.backfillState == BackfillState.LIKELY_END_RETRYABLE ->
+              "Chưa thấy thêm tin cũ hơn — chạm để kiểm tra lại"
+            else -> "Không có thêm ảnh hoặc video cũ hơn"
+          }
+        }
+        .onFailure { err ->
+          if (err is FloodWaitException) {
+            repo.handleFloodWait(err)
+          }
+          _statusBanner.value = err.message ?: "Không thể tải thêm lịch sử cũ"
+        }
+      _isBusy.value = false
     }
   }
 

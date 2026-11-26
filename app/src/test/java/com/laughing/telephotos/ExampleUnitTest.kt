@@ -14,13 +14,27 @@ import com.laughing.telephotos.core.RetryDecision
 import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.core.TelegramCaptionMetadata
 import com.laughing.telephotos.core.TelegramCaptionPayload
+import com.laughing.telephotos.data.local.AlbumSyncStatus
+import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.SyncTargetType
-import java.io.File
+import com.laughing.telephotos.data.repository.SyncCoordinator
+import com.laughing.telephotos.data.repository.TopicSyncKey
 import com.laughing.telephotos.data.telegram.FloodWaitException
+import com.laughing.telephotos.data.telegram.HistoryEndSignal
+import com.laughing.telephotos.data.telegram.HistoryPaginationEngine
+import com.laughing.telephotos.data.telegram.HistoryRawMessage
+import com.laughing.telephotos.data.telegram.ScannedTelegramMedia
 import com.laughing.telephotos.data.telegram.TelegramCandidateTarget
 import com.laughing.telephotos.data.telegram.TelegramConnectionStatus
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import com.laughing.telephotos.data.telegram.TelegramUploadMode
+import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runTest
 import org.drinkless.tdlib.TdApi
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -290,5 +304,194 @@ class ExampleUnitTest {
     assertEquals(TelegramUploadMode.AS_FILE, TelegramUploadMode.fromWireName("UNKNOWN_MODE"))
     assertTrue(TelegramUploadMode.AS_FILE.labelVi.contains("Send as File"))
     assertTrue(TelegramUploadMode.HD_MEDIA.labelVi.contains("Send HD"))
+  }
+
+  @Test
+  fun captionMetadata_preservesUserCaptionAndSyncModeFooterTags() {
+    val payload = TelegramCaptionPayload(
+      contentHash = "fedcba98765432100123456789abcdef",
+      takenAtEpochMs = 1732400000000L,
+      fileName = "sunset.jpg",
+      mediaKind = "PHOTO",
+      syncMode = TelegramUploadMode.HD_MEDIA.name,
+      userCaption = "Hoàng hôn Đà Lạt\nNgày thứ hai",
+    )
+    val caption = TelegramCaptionMetadata.buildCaption(payload)
+    assertTrue(caption.startsWith("Hoàng hôn Đà Lạt\nNgày thứ hai\n📅 "))
+    assertTrue(caption.contains("#tele_anh"))
+    assertTrue(caption.contains("#t_photo"))
+    assertTrue(caption.contains("#m_hd"))
+    assertTrue(caption.contains("#h_fedcba9876543210"))
+
+    val parsed = TelegramCaptionMetadata.parseFromCaption(caption)
+    assertNotNull(parsed)
+    assertEquals("Hoàng hôn Đà Lạt\nNgày thứ hai", parsed?.userCaption)
+    assertEquals("PHOTO", parsed?.mediaKind)
+    assertEquals("HD_MEDIA", parsed?.syncMode)
+    assertEquals("fedcba9876543210", parsed?.contentHash)
+    assertTrue((parsed?.takenAtEpochMs ?: 0L) > 0L)
+
+    // AS_FILE footer check
+    val fileCaption = TelegramCaptionMetadata.buildCaption(
+      payload.copy(
+        mediaKind = "VIDEO",
+        syncMode = TelegramUploadMode.AS_FILE.name,
+        userCaption = null,
+        fileName = "raw_clip.mov",
+      )
+    )
+    assertTrue(fileCaption.lines().size == 2)
+    assertTrue(fileCaption.contains("#t_video"))
+    assertTrue(fileCaption.contains("#m_file"))
+    val parsedFile = TelegramCaptionMetadata.parseFromCaption(fileCaption)
+    assertEquals("VIDEO", parsedFile?.mediaKind)
+    assertEquals("AS_FILE", parsedFile?.syncMode)
+    assertNull(parsedFile?.userCaption)
+
+    // Plain native Telegram caption without Tele Photos tags falls back cleanly (returns null)
+    assertNull(TelegramCaptionMetadata.parseFromCaption("Ảnh chụp gia đình cuối tuần"))
+  }
+
+  @Test
+  fun captionMetadata_bareEmojiWithoutExplicitAppTag_returnsNull() {
+    assertNull(TelegramCaptionMetadata.parseFromCaption("🖼️ Ảnh hoàng hôn bãi biển"))
+    assertNull(TelegramCaptionMetadata.parseFromCaption("🎞️ Video du lịch gia đình\n📅 24/11/2024 10:15"))
+  }
+
+  @Test
+  fun historyPaginationEngine_overlappingPagesAndConservativeBackfill_behaveSafely() = runTest {
+    fun fakeMedia(id: Long) = ScannedTelegramMedia(
+      chatId = -1001L,
+      messageId = id,
+      topicId = 10L,
+      fileId = id.toInt(),
+      remoteFileId = "r_$id",
+      telegramFileUniqueId = "u_$id",
+      thumbFileId = null,
+      fileName = "img_$id.jpg",
+      mimeType = "image/jpeg",
+      mediaType = MediaType.PHOTO,
+      sizeBytes = 100L,
+      durationSec = 0,
+      takenAtEpochMs = id * 1000L,
+      fullContentHash = null,
+      shortHashHint = null,
+      syncMode = null,
+      userCaption = null,
+      isTrashed = false,
+      metadataVersion = 4,
+    )
+
+    // Overlapping page boundary returns id=50 twice without duplicating or looping infinitely
+    var calls = 0
+    val forward = HistoryPaginationEngine.fetchIncrementalForward(
+      sinceMessageId = 40L,
+      startFromMessageId = 0L,
+      maxPages = 5,
+      pageSize = 3,
+      pageDelayMs = 0L,
+    ) { fromId, _ ->
+      calls++
+      when (calls) {
+        1 -> listOf(55L, 52L, 50L).map { HistoryRawMessage(it, false, fakeMedia(it)) }
+        2 -> listOf(50L, 45L, 40L).map { HistoryRawMessage(it, false, fakeMedia(it)) }
+        else -> emptyList()
+      }
+    }
+    assertTrue(forward.hitKnownCheckpoint)
+    assertEquals(listOf(55L, 52L, 50L, 45L), forward.items.map { it.messageId })
+
+    // Short backfill page without creation marker => UNCERTAIN_EMPTY_OR_SHORT
+    val shortBackfill = HistoryPaginationEngine.fetchOlderBackfill(
+      beforeMessageId = 50L,
+      maxPages = 2,
+      pageSize = 25,
+      pageDelayMs = 0L,
+    ) { fromId, _ ->
+      if (fromId > 49L) {
+        listOf(HistoryRawMessage(49L, isCreationMarker = false, media = fakeMedia(49L)))
+      } else {
+        emptyList()
+      }
+    }
+    assertEquals(HistoryEndSignal.UNCERTAIN_EMPTY_OR_SHORT, shortBackfill.endSignal)
+
+    // Backfill hitting topic creation marker => CONFIRMED_CREATION_END
+    val confirmedBackfill = HistoryPaginationEngine.fetchOlderBackfill(
+      beforeMessageId = 50L,
+      maxPages = 2,
+      pageSize = 25,
+      pageDelayMs = 0L,
+    ) { _, _ ->
+      listOf(
+        HistoryRawMessage(2L, isCreationMarker = false, media = fakeMedia(2L)),
+        HistoryRawMessage(1L, isCreationMarker = true, media = null),
+      )
+    }
+    assertEquals(HistoryEndSignal.CONFIRMED_CREATION_END, confirmedBackfill.endSignal)
+  }
+
+  @Test
+  fun syncCoordinator_serializesSameTopic_allowsOtherTopic_andHandlesCancelOrError() = runTest {
+    val coordinator = SyncCoordinator()
+    val keyA = TopicSyncKey(-1001L, 10L)
+    val keyB = TopicSyncKey(-1001L, 20L)
+
+    val gateA1 = CompletableDeferred<Unit>()
+    val enteredA1 = CompletableDeferred<Unit>()
+    val events = mutableListOf<String>()
+
+    val jobA1 = async {
+      coordinator.runSerialized(key = keyA, mode = AlbumSyncStatus.SYNCING) {
+        events.add("A1_start")
+        enteredA1.complete(Unit)
+        gateA1.await()
+        events.add("A1_end")
+      }
+    }
+    enteredA1.await()
+    assertEquals(AlbumSyncStatus.SYNCING, coordinator.currentState(keyA).status)
+
+    // Second job on same topic A must wait for A1, while topic B runs concurrently
+    val jobA2 = async {
+      coordinator.runSerialized(key = keyA, mode = AlbumSyncStatus.BACKFILLING) {
+        events.add("A2_run")
+      }
+    }
+    val jobB = async {
+      coordinator.runSerialized(key = keyB, mode = AlbumSyncStatus.SYNCING) {
+        events.add("B_run")
+      }
+    }
+    jobB.await()
+    assertTrue("B should finish before A1 releases", "B_run" in events && "A2_run" !in events)
+
+    gateA1.complete(Unit)
+    jobA1.await()
+    jobA2.await()
+    assertEquals(listOf("A1_start", "B_run", "A1_end", "A2_run"), events)
+    assertEquals(AlbumSyncStatus.IDLE, coordinator.currentState(keyA).status)
+
+    // Error state transitions cleanly to ERROR and resets to IDLE on next success
+    runCatching {
+      coordinator.runSerialized(key = keyA, mode = AlbumSyncStatus.SYNCING) {
+        error("Network timeout")
+      }
+    }
+    assertEquals(AlbumSyncStatus.ERROR, coordinator.currentState(keyA).status)
+    assertEquals("Network timeout", coordinator.currentState(keyA).lastError)
+
+    // Cancellation recovers cleanly to IDLE without sticking
+    val cancelGate = CompletableDeferred<Unit>()
+    val cancelJob = launch {
+      coordinator.runSerialized(key = keyA, mode = AlbumSyncStatus.SYNCING) {
+        cancelGate.complete(Unit)
+        delay(10_000L)
+      }
+    }
+    cancelGate.await()
+    cancelJob.cancel(CancellationException("user cancelled"))
+    cancelJob.join()
+    assertEquals(AlbumSyncStatus.IDLE, coordinator.currentState(keyA).status)
   }
 }

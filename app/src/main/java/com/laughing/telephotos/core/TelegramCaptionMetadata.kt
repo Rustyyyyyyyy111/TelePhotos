@@ -9,7 +9,7 @@ import kotlinx.serialization.json.Json
 
 @Serializable
 data class TelegramCaptionPayload(
-  @SerialName("v") val version: Int = 1,
+  @SerialName("v") val version: Int = TelegramCaptionMetadata.CURRENT_METADATA_VERSION,
   @SerialName("hash") val contentHash: String,
   @SerialName("ts") val takenAtEpochMs: Long,
   @SerialName("dur") val durationSec: Int = 0,
@@ -18,11 +18,18 @@ data class TelegramCaptionPayload(
   @SerialName("name") val fileName: String = "",
   @SerialName("type") val mediaKind: String = "PHOTO",
   @SerialName("size") val sizeBytes: Long = 0L,
+  @SerialName("mode") val syncMode: String? = null,
+  @SerialName("caption") val userCaption: String? = null,
 )
 
 object TelegramCaptionMetadata {
+  const val CURRENT_METADATA_VERSION = 4
   private const val LEGACY_META_TAG = "#tele_anh_meta"
   const val APP_HASHTAG = "#tele_anh"
+  const val PHOTO_TYPE_TAG = "#t_photo"
+  const val VIDEO_TYPE_TAG = "#t_video"
+  const val FILE_MODE_TAG = "#m_file"
+  const val HD_MODE_TAG = "#m_hd"
   private const val HASH_TAG_PREFIX = "#h_"
   private const val TRASH_TAG = "#trash"
   private const val CAPTION_DATE_PATTERN = "dd/MM/yyyy HH:mm"
@@ -38,16 +45,21 @@ object TelegramCaptionMetadata {
   }
 
   /**
-   * Builds a clean, human-readable 2-line Telegram caption with NO raw JSON strings.
-   * Technical fields (size, type, topic, duration) are read directly from TDLib Document/Message
-   * objects when scanning history, while an optional compact #h_<prefix> / #trash tag at the end
-   * preserves hash & trash state cleanly.
+   * Builds a compact, non-intrusive Telegram caption with NO raw JSON strings:
+   * - Preserves any custom `userCaption` lines cleanly above the footer when present.
+   * - When `userCaption` is blank, uses a 2-line layout (`🖼️/🎞️ <name>\n📅 <dd/MM/yyyy HH:mm> • ...`).
+   * - Encodes `mediaKind` (`#t_photo`/`#t_video`), `syncMode` (`#m_file`/`#m_hd`),
+   *   optional `#h_<16hex>` hint (from real content hashes only), and `#trash` on the footer line.
    */
   fun buildCaption(payload: TelegramCaptionPayload): String {
-    val icon = if (payload.mediaKind == "VIDEO") "🎞️" else "🖼️"
-    val cleanName = sanitizeFileNameChars.replace(payload.fileName, " ")
-      .trim()
-      .ifBlank { if (payload.mediaKind == "VIDEO") "video.mp4" else "photo.jpg" }
+    val isVideo = payload.mediaKind.equals("VIDEO", ignoreCase = true)
+    val icon = if (isVideo) "🎞️" else "🖼️"
+    val typeTag = if (isVideo) VIDEO_TYPE_TAG else PHOTO_TYPE_TAG
+    val modeTag = when (payload.syncMode) {
+      "HD_MEDIA" -> HD_MODE_TAG
+      "AS_FILE" -> FILE_MODE_TAG
+      else -> null
+    }
     val dateStr = formatCaptionDate(payload.takenAtEpochMs)
 
     val compactHash = payload.contentHash
@@ -58,6 +70,10 @@ object TelegramCaptionMetadata {
 
     val suffixTags = buildList {
       add(APP_HASHTAG)
+      add(typeTag)
+      if (modeTag != null) {
+        add(modeTag)
+      }
       if (!compactHash.isNullOrBlank()) {
         add("$HASH_TAG_PREFIX$compactHash")
       }
@@ -66,13 +82,32 @@ object TelegramCaptionMetadata {
       }
     }.joinToString(" ")
 
-    return "$icon $cleanName\n📅 $dateStr • $suffixTags"
+    val footerLine = "📅 $dateStr • $suffixTags"
+    val cleanUserCaption = payload.userCaption
+      ?.lines()
+      ?.map { it.trimEnd() }
+      ?.filter { it.isNotBlank() && !isFooterMetadataLine(it) }
+      ?.joinToString("\n")
+      ?.trim()
+
+    if (!cleanUserCaption.isNullOrBlank()) {
+      return "$cleanUserCaption\n$footerLine"
+    }
+
+    val cleanName = sanitizeFileNameChars.replace(payload.fileName, " ")
+      .trim()
+      .ifBlank { if (isVideo) "video.mp4" else "photo.jpg" }
+
+    return "$icon $cleanName\n$footerLine"
   }
 
   /**
    * Parses both:
-   * 1. Legacy captions containing `#tele_anh_meta {...}` JSON payloads (full backward compatibility)
-   * 2. Clean 2-line captions (`🖼️/🎞️ <name>\n📅 <dd/MM/yyyy HH:mm> • #tele_anh [#h_<hash>] [#trash]`)
+   * 1. Legacy captions containing `#tele_anh_meta {...}` JSON payloads (backward compatibility)
+   * 2. Clean footer captions carrying explicit Tele Photos tags (`#tele_anh`, `#t_photo`, `#t_video`, `#h_...`).
+   *
+   * Plain native Telegram captions (even if they start with "🖼️" or "🎞️") return `null` so callers
+   * preserve raw caption text and fall back cleanly to Telegram message timestamp.
    */
   fun parseFromCaption(caption: String?): TelegramCaptionPayload? {
     if (caption.isNullOrBlank()) return null
@@ -91,22 +126,47 @@ object TelegramCaptionMetadata {
       }
     }
 
-    // 2. Clean 2-line format parser
-    val hasAppTag = caption.contains(APP_HASHTAG) ||
-      hashTagRegex.containsMatchIn(caption) ||
-      caption.trimStart().startsWith("🖼️") ||
-      caption.trimStart().startsWith("🎞️")
-    if (!hasAppTag) return null
+    // 2. Clean footer format parser: require explicit Tele Photos hashtag markers
+    val hasExplicitAppTag = caption.contains(APP_HASHTAG) ||
+      caption.contains(PHOTO_TYPE_TAG) ||
+      caption.contains(VIDEO_TYPE_TAG) ||
+      hashTagRegex.containsMatchIn(caption)
+    if (!hasExplicitAppTag) return null
 
-    val lines = caption.lines().map { it.trim() }.filter { it.isNotEmpty() }
-    val firstLine = lines.firstOrNull().orEmpty()
-    val mediaKind = if (firstLine.startsWith("🎞️")) "VIDEO" else "PHOTO"
-    val parsedFileName = firstLine
-      .removePrefix("🖼️")
-      .removePrefix("🎞️")
-      .trim()
+    val lines = caption.lines().map { it.trimEnd() }.filter { it.isNotBlank() }
+    val footerLine = lines.lastOrNull { isFooterMetadataLine(it) } ?: caption
+    val bodyLines = lines.filterNot { isFooterMetadataLine(it) }
+    val firstBodyLine = bodyLines.firstOrNull()?.trim().orEmpty()
 
-    val parsedDateMs = dateLineRegex.find(caption)?.groupValues?.getOrNull(1)?.let { dateText ->
+    val mediaKind = when {
+      footerLine.contains(VIDEO_TYPE_TAG) || caption.contains(VIDEO_TYPE_TAG) -> "VIDEO"
+      footerLine.contains(PHOTO_TYPE_TAG) || caption.contains(PHOTO_TYPE_TAG) -> "PHOTO"
+      firstBodyLine.startsWith("🎞️") -> "VIDEO"
+      else -> "PHOTO"
+    }
+
+    val syncMode = when {
+      footerLine.contains(HD_MODE_TAG) || caption.contains(HD_MODE_TAG) -> "HD_MEDIA"
+      footerLine.contains(FILE_MODE_TAG) || caption.contains(FILE_MODE_TAG) -> "AS_FILE"
+      else -> null
+    }
+
+    val isAutoFileHeaderOnly = bodyLines.size == 1 &&
+      (firstBodyLine.startsWith("🖼️") || firstBodyLine.startsWith("🎞️"))
+
+    val parsedFileName = if (firstBodyLine.startsWith("🖼️") || firstBodyLine.startsWith("🎞️")) {
+      firstBodyLine.removePrefix("🖼️").removePrefix("🎞️").trim()
+    } else {
+      ""
+    }
+
+    val parsedUserCaption = if (!isAutoFileHeaderOnly && bodyLines.isNotEmpty()) {
+      bodyLines.joinToString("\n").trim().takeIf { it.isNotBlank() }
+    } else {
+      null
+    }
+
+    val parsedDateMs = dateLineRegex.find(footerLine)?.groupValues?.getOrNull(1)?.let { dateText ->
       runCatching {
         SimpleDateFormat(CAPTION_DATE_PATTERN, vietnameseLocale).apply {
           isLenient = false
@@ -118,7 +178,7 @@ object TelegramCaptionMetadata {
     val isTrashed = caption.contains(TRASH_TAG)
 
     return TelegramCaptionPayload(
-      version = 2,
+      version = CURRENT_METADATA_VERSION,
       contentHash = parsedHash,
       takenAtEpochMs = parsedDateMs,
       durationSec = 0,
@@ -127,6 +187,8 @@ object TelegramCaptionMetadata {
       fileName = parsedFileName,
       mediaKind = mediaKind,
       sizeBytes = 0L,
+      syncMode = syncMode,
+      userCaption = parsedUserCaption,
     )
   }
 
@@ -158,6 +220,19 @@ object TelegramCaptionMetadata {
     } else {
       sanitized
     }
+  }
+
+  private fun isFooterMetadataLine(line: String): Boolean {
+    val trimmed = line.trim()
+    if (trimmed.startsWith("📅") &&
+      (trimmed.contains(APP_HASHTAG) ||
+        trimmed.contains(PHOTO_TYPE_TAG) ||
+        trimmed.contains(VIDEO_TYPE_TAG) ||
+        hashTagRegex.containsMatchIn(trimmed))
+    ) {
+      return true
+    }
+    return trimmed.startsWith(APP_HASHTAG) && trimmed.contains(HASH_TAG_PREFIX)
   }
 
   private fun formatCaptionDate(epochMs: Long): String {

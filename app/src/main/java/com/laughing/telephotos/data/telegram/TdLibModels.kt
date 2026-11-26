@@ -71,15 +71,16 @@ data class SentDocumentResult(
   val remoteFileId: String?,
   val messageThreadId: Long?,
   val thumbFileId: Int? = null,
+  val fileUniqueId: String? = null,
 )
 
 data class ScannedTelegramMedia(
-  val contentHash: String,
   val chatId: Long,
   val messageId: Long,
   val topicId: Long?,
   val fileId: Int,
   val remoteFileId: String?,
+  val telegramFileUniqueId: String?,
   val thumbFileId: Int?,
   val fileName: String,
   val mimeType: String,
@@ -88,6 +89,28 @@ data class ScannedTelegramMedia(
   val durationSec: Int,
   val takenAtEpochMs: Long,
   val isTrashed: Boolean,
+  val fullContentHash: String? = null,
+  val shortHashHint: String? = null,
+  val syncMode: String? = null,
+  val userCaption: String? = null,
+  val metadataVersion: Int = 0,
+)
+
+enum class HistoryEndSignal {
+  NONE,
+  REACHED_KNOWN_CHECKPOINT,
+  STALLED_CURSOR,
+  UNCERTAIN_EMPTY_OR_SHORT,
+  CONFIRMED_CREATION_END,
+}
+
+data class HistoryScanPageResult(
+  val items: List<ScannedTelegramMedia>,
+  val highestMessageId: Long = 0L,
+  val lowestMessageId: Long = 0L,
+  val hitKnownCheckpoint: Boolean = false,
+  val endSignal: HistoryEndSignal = HistoryEndSignal.NONE,
+  val reachedHistoryEnd: Boolean = false,
 )
 
 data class FileDownloadProgress(

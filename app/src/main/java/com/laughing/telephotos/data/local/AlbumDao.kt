@@ -13,6 +13,9 @@ interface AlbumDao {
     """
     SELECT a.id, a.title, a.chatId, a.messageThreadId, a.isTrashTopic,
            a.iconColor, a.coverUri, a.createdAtEpochMs,
+           a.latestMessageId, a.oldestMessageId, a.backfillExhausted, a.lastSyncedAtEpochMs,
+           a.pendingForwardCursor, a.pendingForwardHighWaterMark,
+           a.backfillState, a.syncStatus, a.lastSyncError, a.lastBackfillAtEpochMs,
            COUNT(DISTINCT m.id) AS itemCount
     FROM albums a
     LEFT JOIN media_items m
@@ -52,6 +55,55 @@ interface AlbumDao {
 
   @Query("UPDATE albums SET coverUri = :coverUri WHERE id = :albumId")
   suspend fun updateCoverUri(albumId: Long, coverUri: String?)
+
+  @Query(
+    """
+    UPDATE albums
+    SET latestMessageId = :latestMessageId,
+        oldestMessageId = :oldestMessageId,
+        backfillExhausted = :backfillExhausted,
+        lastSyncedAtEpochMs = :lastSyncedAtEpochMs,
+        pendingForwardCursor = COALESCE(:pendingForwardCursor, pendingForwardCursor),
+        pendingForwardHighWaterMark = COALESCE(:pendingForwardHighWaterMark, pendingForwardHighWaterMark),
+        backfillState = COALESCE(:backfillState, backfillState),
+        lastBackfillAtEpochMs = COALESCE(:lastBackfillAtEpochMs, lastBackfillAtEpochMs)
+    WHERE id = :albumId
+    """
+  )
+  suspend fun updateSyncCheckpoints(
+    albumId: Long,
+    latestMessageId: Long,
+    oldestMessageId: Long,
+    backfillExhausted: Boolean,
+    lastSyncedAtEpochMs: Long = System.currentTimeMillis(),
+    pendingForwardCursor: Long? = null,
+    pendingForwardHighWaterMark: Long? = null,
+    backfillState: String? = null,
+    lastBackfillAtEpochMs: Long? = null,
+  )
+
+  @Query(
+    """
+    UPDATE albums
+    SET syncStatus = :syncStatus,
+        lastSyncError = :lastSyncError
+    WHERE id = :albumId
+    """
+  )
+  suspend fun updateSyncStatus(
+    albumId: Long,
+    syncStatus: String,
+    lastSyncError: String?,
+  )
+
+  @Query(
+    """
+    UPDATE albums
+    SET syncStatus = 'IDLE'
+    WHERE syncStatus IN ('SYNCING', 'BACKFILLING')
+    """
+  )
+  suspend fun resetStaleSyncStatuses()
 
   @Query("DELETE FROM albums WHERE id IN (:ids)")
   suspend fun deleteByIds(ids: List<Long>)

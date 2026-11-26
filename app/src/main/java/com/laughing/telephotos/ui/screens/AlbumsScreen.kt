@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.CollectionsBookmark
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VideoCall
@@ -44,7 +45,9 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
@@ -53,6 +56,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -70,9 +74,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.laughing.telephotos.data.local.AlbumEntity
+import com.laughing.telephotos.data.local.AlbumSyncStatus
 import com.laughing.telephotos.data.local.AlbumWithCount
+import com.laughing.telephotos.data.local.BackfillState
 import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.SyncTargetEntity
+import com.laughing.telephotos.data.repository.TopicSyncUiState
 import com.laughing.telephotos.data.telegram.TelegramPolicyGuard
 import com.laughing.telephotos.ui.components.MediaGridTile
 import com.laughing.telephotos.ui.components.TelePhotosGlassCard
@@ -96,17 +103,9 @@ fun AlbumsScreen(
   modifier: Modifier = Modifier,
 ) {
   var showCreateDialog by remember { mutableStateOf(false) }
-  var hasAutoSyncedOnce by remember(lockedTarget?.chatId) { mutableStateOf(false) }
 
   LaunchedEffect(Unit) {
     onPurgeExpiredTrash()
-  }
-
-  LaunchedEffect(lockedTarget?.chatId, isLoggedIn, albums.isEmpty()) {
-    if (lockedTarget != null && isLoggedIn && albums.isEmpty() && !hasAutoSyncedOnce) {
-      hasAutoSyncedOnce = true
-      onRefreshAlbums()
-    }
   }
 
   Box(modifier = modifier.fillMaxSize()) {
@@ -194,10 +193,10 @@ fun AlbumsScreen(
                   modifier = Modifier.size(44.dp),
                 )
                 Spacer(modifier = Modifier.height(12.dp))
-                Text("Chưa có Album nào", style = MaterialTheme.typography.titleLarge)
+                Text("Chưa có Album nào trong bộ nhớ", style = MaterialTheme.typography.titleLarge)
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                  text = "Tạo album mới để phân loại ảnh và video theo chủ đề riêng (chỉ đồng bộ khi bạn bấm tải lên).",
+                  text = "Tạo album mới hoặc chạm biểu tượng Làm mới trên thanh công cụ để đọc chủ đề từ Telegram (chỉ đồng bộ khi bạn bấm tải lên / làm mới).",
                   style = MaterialTheme.typography.bodyMedium,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -475,17 +474,31 @@ fun AlbumDetailScreen(
   videos: List<MediaEntity>,
   isLoggedIn: Boolean = false,
   isBusy: Boolean = false,
+  topicSyncState: TopicSyncUiState = TopicSyncUiState(),
   onBack: () -> Unit,
   onMediaClick: (MediaEntity, Boolean) -> Unit,
   onImportIntoAlbum: (List<android.net.Uri>) -> Unit,
   onMoveSelectedToTrash: (List<Long>) -> Unit = {},
   onRefreshAlbum: () -> Unit = {},
+  onLoadOlderHistory: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   var selectedTabIndex by remember { mutableIntStateOf(0) }
   var selectedIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
   val isSelectionMode = selectedIds.isNotEmpty()
   val activeList = if (selectedTabIndex == 0) photos else videos
+
+  val effectiveSyncStatus = if (topicSyncState.status != AlbumSyncStatus.IDLE) {
+    topicSyncState.status
+  } else {
+    AlbumSyncStatus.fromWireName(album?.syncStatus)
+  }
+  val effectiveSyncError = topicSyncState.lastError ?: album?.lastSyncError
+  val isTopicActive = effectiveSyncStatus == AlbumSyncStatus.SYNCING ||
+    effectiveSyncStatus == AlbumSyncStatus.BACKFILLING
+  val resolvedBackfillState = BackfillState.fromWireName(album?.backfillState)
+  val isConfirmedEnd = resolvedBackfillState == BackfillState.CONFIRMED_END ||
+    album?.backfillExhausted == true
 
   if (isSelectionMode) {
     BackHandler { selectedIds = emptySet() }
@@ -590,7 +603,7 @@ fun AlbumDetailScreen(
             if (isLoggedIn) {
               IconButton(
                 onClick = onRefreshAlbum,
-                enabled = !isBusy,
+                enabled = !isBusy && !isTopicActive,
                 modifier = Modifier.testTag("album_detail_refresh_button"),
               ) {
                 Icon(
@@ -602,6 +615,49 @@ fun AlbumDetailScreen(
           },
           colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         )
+      }
+
+      if (isTopicActive) {
+        LinearProgressIndicator(
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("album_sync_progress"),
+        )
+      } else if (effectiveSyncStatus == AlbumSyncStatus.ERROR && !effectiveSyncError.isNullOrBlank()) {
+        Surface(
+          color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f),
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("album_sync_error_banner"),
+        ) {
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(horizontal = 14.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+          ) {
+            Text(
+              text = effectiveSyncError,
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onErrorContainer,
+              maxLines = 2,
+              overflow = TextOverflow.Ellipsis,
+              modifier = Modifier.weight(1f),
+            )
+            if (isLoggedIn) {
+              TextButton(
+                onClick = onRefreshAlbum,
+                enabled = !isBusy,
+                modifier = Modifier
+                  .defaultMinSize(minHeight = 48.dp)
+                  .testTag("album_sync_retry_button"),
+              ) {
+                Text("Thử lại")
+              }
+            }
+          }
+        }
       }
 
       PrimaryTabRow(
@@ -665,6 +721,26 @@ fun AlbumDetailScreen(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(if (selectedTabIndex == 0) "Thêm ảnh vào Album" else "Thêm video vào Album")
               }
+              if (isLoggedIn && album != null && !isConfirmedEnd) {
+                Spacer(modifier = Modifier.height(8.dp))
+                TextButton(
+                  onClick = onLoadOlderHistory,
+                  enabled = !isBusy && !isTopicActive,
+                  modifier = Modifier
+                    .defaultMinSize(minHeight = 48.dp)
+                    .testTag("album_load_older_empty_button"),
+                ) {
+                  Icon(Icons.Filled.History, contentDescription = null)
+                  Spacer(modifier = Modifier.width(6.dp))
+                  Text(
+                    if (resolvedBackfillState == BackfillState.LIKELY_END_RETRYABLE) {
+                      "Kiểm tra lại lịch sử cũ hơn"
+                    } else {
+                      "Tải lịch sử cũ từ Telegram"
+                    }
+                  )
+                }
+              }
             }
           }
         }
@@ -688,6 +764,44 @@ fun AlbumDetailScreen(
               onMediaClick = stableTileClick,
               onMediaLongPress = stableTileLongPress,
             )
+          }
+
+          if (isLoggedIn && album != null) {
+            item(span = { GridItemSpan(maxLineSpan) }, key = "album_backfill_footer") {
+              Box(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .padding(horizontal = 14.dp, vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+              ) {
+                if (!isConfirmedEnd) {
+                  OutlinedButton(
+                    onClick = onLoadOlderHistory,
+                    enabled = !isBusy && !isTopicActive,
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .defaultMinSize(minHeight = 48.dp)
+                      .testTag("album_load_older_button"),
+                  ) {
+                    Icon(Icons.Filled.History, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                      if (resolvedBackfillState == BackfillState.LIKELY_END_RETRYABLE) {
+                        "Kiểm tra lại lịch sử cũ hơn"
+                      } else {
+                        "Tải thêm lịch sử cũ từ Telegram (từng lô nhỏ)"
+                      }
+                    )
+                  }
+                } else if (album.oldestMessageId > 0L) {
+                  Text(
+                    text = "Đã tải hết lịch sử chủ đề này",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+              }
+            }
           }
         }
       }

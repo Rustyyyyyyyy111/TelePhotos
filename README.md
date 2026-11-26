@@ -13,11 +13,12 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
 - Tải lên thủ công theo hàng đợi tuần tự 1 luồng với **menu chọn chế độ mỗi lần bấm Sync / Upload (`SyncUploadModeBottomSheet`)**:
   - **Gửi dạng Tệp (`Send as File` — `TdApi.InputMessageDocument`, `disableContentTypeDetection = true`)**: giữ nguyên tệp gốc, không nén hay chuyển mã.
   - **Gửi HD (`Send HD` — `TdApi.InputMessagePhoto` / `TdApi.InputMessageVideo` với `supportsStreaming = true`)**: gửi dưới dạng Ảnh/Video chất lượng cao theo kích thước thật (`MediaHashUtil.extractLocalMediaDimensions`), không hạ độ phân giải thấp.
-  - Cả hai chế độ đều đính kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và caption tối giản 2 dòng (`🖼️/🎞️ <fileName>\n📅 dd/MM/yyyy HH:mm • #tele_anh [#h_<16hex>] [#trash]`), đồng thời **giữ nguyên hoàn toàn luồng xem trực tuyến tệp `document` và xem ảnh/video thông thường** cho cả dữ liệu đã đồng bộ trước đó lẫn dữ liệu mới tải lên.
+  - Cả hai chế độ đều đính kèm ảnh thu nhỏ (`InputThumbnail <= 320px`) và dòng chân metadata gọn nhẹ (`📅 dd/MM/yyyy HH:mm • #tele_anh #t_photo|#t_video #m_file|#m_hd [#h_<16hex>] [#trash]`), đồng thời **bảo toàn toàn bộ nội dung caption gốc của người dùng phía trên** (hoặc dùng `🖼️/🎞️ <fileName>` khi không có caption tuỳ chỉnh) và **giữ nguyên hoàn toàn luồng xem trực tuyến tệp `document` và xem ảnh/video thông thường** cho cả dữ liệu đã đồng bộ trước đó lẫn dữ liệu mới tải lên.
+- Đọc dữ liệu từ **Room cục bộ trước** khi mở tab `Album` hay duyệt thư viện; chỉ gọi lịch sử Telegram khi người dùng chủ động bấm **Đồng bộ / Làm mới** hoặc **Tải thêm lịch sử cũ**. Hệ thống lưu mốc `latestMessageId` / `oldestMessageId` cùng con trỏ nối tiếp **`pendingForwardCursor` / `pendingForwardHighWaterMark`** trên từng Album (`MIGRATION_3_4`) để quét gia tăng giới hạn tối đa 10 trang mỗi lượt (`30` tin/trang) mà không bao giờ bỏ sót hay kẹt lặp vô hạn khi có >300 tin nhắn mới; chỉ cập nhật `latestMessageId` khi đã nối liền mạch tới mốc trước đó. Khi backfill thủ công (`25` tin/trang, tối đa `2` trang, giãn nhịp `250–320ms`), hệ thống phân biệt `HAS_MORE`, `LIKELY_END_RETRYABLE` (khi gặp ranh giới bộ nhớ đệm TDLib / danh sách ngắn nhưng chưa thấy marker tạo chủ đề) và `CONFIRMED_END` (chỉ khi thấy tin nhắn tạo chủ đề/nhóm), đồng thời dùng lại `msg.date * 1000L` nếu tin nhắn gốc không gắn thẻ.
 - Quét và hiển thị cả ảnh/video có sẵn từ trước trên nhóm/kênh Telegram (`TdApi.MessagePhoto`, `TdApi.MessageVideo`, `TdApi.MessageDocument` kể cả khi không có caption metadata) vào cả tab `Ảnh`, tab `Video` và tab `Album` (bao gồm cả chủ đề Forum **«Ảnh»** và **«Video»** bên cạnh các Album tuỳ chỉnh).
 - Quản lý vòng đời kết nối **TDLib tái sử dụng theo Foreground/Background**: giữ một phiên `TdLibManager` duy nhất sống khi người dùng mở ứng dụng (loại bỏ chi phí kết nối lại liên tục), và tự động chạy `TdApi.OptimizeStorage` + `TdApi.Close()` khi ứng dụng chuyển sang chạy nền (sau khi mọi tác vụ/worker hoàn tất).
 - Tự phục hồi lỗi `File not found` sau khi bị force-close / kill khỏi Recents: xác thực trạng thái `Ready` của TDLib và dung lượng tệp vật lý trên đĩa (> 0 byte), tự động dọn handle cache lỗi (`TdApi.DeleteFile`), truy xuất lại tin nhắn Telegram (`GetMessage` / lịch sử Topic) hoặc `GetRemoteFile` để làm mới `fileId`, cập nhật Room và tải lại sạch sẽ.
-- Tối ưu hiệu năng cho máy cấu hình thấp (Dimensity giá rẻ), hỗ trợ chọn nhiều theo nhóm ngày kiểu Google Photos, zoom lưới tab `Ảnh` (`2–5` cột bằng chụm/mở 2 ngón hoặc nút chuyển mật độ), trình xem toàn màn hình hỗ trợ vuốt ngang theo đúng ngữ cảnh (`HorizontalPager`) kèm pinch-zoom / chạm đúp, reset trạng thái giao diện khi bị đóng hẳn khỏi Recents, và biểu tượng launcher 4 cánh chong chóng tối giản (hỗ trợ đổi 3 preset qua `<activity-alias>`).
+- Tối ưu hiệu năng cho máy cấu hình thấp (Dimensity giá rẻ), chỉ quét `MediaStore` **một lần mỗi phiên** cho mỗi tab `Ảnh`/`Video` (vẫn cho phép quét lại khi người dùng chủ động bấm Sync) qua `MediaIdentitySummary` nhẹ thay vì nạp toàn bảng, hỗ trợ chọn nhiều theo nhóm ngày kiểu Google Photos, zoom lưới tab `Ảnh` (`2–5` cột), trình xem toàn màn hình hỗ trợ vuốt ngang (`HorizontalPager`) kèm pinch-zoom / chạm đúp, reset trạng thái giao diện khi bị đóng hẳn khỏi Recents, và biểu tượng launcher 4 cánh chong chóng tối giản.
 - Tuân thủ chính sách **Chỉ đọc + Tải lên (`TelegramPolicyGuard`)**: tuyệt đối không gọi các hàm TDLib có khả năng xoá tin nhắn, lịch sử chat hoặc Forum Topic trên Telegram (`TdApi.DeleteFile` chỉ xoá tệp cache cục bộ trong `tdlib_files` để phục hồi tải xuống).
 
 ### Ngôn ngữ, Build & Thư viện (xác thực từ `gradle/libs.versions.toml` & `app/build.gradle.kts`)
@@ -25,7 +26,7 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
 - **Giao diện (UI):** Jetpack Compose BOM `2024.09.00`, Material 3, Navigation Compose `2.8.9`, Material Icons Extended.
 - **Hiển thị Ảnh/Video:** Coil `2.7.0` (`coil-compose`, `coil-video`), Media3 ExoPlayer `1.11.1` (`androidx-media3-exoplayer`, `androidx-media3-ui`).
 - **Lưu trữ & Tác vụ nền:**
-  - Room `2.7.0` (`room-runtime`, `room-ktx`, KSP `2.3.5`) — CSDL cục bộ `tele_photos_vault.db` (Version `2`).
+  - Room `2.7.0` (`room-runtime`, `room-ktx`, KSP `2.3.5`) — CSDL cục bộ `tele_photos_vault.db` (Version `4`, `MIGRATION_1_2`, `MIGRATION_2_3` & `MIGRATION_3_4` nâng cấp an toàn giữ nguyên toàn bộ dữ liệu).
   - DataStore Preferences `1.1.7` (`tele_photos_settings`) — lưu cấu hình giao diện, Wi-Fi guard, API ID/Hash, thông tin phiên Telegram và dấu thời gian mở khoá `FLOOD_WAIT`.
   - WorkManager `2.12.0` (`work-runtime-ktx`) — thực thi hàng đợi upload tuần tự (`TelegramUploadWorker`) và đặt lịch chạy lại qua `initialDelay` cho `FLOOD_WAIT` dài.
   - Kotlin Coroutines `1.10.2` & `kotlinx-serialization-json` `1.13.0`.
@@ -57,30 +58,33 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
     │   │   └── ThemeMode.kt              # Enum 3 chế độ giao diện: LIGHT, DARK, LIQUID_GLASS
     │   ├── data/
     │   │   ├── local/
-    │   │   │   ├── TelePhotosDatabase.kt # Room v2 (entities + MIGRATION_1_2)
-    │   │   │   ├── MediaEntity.kt        # Bảng media_items, MediaType, UploadStatus
-    │   │   │   ├── MediaDao.kt           # Truy vấn Timeline, Queue (toàn cục & *InIds theo lô chọn tay), FreeUpSpace, PAUSED_FLOOD_WAIT
-    │   │   │   ├── AlbumEntity.kt        # Bảng albums ánh xạ 1-1 Forum Topic
-    │   │   │   ├── AlbumDao.kt           # Truy vấn danh sách Album kèm số lượng mục
+    │   │   │   ├── TelePhotosDatabase.kt # Room v4 (entities + MIGRATION_1_2 + MIGRATION_2_3 + MIGRATION_3_4)
+    │   │   │   ├── MediaEntity.kt        # Bảng media_items (tách riêng contentHash SHA-256, localMediaStoreKey, telegramFileUniqueId, shortHashHint, metadataVersion)
+    │   │   │   ├── MediaDao.kt           # Truy vấn Timeline, Queue (toàn cục & *InIds), MediaIdentitySummary nhẹ, merge trùng lặp nguyên tử
+    │   │   │   ├── AlbumEntity.kt        # Bảng albums + BackfillState, AlbumSyncStatus, pendingForwardCursor, pendingForwardHighWaterMark
+    │   │   │   ├── AlbumDao.kt           # Truy vấn danh sách Album kèm số lượng mục, cập nhật mốc nối tiếp & trạng thái đồng bộ
     │   │   │   ├── SyncTargetEntity.kt   # Bảng sync_targets lưu đích đã khoá + threadId 3 chủ đề lõi
     │   │   │   └── SyncTargetDao.kt      # Lưu/cập nhật đích đồng bộ
     │   │   ├── telegram/
-    │   │   │   ├── TdLibModels.kt        # Enum TelegramConnectionStatus, TdLibLifecycleState, TelegramUploadMode (AS_FILE / HD_MEDIA), FloodWaitState, FloodWaitException
+    │   │   │   ├── TdLibModels.kt        # Enum TelegramConnectionStatus, TdLibLifecycleState, TelegramUploadMode, HistoryEndSignal, ScannedTelegramMedia tách bạch danh tính
+    │   │   │   ├── HistoryPaginationEngine.kt # Bộ phân trang thuần cho đồng bộ tiến có con trỏ nối tiếp & backfill bảo toàn
     │   │   │   ├── TelegramPolicyGuard.kt# Chặn hàm Delete* trên Telegram, phân loại đích, tính buffer FLOOD_WAIT
     │   │   │   └── TdLibManager.kt       # Quản lý client TDLib đơn lệ, single-flight recovery, in-flight map, sendDocumentOriginal & sendMediaHd
     │   │   └── repository/
-    │   │       └── VaultRepository.kt    # Điều phối trung tâm Room <-> MediaStore <-> TdLibManager <-> WorkManager
+    │   │       ├── SyncCoordinator.kt    # Mutex theo từng Topic (chatId, messageThreadId) & TopicSyncUiState hiển thị trên header AlbumDetail
+    │   │       └── VaultRepository.kt    # Điều phối trung tâm Room (@Transaction nguyên tử) <-> MediaStore (quét 1 lần/phiên) <-> TdLibManager <-> WorkManager
     │   ├── worker/
-    │   │   └── TelegramUploadWorker.kt   # Worker upload tuần tự 1 luồng (AS_FILE / HD_MEDIA) + xử lý FLOOD_WAIT động
+    │   │   └── TelegramUploadWorker.kt   # Worker upload tuần tự 1 luồng (AS_FILE / HD_MEDIA) + xử lý FLOOD_WAIT động + merge trùng lặp an toàn
     │   └── ui/
     │       ├── components/               # MediaGridComponents.kt, TelePhotosSurfaces.kt, SyncUploadModeBottomSheet.kt
     │       ├── navigation/TelePhotosApp.kt # Bottom Bar / NavigationRail + điều hướng 4 tab & sub-screens
     │       ├── screens/                  # TimelineScreen, VideosScreen, AlbumsScreen, TrashScreen, SyncStorageScreen, TargetSelectorScreen, TelegramAuthScreen, MediaViewerScreen
     │       ├── theme/                    # Color.kt, Theme.kt, Type.kt
-    │       └── viewmodel/TelePhotosViewModel.kt # StateFlow cho UI, đếm ngược FLOOD_WAIT, xử lý hành động người dùng
+    │       └── viewmodel/TelePhotosViewModel.kt # StateFlow cho UI, topicSyncStates, đếm ngược FLOOD_WAIT, quét MediaStore 1 lần/phiên
     └── test/java/com/laughing/telephotos/
-        ├── ExampleUnitTest.kt            # Unit test cho metadata, policy guard, FLOOD_WAIT động, network retry
-        └── ExampleRobolectricTest.kt     # Robolectric test cho Room v2 & luồng dữ liệu cục bộ
+        ├── ExampleUnitTest.kt            # Unit test cho metadata, policy guard, FLOOD_WAIT động, network retry, HistoryPaginationEngine, SyncCoordinator
+        ├── ExampleRobolectricTest.kt     # Robolectric test cho Room & chọn lô cô lập
+        └── TelePhotosArchitectureTest.kt # Test di trú Room v3->v4, 1.050 tin nối tiếp, crash-recovery, deduplication, transaction & Compose UI AlbumDetail
 ```
 
 ---
@@ -98,18 +102,27 @@ Toàn bộ giao diện người dùng, hộp thoại thông báo và tên chủ 
    - Nếu client đóng bất thường (`AuthorizationStateClosed` khi `isIntentionalShutdown == false`) hoặc lệnh gặp lỗi `"Client is closed"` / `"TDLib chưa sẵn sàng"`, `TdLibManager` tự phục hồi tối đa 1 lần qua `ensureConnected(forceReconnect = true)` (trừ `FLOOD_WAIT` — không bao giờ đóng/kết nối lại khi dính `FLOOD_WAIT`).
 
 ### B. Luồng Đồng bộ Thủ công, Quét Ảnh/Album Có Sẵn & Chống trùng lặp
-1. **Hợp nhất nguồn & Chống trùng lặp:**
-   - `VaultRepository.syncDeviceMediaStore()` quét ảnh/video qua `MediaStoreScanner` và gộp với bảng `media_items` theo `localUri` và `(mediaType, fileName.lowercase(), sizeBytes)`.
-   - Khi quét lịch sử Telegram (`TdLibManager.scanHistoryReadOnly` phân trang `GetForumTopicHistory` / `GetChatHistory`), ứng dụng đọc cả `MessageDocument`, `MessagePhoto` và `MessageVideo` (kể cả ảnh có sẵn trên Telegram trước khi cài app), đối chiếu chống trùng lặp theo `(chatId, messageId)` và prefix SHA-256 (`#h_<16hex>`).
-   - Khi `TelegramUploadWorker` chuẩn bị upload mục có hash tạm `ms_*`, `MediaHashUtil` sao chép URI ra staging file trong `cacheDir` và tính `SHA-256` thật. Nếu `mediaDao.findUploadedByHash(trueHash)` đã tồn tại, mục này được đánh dấu `UPLOADED` ngay lập tức (không upload trùng).
-2. **Phân luồng Album / Forum Topics & Caption Sạch 2 Dòng:**
+1. **Hợp nhất nguồn & Chống trùng lặp (Tách bạch Danh tính Nội dung vs. Danh tính Tin nhắn Telegram):**
+   - `MediaEntity` (Room v4) tách bạch hoàn toàn các định danh:
+     - `(telegramChatId, telegramMessageId)` là cặp khoá duy nhất thực sự của tin nhắn Telegram (`@Index(unique = true)`, để `NULL` khi chưa gửi — không bao giờ dùng `0L` làm giá trị giả).
+     - `contentHash` (non-unique `@Index`) chỉ lưu mã băm `SHA-256` thật của tệp (hoặc `sampled_<sha256>`), tuyệt đối không nhồi tiền tố `ms_*` hay `tg_*`. Hai tin nhắn Telegram khác nhau chia sẻ cùng một tệp vẫn tồn tại độc lập không bị mất hàng.
+     - `localMediaStoreKey` lưu `"ms_photo_<id>"` / `"ms_video_<id>"`, `telegramFileUniqueId` lưu `remote.uniqueId`, và `shortHashHint` lưu gợi ý `#h_<16hex>` từ caption để ghép nối an toàn với bản cục bộ chưa tải lên.
+   - `VaultRepository.syncDeviceMediaStoreIfNeededForSession()` đảm bảo việc quét `MediaStore` chỉ chạy **tối đa 1 lần mỗi phiên ứng dụng** cho mỗi tab `Ảnh`/`Video` qua truy vấn chiếu nhẹ `MediaDao.getMediaIdentitySummaries()`, vẫn cho phép quét lại ngay khi người dùng bấm nút **Đồng bộ**.
+   - **Đọc cục bộ trước, Đồng bộ tiến có con trỏ nối tiếp (`pendingForwardCursor`) & Tuần tự hoá theo Chủ đề (`SyncCoordinator`):**
+     - Mở tab `Album` hoặc khởi động lại app luôn đọc ngay từ Room cục bộ (**không** tự động quét lịch sử Telegram khi vừa mở màn hình); Telegram chỉ được truy vấn khi người dùng bấm **Đồng bộ**, **Làm mới** hoặc **Tải thêm lịch sử cũ**.
+     - `SyncCoordinator` tuần tự hoá theo từng cặp `(chatId, messageThreadId)` để hai lượt làm mới/backfill cùng chủ đề không bao giờ chạy đè nhau, đồng thời hiển thị thanh tiến trình mảnh và biểu ngữ lỗi kèm nút **"Thử lại"** ngay dưới header của `AlbumDetailScreen`. Mọi ghi nhận batch + cập nhật mốc đều bọc trong `database.withTransaction { ... }`, còn tải thumbnail nhanh (`fetchQuickThumbnailsAfterCommit`) luôn chạy ngoài transaction.
+     - `HistoryPaginationEngine.fetchIncrementalForward()` + `VaultRepository.syncAlbumIncrementalWithPageSource()` quét tối đa 10 trang/lượt (`30` tin/trang, giãn nhịp `250ms`). Nếu còn hơn 300 tin nhắn chưa thấy ở lần chạy hiện tại, hệ thống lưu `pendingForwardCursor` + `pendingForwardHighWaterMark` vào bảng `albums` và giữ nguyên mốc `latestMessageId` đã cam kết (kể cả khi `bumpAlbumLatestMessageId` được gọi từ UploadWorker); lần đồng bộ tiếp theo tự động nối tiếp từ `pendingForwardCursor` xuống thay vì lặp lại 300 tin mới nhất, và chỉ nâng `latestMessageId` khi đã nối liền mạch tới mốc cũ.
+     - `VaultRepository.backfillOlderAlbumHistoryWithPageSource()` + `HistoryPaginationEngine.fetchOlderBackfill()` tải bù thủ công các tin nhắn cũ hơn (`msg.id < oldestMessageId`) theo từng lô nhỏ (`25` tin/trang, tối đa `2` trang, giãn nhịp `250–320ms`). Chỉ khoá vĩnh viễn sang `BackfillState.CONFIRMED_END` khi gặp marker tạo chủ đề/nhóm thực sự (`MessageForumTopicCreated` / `MessageSupergroupChatCreate`); trường hợp gặp lô ngắn/rỗng do giới hạn cache TDLib sẽ đặt `BackfillState.LIKELY_END_RETRYABLE` để người dùng vẫn bấm **"Kiểm tra lại lịch sử cũ hơn"** được (và `MIGRATION_3_4` tự mở khoá các album từng bị đánh dấu `backfillExhausted = 1` ở v3 về `LIKELY_END_RETRYABLE`).
+     - Khi đọc `MessageDocument`, `MessagePhoto` và `MessageVideo`, `TelegramCaptionMetadata.parseFromCaption()` giải mã ngày chụp gốc, loại media (`#t_photo`/`#t_video`), chế độ tải lên (`#m_file`/`#m_hd`), hash (`#h_<16hex>`) và bảo toàn `userCaption` một lần duy nhất (`metadataVersion = 4`, không phản hồi sai emoji đứng riêng) rồi lưu bền vững vào `media_items`; nếu tin nhắn gốc không có thẻ, ứng dụng dùng `msg.date * 1000L` làm ngày hiển thị.
+   - Khi `TelegramUploadWorker` chuẩn bị upload mục chưa có `SHA-256` (`contentHash == null`), `MediaHashUtil` sao chép URI ra staging file trong `cacheDir` và tính `SHA-256` thật. Nếu phát hiện `findUploadedByHash(trueHash)` hoặc `telegramFileUniqueId` đã có trên Telegram, Worker gộp chi tiết cục bộ vào bản ghi đã tải lên và xoá bản nháp trùng trong `db.withTransaction` (tránh tuyệt đối lỗi đụng khoá duy nhất `(telegramChatId, telegramMessageId)`).
+2. **Phân luồng Album / Forum Topics & Dòng chân Metadata Sạch:**
    - Nếu đích là Forum Group, `VaultRepository.resolveUploadDestination()` tự định tuyến: mục đã gán Album (`media.albumId`) -> ưu tiên `album.messageThreadId`; nếu chưa gán -> dùng **Đích tải lên mặc định** (`defaultUploadAlbumId` trong tab `Setting` nếu đã chọn); nếu để mặc định `0L` -> tự định tuyến ảnh vào topic **"Ảnh"** và video vào topic **"Video"** (tạo an toàn qua `topicMutexFor(chatId)` chuẩn hoá dấu tiếng Việt và tự tạo thẻ Album tương ứng để đếm `COUNT(DISTINCT m.id)` ngay lập tức trong tab `Album`).
    - `AlbumDao.observeAlbumsWithCount()` và `MediaDao.observeAlbumPhotos` / `observeAlbumVideos` hiển thị cả hai thẻ chủ đề **"Ảnh"** và **"Video"** bên cạnh các Album tuỳ chỉnh (chỉ ẩn **"Đã Xoá Gần Đây"** xuống thẻ footer thùng rác), khớp cả `albumId` lẫn `topicId`.
    - Nếu đích là Kênh/Nhóm thường (`!isForumEnabled`), `lockSyncTarget` / `syncAlbumsFromTelegram` tự tạo Album đại diện (`messageThreadId = 0L`) để hiển thị toàn bộ ảnh/video trên kênh/nhóm trong tab `Album`.
    - Khi chạm nút **Đồng bộ** (TopAppBar) hoặc biểu tượng **Tải lên** khi đang chọn nhiều mục ở tab `Ảnh` / `Video`, ứng dụng mở `SyncUploadModeBottomSheet` để chọn mới mỗi lần thao tác:
      - **Gửi dạng Tệp (Send as File)** (`TelegramUploadMode.AS_FILE`): gọi `TdLibManager.sendDocumentOriginal()` gửi `TdApi.InputMessageDocument` (`disableContentTypeDetection = true`) không nén, không chuyển mã; giữ nguyên hoàn toàn khả năng xem/đọc trực tuyến tệp `MessageDocument` qua `downloadMediaOnDemand` và `MediaViewerScreen`.
      - **Gửi HD (Send HD)** (`TelegramUploadMode.HD_MEDIA`): đọc kích thước/xoay EXIF/thời lượng thật qua `MediaHashUtil.extractLocalMediaDimensions()` và gọi `TdLibManager.sendMediaHd()` gửi `TdApi.InputMessagePhoto` hoặc `TdApi.InputMessageVideo` (`supportsStreaming = true`) mà không hạ độ phân giải thấp; kết quả `MessagePhoto` / `MessageVideo` được parse đồng nhất qua `messageToSentResult()` / `extractFileFromMessage()` để xem ảnh/video bình thường.
-     - Cả hai chế độ đều đính kèm `InputThumbnail` (`<= 320px`) và caption sạch tối đa 2 dòng từ `TelegramCaptionMetadata.buildCaption()` (không nhúng chuỗi JSON thô), đồng thời giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` nếu rớt mạng để **không gửi trùng tin nhắn**.
+     - Cả hai chế độ đều đính kèm `InputThumbnail` (`<= 320px`) và dòng chân metadata sạch từ `TelegramCaptionMetadata.buildCaption()` (`📅 dd/MM/yyyy HH:mm • #tele_anh #t_photo|#t_video #m_file|#m_hd [#h_<16hex>] [#trash]`), bảo toàn caption tuỳ chỉnh của người dùng phía trên (không nhúng chuỗi JSON thô), đồng thời giữ lại `pendingMessageId` và kiểm tra qua `GetMessage` / `ResendMessages` nếu rớt mạng để **không gửi trùng tin nhắn**.
    - Chế độ đã chọn (`TelegramUploadMode`) được truyền qua `WorkManager` (`KEY_UPLOAD_MODE`) và lưu tạm trong `SettingsPreferences` (`ACTIVE_UPLOAD_BATCH_MODE`) để tự động giữ đúng chế độ nếu lô tải lên bị gián đoạn bởi `FLOOD_WAIT` dài.
    - Giữa các tệp tuần tự có độ trễ chống khoá tài khoản `2.0–3.5 giây` (`uploadPacingMs + random(0..1500ms)`).
 3. **Cô lập Chọn nhiều & Đồng bộ theo Đúng Lựa chọn (`Ảnh` vs `Video`):**
@@ -158,8 +171,8 @@ Hệ thống tách bạch hoàn toàn hai cơ chế này:
 2. **Không tải hàng loạt tự động & Không gắn Firebase:**
    - Không thêm `google-services` / Firebase dependencies vào `app/build.gradle.kts` (CI `.github/workflows/Main.yml` cũng chủ động loại bỏ `google-services`).
    - Không tự động tải tệp gốc từ Telegram khi quét lịch sử (`scanHistoryReadOnly` chỉ tải metadata & thumbnail nhỏ `downloadThumbnailQuick`).
-3. **Bất biến Room Schema v2:**
-   - Giữ nguyên `TelePhotosDatabase` `version = 2` và `MIGRATION_1_2` (`photosThreadId`, `videosThreadId` trong `sync_targets`). Mọi thay đổi schema bắt buộc phải tăng version và viết `Migration` mới.
+3. **Bất biến Room Schema v4:**
+   - Giữ nguyên `TelePhotosDatabase` `MIGRATION_1_2`, `MIGRATION_2_3` và `MIGRATION_3_4` (`version = 4`, `exportSchema = true`). `MIGRATION_3_4` tái tạo `media_items` không mất dữ liệu (chuẩn hoá `telegramMessageId <= 0` thành `NULL`, gộp các cặp trùng `(telegramChatId, telegramMessageId)` trước khi dựng chỉ mục duy nhất, tách tiền tố `ms_` / `tg_u_` / `tg_` ra khỏi `contentHash`), bổ sung các cột con trỏ nối tiếp & trạng thái trên `albums`, và mở khoá `backfillExhausted = 1` cũ thành `LIKELY_END_RETRYABLE`. Mọi thay đổi schema tiếp theo bắt buộc phải tăng version và viết `Migration` mới.
 4. **Ràng buộc Test & Trạng thái UI:**
    - `TelegramConnectionStatus.DISCONNECTED_IDLE.labelVi` phải giữ chuỗi con `"Đã ngắt kết nối"` (được kiểm tra bởi `ExampleUnitTest.kt`).
    - Không dùng `NetworkRetryTracker` (`8s x 2`) cho `FloodWaitException`.

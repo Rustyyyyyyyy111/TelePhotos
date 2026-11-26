@@ -1,0 +1,512 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 4,
+    "identityHash": "cacc4e93b0010a97ee812111d89f77c5",
+    "entities": [
+      {
+        "tableName": "media_items",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `contentHash` TEXT, `localUri` TEXT, `fileName` TEXT NOT NULL, `mimeType` TEXT NOT NULL, `mediaType` TEXT NOT NULL, `sizeBytes` INTEGER NOT NULL, `width` INTEGER NOT NULL, `height` INTEGER NOT NULL, `durationSec` INTEGER NOT NULL, `takenAtEpochMs` INTEGER NOT NULL, `albumId` INTEGER, `topicId` INTEGER, `previousAlbumId` INTEGER, `previousTopicId` INTEGER, `uploadStatus` TEXT NOT NULL, `telegramChatId` INTEGER, `telegramMessageId` INTEGER, `telegramFileId` INTEGER, `telegramRemoteFileId` TEXT, `telegramThumbFileId` INTEGER, `cachedThumbPath` TEXT, `cachedLocalVideoPath` TEXT, `isTrashed` INTEGER NOT NULL, `trashedAtEpochMs` INTEGER, `trashTopicMessageId` INTEGER, `lastError` TEXT, `updatedAtEpochMs` INTEGER NOT NULL, `syncMode` TEXT, `userCaption` TEXT, `localMediaStoreKey` TEXT, `telegramFileUniqueId` TEXT, `shortHashHint` TEXT, `metadataVersion` INTEGER NOT NULL, `metadataParsedAtEpochMs` INTEGER)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "contentHash",
+            "columnName": "contentHash",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "localUri",
+            "columnName": "localUri",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "fileName",
+            "columnName": "fileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mimeType",
+            "columnName": "mimeType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mediaType",
+            "columnName": "mediaType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sizeBytes",
+            "columnName": "sizeBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "width",
+            "columnName": "width",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "height",
+            "columnName": "height",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationSec",
+            "columnName": "durationSec",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "takenAtEpochMs",
+            "columnName": "takenAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "albumId",
+            "columnName": "albumId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "topicId",
+            "columnName": "topicId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "previousAlbumId",
+            "columnName": "previousAlbumId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "previousTopicId",
+            "columnName": "previousTopicId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "uploadStatus",
+            "columnName": "uploadStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "telegramChatId",
+            "columnName": "telegramChatId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "telegramMessageId",
+            "columnName": "telegramMessageId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "telegramFileId",
+            "columnName": "telegramFileId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "telegramRemoteFileId",
+            "columnName": "telegramRemoteFileId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "telegramThumbFileId",
+            "columnName": "telegramThumbFileId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "cachedThumbPath",
+            "columnName": "cachedThumbPath",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cachedLocalVideoPath",
+            "columnName": "cachedLocalVideoPath",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "isTrashed",
+            "columnName": "isTrashed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trashedAtEpochMs",
+            "columnName": "trashedAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "trashTopicMessageId",
+            "columnName": "trashTopicMessageId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastError",
+            "columnName": "lastError",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "updatedAtEpochMs",
+            "columnName": "updatedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "syncMode",
+            "columnName": "syncMode",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "userCaption",
+            "columnName": "userCaption",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "localMediaStoreKey",
+            "columnName": "localMediaStoreKey",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "telegramFileUniqueId",
+            "columnName": "telegramFileUniqueId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "shortHashHint",
+            "columnName": "shortHashHint",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "metadataVersion",
+            "columnName": "metadataVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "metadataParsedAtEpochMs",
+            "columnName": "metadataParsedAtEpochMs",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_media_items_contentHash",
+            "unique": false,
+            "columnNames": [
+              "contentHash"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_contentHash` ON `${TABLE_NAME}` (`contentHash`)"
+          },
+          {
+            "name": "index_media_items_localMediaStoreKey",
+            "unique": false,
+            "columnNames": [
+              "localMediaStoreKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_localMediaStoreKey` ON `${TABLE_NAME}` (`localMediaStoreKey`)"
+          },
+          {
+            "name": "index_media_items_telegramFileUniqueId",
+            "unique": false,
+            "columnNames": [
+              "telegramFileUniqueId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_telegramFileUniqueId` ON `${TABLE_NAME}` (`telegramFileUniqueId`)"
+          },
+          {
+            "name": "index_media_items_shortHashHint",
+            "unique": false,
+            "columnNames": [
+              "shortHashHint"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_shortHashHint` ON `${TABLE_NAME}` (`shortHashHint`)"
+          },
+          {
+            "name": "index_media_items_localUri",
+            "unique": false,
+            "columnNames": [
+              "localUri"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_localUri` ON `${TABLE_NAME}` (`localUri`)"
+          },
+          {
+            "name": "index_media_items_telegramChatId_telegramMessageId",
+            "unique": true,
+            "columnNames": [
+              "telegramChatId",
+              "telegramMessageId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_media_items_telegramChatId_telegramMessageId` ON `${TABLE_NAME}` (`telegramChatId`, `telegramMessageId`)"
+          },
+          {
+            "name": "index_media_items_isTrashed_takenAtEpochMs",
+            "unique": false,
+            "columnNames": [
+              "isTrashed",
+              "takenAtEpochMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_isTrashed_takenAtEpochMs` ON `${TABLE_NAME}` (`isTrashed`, `takenAtEpochMs`)"
+          },
+          {
+            "name": "index_media_items_albumId_isTrashed",
+            "unique": false,
+            "columnNames": [
+              "albumId",
+              "isTrashed"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_albumId_isTrashed` ON `${TABLE_NAME}` (`albumId`, `isTrashed`)"
+          },
+          {
+            "name": "index_media_items_uploadStatus",
+            "unique": false,
+            "columnNames": [
+              "uploadStatus"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_media_items_uploadStatus` ON `${TABLE_NAME}` (`uploadStatus`)"
+          }
+        ]
+      },
+      {
+        "tableName": "albums",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `title` TEXT NOT NULL, `chatId` INTEGER NOT NULL, `messageThreadId` INTEGER NOT NULL, `isTrashTopic` INTEGER NOT NULL, `iconColor` INTEGER NOT NULL, `coverUri` TEXT, `createdAtEpochMs` INTEGER NOT NULL, `latestMessageId` INTEGER NOT NULL, `oldestMessageId` INTEGER NOT NULL, `backfillExhausted` INTEGER NOT NULL, `lastSyncedAtEpochMs` INTEGER NOT NULL, `pendingForwardCursor` INTEGER NOT NULL, `pendingForwardHighWaterMark` INTEGER NOT NULL, `backfillState` TEXT NOT NULL, `syncStatus` TEXT NOT NULL, `lastSyncError` TEXT, `lastBackfillAtEpochMs` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chatId",
+            "columnName": "chatId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageThreadId",
+            "columnName": "messageThreadId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isTrashTopic",
+            "columnName": "isTrashTopic",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "iconColor",
+            "columnName": "iconColor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "coverUri",
+            "columnName": "coverUri",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "createdAtEpochMs",
+            "columnName": "createdAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "latestMessageId",
+            "columnName": "latestMessageId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "oldestMessageId",
+            "columnName": "oldestMessageId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "backfillExhausted",
+            "columnName": "backfillExhausted",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSyncedAtEpochMs",
+            "columnName": "lastSyncedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pendingForwardCursor",
+            "columnName": "pendingForwardCursor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pendingForwardHighWaterMark",
+            "columnName": "pendingForwardHighWaterMark",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "backfillState",
+            "columnName": "backfillState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "syncStatus",
+            "columnName": "syncStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSyncError",
+            "columnName": "lastSyncError",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastBackfillAtEpochMs",
+            "columnName": "lastBackfillAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_albums_chatId_messageThreadId",
+            "unique": true,
+            "columnNames": [
+              "chatId",
+              "messageThreadId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_albums_chatId_messageThreadId` ON `${TABLE_NAME}` (`chatId`, `messageThreadId`)"
+          },
+          {
+            "name": "index_albums_isTrashTopic",
+            "unique": false,
+            "columnNames": [
+              "isTrashTopic"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_albums_isTrashTopic` ON `${TABLE_NAME}` (`isTrashTopic`)"
+          }
+        ]
+      },
+      {
+        "tableName": "sync_targets",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER NOT NULL, `chatId` INTEGER NOT NULL, `chatTitle` TEXT NOT NULL, `targetType` TEXT NOT NULL, `isForumEnabled` INTEGER NOT NULL, `defaultMessageThreadId` INTEGER, `photosThreadId` INTEGER, `videosThreadId` INTEGER, `trashThreadId` INTEGER, `isLocked` INTEGER NOT NULL, `confirmedAtEpochMs` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chatId",
+            "columnName": "chatId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "chatTitle",
+            "columnName": "chatTitle",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetType",
+            "columnName": "targetType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isForumEnabled",
+            "columnName": "isForumEnabled",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "defaultMessageThreadId",
+            "columnName": "defaultMessageThreadId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "photosThreadId",
+            "columnName": "photosThreadId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "videosThreadId",
+            "columnName": "videosThreadId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "trashThreadId",
+            "columnName": "trashThreadId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "isLocked",
+            "columnName": "isLocked",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "confirmedAtEpochMs",
+            "columnName": "confirmedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'cacc4e93b0010a97ee812111d89f77c5')"
+    ]
+  }
+}

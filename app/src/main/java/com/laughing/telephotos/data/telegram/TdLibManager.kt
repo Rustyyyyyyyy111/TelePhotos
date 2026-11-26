@@ -1231,6 +1231,7 @@ class TdLibManager(
           remoteFileId = doc?.document?.remote?.id,
           messageThreadId = resolvedTopicId,
           thumbFileId = doc?.thumbnail?.file?.id,
+          fileUniqueId = doc?.document?.remote?.uniqueId?.takeIf { it.isNotBlank() },
         )
       }
       is TdApi.MessagePhoto -> {
@@ -1247,6 +1248,7 @@ class TdLibManager(
           remoteFileId = largest?.photo?.remote?.id,
           messageThreadId = resolvedTopicId,
           thumbFileId = compactThumb?.photo?.id ?: largest?.photo?.id,
+          fileUniqueId = largest?.photo?.remote?.uniqueId?.takeIf { it.isNotBlank() },
         )
       }
       is TdApi.MessageVideo -> {
@@ -1258,6 +1260,7 @@ class TdLibManager(
           remoteFileId = video?.video?.remote?.id,
           messageThreadId = resolvedTopicId,
           thumbFileId = video?.thumbnail?.file?.id,
+          fileUniqueId = video?.video?.remote?.uniqueId?.takeIf { it.isNotBlank() },
         )
       }
       else -> SentDocumentResult(
@@ -1267,6 +1270,7 @@ class TdLibManager(
         remoteFileId = null,
         messageThreadId = resolvedTopicId,
         thumbFileId = null,
+        fileUniqueId = null,
       )
     }
   }
@@ -1387,174 +1391,271 @@ class TdLibManager(
   suspend fun scanHistoryReadOnly(
     chatId: Long,
     messageThreadId: Long? = null,
-    limit: Int = 60,
+    limit: Int = 50,
   ): List<ScannedTelegramMedia> {
+    val safePageSize = limit.coerceIn(15, 25)
+    val pages = ((limit + safePageSize - 1) / safePageSize).coerceIn(1, 2)
+    return scanIncrementalHistory(
+      chatId = chatId,
+      messageThreadId = messageThreadId,
+      sinceMessageId = 0L,
+      maxPages = pages,
+      pageSize = safePageSize,
+      pageDelayMs = 250L,
+    ).items
+  }
+
+  /**
+   * Incremental forward history scan:
+   * - Fetches newest-to-oldest from `startFromMessageId` (0L for head, or pendingForwardCursor to resume).
+   * - Stops immediately upon reaching `msg.id <= sinceMessageId` (`hitKnownCheckpoint = true`) and
+   *   never advances the committed checkpoint unless contiguously bridged down to `sinceMessageId`.
+   */
+  suspend fun scanIncrementalHistory(
+    chatId: Long,
+    messageThreadId: Long? = null,
+    sinceMessageId: Long = 0L,
+    startFromMessageId: Long = 0L,
+    maxPages: Int = 10,
+    pageSize: Int = 30,
+    pageDelayMs: Long = 250L,
+  ): HistoryScanPageResult {
     if (!isSessionReady()) {
       ensureConnected().getOrThrow()
     }
-
-    val targetLimit = limit.coerceIn(1, 200)
-    val collected = mutableListOf<TdApi.Message>()
-    val seenMsgIds = HashSet<Long>()
-    var fromMessageId = 0L
-    var pageAttempts = 0
-
-    while (collected.size < targetLimit && pageAttempts < 5) {
-      pageAttempts++
-      val batchSize = (targetLimit - collected.size).coerceIn(20, 50)
-      val messagesObj = if (messageThreadId != null && messageThreadId != 0L) {
-        sendFunction(TdApi.GetForumTopicHistory(chatId, messageThreadId.toInt(), fromMessageId, 0, batchSize))
-      } else {
-        sendFunction(TdApi.GetChatHistory(chatId, fromMessageId, 0, batchSize, false))
-      } as? TdApi.Messages ?: break
-
-      val batch = messagesObj.messages ?: break
-      if (batch.isEmpty()) break
-
-      var addedInBatch = 0
-      for (msg in batch) {
-        if (seenMsgIds.add(msg.id)) {
-          collected.add(msg)
-          addedInBatch++
-        }
-      }
-
-      val oldestId = batch.last().id
-      if (oldestId == 0L || oldestId == fromMessageId || addedInBatch == 0) {
-        break
-      }
-      fromMessageId = oldestId
-      if (collected.size < targetLimit) {
-        delay(80L)
-      }
+    return HistoryPaginationEngine.fetchIncrementalForward(
+      sinceMessageId = sinceMessageId,
+      startFromMessageId = startFromMessageId,
+      maxPages = maxPages,
+      pageSize = pageSize,
+      pageDelayMs = pageDelayMs,
+    ) { fromMessageId, limit ->
+      fetchRawHistoryBatch(
+        chatId = chatId,
+        messageThreadId = messageThreadId,
+        fromMessageId = fromMessageId,
+        limit = limit,
+      )
     }
-
-    val scanned = mutableListOf<ScannedTelegramMedia>()
-    for (msg in collected) {
-      val msgTopicId = (msg.topicId as? TdApi.MessageTopicForum)?.forumTopicId?.toLong()
-        ?: messageThreadId?.takeIf { it != 0L }
-
-      when (val content = msg.content) {
-        is TdApi.MessageDocument -> {
-          val doc = content.document
-          val captionText = content.caption?.text
-          val parsed = TelegramCaptionMetadata.parseFromCaption(captionText)
-          val rawFileName = doc.fileName?.takeIf { it.isNotBlank() }
-            ?: parsed?.fileName?.takeIf { it.isNotBlank() }
-            ?: "TG_Doc_${msg.id}"
-          val mime = doc.mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
-          val isVideoExt = rawFileName.substringAfterLast('.', "").lowercase() in setOf(
-            "mp4", "mov", "mkv", "webm", "3gp", "avi", "m4v"
-          )
-          val mediaType = when {
-            mime.startsWith("video/", ignoreCase = true) || isVideoExt -> MediaType.VIDEO
-            parsed?.mediaKind == "VIDEO" -> MediaType.VIDEO
-            else -> MediaType.PHOTO
-          }
-          val fallbackHash = doc.document.remote?.uniqueId?.takeIf { it.isNotBlank() }
-            ?.let { "tg_u_$it" }
-            ?: "tg_${msg.chatId}_${msg.id}"
-          val directSize = doc.document.size.takeIf { it > 0L }
-            ?: doc.document.expectedSize.takeIf { it > 0L }
-            ?: (parsed?.sizeBytes ?: 0L)
-
-          scanned.add(
-            ScannedTelegramMedia(
-              contentHash = parsed?.contentHash?.takeIf { it.isNotBlank() } ?: fallbackHash,
-              chatId = msg.chatId,
-              messageId = msg.id,
-              topicId = msgTopicId ?: parsed?.topicId,
-              fileId = doc.document.id,
-              remoteFileId = doc.document.remote?.id,
-              thumbFileId = doc.thumbnail?.file?.id,
-              fileName = rawFileName,
-              mimeType = mime,
-              mediaType = mediaType,
-              sizeBytes = directSize,
-              durationSec = parsed?.durationSec ?: 0,
-              takenAtEpochMs = parsed?.takenAtEpochMs?.takeIf { it > 0L } ?: (msg.date * 1000L),
-              isTrashed = parsed?.isTrashed ?: false,
-            )
-          )
-        }
-
-        is TdApi.MessagePhoto -> {
-          val sizes = content.photo.sizes ?: continue
-          val largest = sizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: continue
-          val compactThumb = sizes
-            .filter { maxOf(it.width, it.height) in 90..360 }
-            .minByOrNull { it.width.toLong() * it.height.toLong() }
-            ?: sizes.minByOrNull { it.width.toLong() * it.height.toLong() }
-          val captionText = content.caption?.text
-          val parsed = TelegramCaptionMetadata.parseFromCaption(captionText)
-          val fallbackName = "TG_Photo_${msg.id}.jpg"
-          val resolvedName = parsed?.fileName?.takeIf { it.isNotBlank() }
-            ?: TelegramCaptionMetadata.extractReadableTitle(captionText, fallbackName)
-          val fallbackHash = largest.photo.remote?.uniqueId?.takeIf { it.isNotBlank() }
-            ?.let { "tg_u_$it" }
-            ?: "tg_photo_${msg.chatId}_${msg.id}"
-          val sizeBytes = largest.photo.size.takeIf { it > 0L }
-            ?: largest.photo.expectedSize.coerceAtLeast(0L)
-
-          scanned.add(
-            ScannedTelegramMedia(
-              contentHash = parsed?.contentHash?.takeIf { it.isNotBlank() } ?: fallbackHash,
-              chatId = msg.chatId,
-              messageId = msg.id,
-              topicId = msgTopicId ?: parsed?.topicId,
-              fileId = largest.photo.id,
-              remoteFileId = largest.photo.remote?.id,
-              thumbFileId = compactThumb?.photo?.id ?: largest.photo.id,
-              fileName = resolvedName,
-              mimeType = "image/jpeg",
-              mediaType = MediaType.PHOTO,
-              sizeBytes = sizeBytes,
-              durationSec = 0,
-              takenAtEpochMs = parsed?.takenAtEpochMs?.takeIf { it > 0L } ?: (msg.date * 1000L),
-              isTrashed = parsed?.isTrashed ?: false,
-            )
-          )
-        }
-
-        is TdApi.MessageVideo -> {
-          val video = content.video
-          val captionText = content.caption?.text
-          val parsed = TelegramCaptionMetadata.parseFromCaption(captionText)
-          val fallbackName = "TG_Video_${msg.id}.mp4"
-          val resolvedName = video.fileName?.takeIf { it.isNotBlank() }
-            ?: parsed?.fileName?.takeIf { it.isNotBlank() }
-            ?: TelegramCaptionMetadata.extractReadableTitle(captionText, fallbackName)
-          val fallbackHash = video.video.remote?.uniqueId?.takeIf { it.isNotBlank() }
-            ?.let { "tg_u_$it" }
-            ?: "tg_video_${msg.chatId}_${msg.id}"
-          val sizeBytes = video.video.size.takeIf { it > 0L }
-            ?: video.video.expectedSize.coerceAtLeast(0L)
-
-          scanned.add(
-            ScannedTelegramMedia(
-              contentHash = parsed?.contentHash?.takeIf { it.isNotBlank() } ?: fallbackHash,
-              chatId = msg.chatId,
-              messageId = msg.id,
-              topicId = msgTopicId ?: parsed?.topicId,
-              fileId = video.video.id,
-              remoteFileId = video.video.remote?.id,
-              thumbFileId = video.thumbnail?.file?.id,
-              fileName = resolvedName,
-              mimeType = video.mimeType?.takeIf { it.isNotBlank() } ?: "video/mp4",
-              mediaType = MediaType.VIDEO,
-              sizeBytes = sizeBytes,
-              durationSec = video.duration.coerceAtLeast(0),
-              takenAtEpochMs = parsed?.takenAtEpochMs?.takeIf { it > 0L } ?: (msg.date * 1000L),
-              isTrashed = parsed?.isTrashed ?: false,
-            )
-          )
-        }
-
-        else -> Unit
-      }
-    }
-    return scanned
   }
+
+  /**
+   * Manual paced backfill for older messages strictly before `beforeMessageId`.
+   * Never marks history exhausted solely on a short locally cached page (`batch.size < pageSize`).
+   */
+  suspend fun scanOlderHistoryBackfill(
+    chatId: Long,
+    messageThreadId: Long? = null,
+    beforeMessageId: Long,
+    maxPages: Int = 2,
+    pageSize: Int = 25,
+    pageDelayMs: Long = 350L,
+  ): HistoryScanPageResult {
+    if (!isSessionReady()) {
+      ensureConnected().getOrThrow()
+    }
+    return HistoryPaginationEngine.fetchOlderBackfill(
+      beforeMessageId = beforeMessageId,
+      maxPages = maxPages,
+      pageSize = pageSize,
+      pageDelayMs = pageDelayMs,
+    ) { fromMessageId, limit ->
+      fetchRawHistoryBatch(
+        chatId = chatId,
+        messageThreadId = messageThreadId,
+        fromMessageId = fromMessageId,
+        limit = limit,
+      )
+    }
+  }
+
+  internal suspend fun fetchRawHistoryBatch(
+    chatId: Long,
+    messageThreadId: Long?,
+    fromMessageId: Long,
+    limit: Int,
+  ): List<HistoryRawMessage> {
+    val messagesObj = if (messageThreadId != null && messageThreadId != 0L) {
+      sendFunction(TdApi.GetForumTopicHistory(chatId, messageThreadId.toInt(), fromMessageId, 0, limit))
+    } else {
+      sendFunction(TdApi.GetChatHistory(chatId, fromMessageId, 0, limit, false))
+    } as? TdApi.Messages ?: return emptyList()
+
+    val batch = messagesObj.messages ?: return emptyList()
+    return batch.map { msg ->
+      val contentName = msg.content?.javaClass?.simpleName.orEmpty()
+      val isCreation = contentName in CREATION_MESSAGE_CLASS_NAMES
+      HistoryRawMessage(
+        messageId = msg.id,
+        isCreationMarker = isCreation,
+        media = parseTelegramMessageToMedia(msg, messageThreadId),
+      )
+    }
+  }
+
+  private fun parseTelegramMessageToMedia(
+    msg: TdApi.Message,
+    fallbackTopicId: Long?,
+  ): ScannedTelegramMedia? {
+    val msgTopicId = (msg.topicId as? TdApi.MessageTopicForum)?.forumTopicId?.toLong()
+      ?: fallbackTopicId?.takeIf { it != 0L }
+
+    return when (val content = msg.content) {
+      is TdApi.MessageDocument -> {
+        val doc = content.document
+        val captionText = content.caption?.text
+        val parsed = TelegramCaptionMetadata.parseFromCaption(captionText)
+        val rawFileName = doc.fileName?.takeIf { it.isNotBlank() }
+          ?: parsed?.fileName?.takeIf { it.isNotBlank() }
+          ?: "TG_Doc_${msg.id}"
+        val mime = doc.mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        val isVideoExt = rawFileName.substringAfterLast('.', "").lowercase() in setOf(
+          "mp4", "mov", "mkv", "webm", "3gp", "avi", "m4v"
+        )
+        val mediaType = when {
+          mime.startsWith("video/", ignoreCase = true) || isVideoExt -> MediaType.VIDEO
+          parsed?.mediaKind == "VIDEO" -> MediaType.VIDEO
+          else -> MediaType.PHOTO
+        }
+        val remoteUniqueId = doc.document.remote?.uniqueId?.takeIf { it.isNotBlank() }
+        val rawParsedHash = parsed?.contentHash?.trim()?.takeIf {
+          it.isNotBlank() && !it.startsWith("ms_") && !it.startsWith("tg_")
+        }
+        val fullHash = rawParsedHash?.takeIf {
+          (it.startsWith("sampled_") && it.length >= 32) || (!it.startsWith("sampled_") && it.length >= 32)
+        }
+        val shortHint = rawParsedHash?.take(16)?.takeIf { it.length >= 6 }
+        val directSize = doc.document.size.takeIf { it > 0L }
+          ?: doc.document.expectedSize.takeIf { it > 0L }
+          ?: (parsed?.sizeBytes ?: 0L)
+        val preservedUserCaption = parsed?.userCaption
+          ?: captionText?.trim()?.takeIf { parsed == null && it.isNotBlank() }
+
+        ScannedTelegramMedia(
+          chatId = msg.chatId,
+          messageId = msg.id,
+          topicId = msgTopicId ?: parsed?.topicId,
+          fileId = doc.document.id,
+          remoteFileId = doc.document.remote?.id,
+          telegramFileUniqueId = remoteUniqueId,
+          thumbFileId = doc.thumbnail?.file?.id,
+          fileName = rawFileName,
+          mimeType = mime,
+          mediaType = mediaType,
+          sizeBytes = directSize,
+          durationSec = parsed?.durationSec ?: 0,
+          takenAtEpochMs = parsed?.takenAtEpochMs?.takeIf { it > 0L } ?: (msg.date * 1000L),
+          isTrashed = parsed?.isTrashed ?: false,
+          fullContentHash = fullHash,
+          shortHashHint = shortHint,
+          syncMode = parsed?.syncMode,
+          userCaption = preservedUserCaption,
+          metadataVersion = if (parsed != null) TelegramCaptionMetadata.CURRENT_METADATA_VERSION else 0,
+        )
+      }
+
+      is TdApi.MessagePhoto -> {
+        val sizes = content.photo.sizes ?: return null
+        val largest = sizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: return null
+        val compactThumb = sizes
+          .filter { maxOf(it.width, it.height) in 90..360 }
+          .minByOrNull { it.width.toLong() * it.height.toLong() }
+          ?: sizes.minByOrNull { it.width.toLong() * it.height.toLong() }
+        val captionText = content.caption?.text
+        val parsed = TelegramCaptionMetadata.parseFromCaption(captionText)
+        val fallbackName = "TG_Photo_${msg.id}.jpg"
+        val resolvedName = parsed?.fileName?.takeIf { it.isNotBlank() }
+          ?: TelegramCaptionMetadata.extractReadableTitle(captionText, fallbackName)
+        val remoteUniqueId = largest.photo.remote?.uniqueId?.takeIf { it.isNotBlank() }
+        val rawParsedHash = parsed?.contentHash?.trim()?.takeIf {
+          it.isNotBlank() && !it.startsWith("ms_") && !it.startsWith("tg_")
+        }
+        val fullHash = rawParsedHash?.takeIf {
+          (it.startsWith("sampled_") && it.length >= 32) || (!it.startsWith("sampled_") && it.length >= 32)
+        }
+        val shortHint = rawParsedHash?.take(16)?.takeIf { it.length >= 6 }
+        val sizeBytes = largest.photo.size.takeIf { it > 0L }
+          ?: largest.photo.expectedSize.coerceAtLeast(0L)
+        val preservedUserCaption = parsed?.userCaption
+          ?: captionText?.trim()?.takeIf { parsed == null && it.isNotBlank() }
+
+        ScannedTelegramMedia(
+          chatId = msg.chatId,
+          messageId = msg.id,
+          topicId = msgTopicId ?: parsed?.topicId,
+          fileId = largest.photo.id,
+          remoteFileId = largest.photo.remote?.id,
+          telegramFileUniqueId = remoteUniqueId,
+          thumbFileId = compactThumb?.photo?.id ?: largest.photo.id,
+          fileName = resolvedName,
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = sizeBytes,
+          durationSec = 0,
+          takenAtEpochMs = parsed?.takenAtEpochMs?.takeIf { it > 0L } ?: (msg.date * 1000L),
+          isTrashed = parsed?.isTrashed ?: false,
+          fullContentHash = fullHash,
+          shortHashHint = shortHint,
+          syncMode = parsed?.syncMode,
+          userCaption = preservedUserCaption,
+          metadataVersion = if (parsed != null) TelegramCaptionMetadata.CURRENT_METADATA_VERSION else 0,
+        )
+      }
+
+      is TdApi.MessageVideo -> {
+        val video = content.video
+        val captionText = content.caption?.text
+        val parsed = TelegramCaptionMetadata.parseFromCaption(captionText)
+        val fallbackName = "TG_Video_${msg.id}.mp4"
+        val resolvedName = video.fileName?.takeIf { it.isNotBlank() }
+          ?: parsed?.fileName?.takeIf { it.isNotBlank() }
+          ?: TelegramCaptionMetadata.extractReadableTitle(captionText, fallbackName)
+        val remoteUniqueId = video.video.remote?.uniqueId?.takeIf { it.isNotBlank() }
+        val rawParsedHash = parsed?.contentHash?.trim()?.takeIf {
+          it.isNotBlank() && !it.startsWith("ms_") && !it.startsWith("tg_")
+        }
+        val fullHash = rawParsedHash?.takeIf {
+          (it.startsWith("sampled_") && it.length >= 32) || (!it.startsWith("sampled_") && it.length >= 32)
+        }
+        val shortHint = rawParsedHash?.take(16)?.takeIf { it.length >= 6 }
+        val sizeBytes = video.video.size.takeIf { it > 0L }
+          ?: video.video.expectedSize.coerceAtLeast(0L)
+        val preservedUserCaption = parsed?.userCaption
+          ?: captionText?.trim()?.takeIf { parsed == null && it.isNotBlank() }
+
+        ScannedTelegramMedia(
+          chatId = msg.chatId,
+          messageId = msg.id,
+          topicId = msgTopicId ?: parsed?.topicId,
+          fileId = video.video.id,
+          remoteFileId = video.video.remote?.id,
+          telegramFileUniqueId = remoteUniqueId,
+          thumbFileId = video.thumbnail?.file?.id,
+          fileName = resolvedName,
+          mimeType = video.mimeType?.takeIf { it.isNotBlank() } ?: "video/mp4",
+          mediaType = MediaType.VIDEO,
+          sizeBytes = sizeBytes,
+          durationSec = video.duration.coerceAtLeast(0),
+          takenAtEpochMs = parsed?.takenAtEpochMs?.takeIf { it > 0L } ?: (msg.date * 1000L),
+          isTrashed = parsed?.isTrashed ?: false,
+          fullContentHash = fullHash,
+          shortHashHint = shortHint,
+          syncMode = parsed?.syncMode,
+          userCaption = preservedUserCaption,
+          metadataVersion = if (parsed != null) TelegramCaptionMetadata.CURRENT_METADATA_VERSION else 0,
+        )
+      }
+
+      else -> null
+    }
+  }
+
+  private val CREATION_MESSAGE_CLASS_NAMES = setOf(
+    "MessageForumTopicCreated",
+    "MessageBasicGroupChatCreate",
+    "MessageSupergroupChatCreate",
+    "MessageChatUpgradeFrom",
+  )
 
   /**
    * Quickly fetches a tiny (~15KB) Telegram document/photo preview thumbnail synchronously while a

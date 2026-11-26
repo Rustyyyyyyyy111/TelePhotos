@@ -24,19 +24,27 @@ import com.laughing.telephotos.core.NetworkRetryPolicy
 import com.laughing.telephotos.core.SettingsPreferences
 import com.laughing.telephotos.core.TelegramCaptionMetadata
 import com.laughing.telephotos.core.TelegramCaptionPayload
+import androidx.room.withTransaction
 import com.laughing.telephotos.data.local.AlbumDao
 import com.laughing.telephotos.data.local.AlbumEntity
+import com.laughing.telephotos.data.local.AlbumSyncStatus
 import com.laughing.telephotos.data.local.AlbumWithCount
+import com.laughing.telephotos.data.local.BackfillState
 import com.laughing.telephotos.data.local.MediaDao
 import com.laughing.telephotos.data.local.MediaEntity
+import com.laughing.telephotos.data.local.MediaIdentitySummary
 import com.laughing.telephotos.data.local.MediaType
 import com.laughing.telephotos.data.local.StorageStats
 import com.laughing.telephotos.data.local.SyncTargetDao
 import com.laughing.telephotos.data.local.SyncTargetEntity
+import com.laughing.telephotos.data.local.TelePhotosDatabase
 import com.laughing.telephotos.data.local.UploadStatus
 import com.laughing.telephotos.data.telegram.FileDownloadProgress
 import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.FloodWaitState
+import com.laughing.telephotos.data.telegram.HistoryEndSignal
+import com.laughing.telephotos.data.telegram.HistoryPaginationEngine
+import com.laughing.telephotos.data.telegram.HistoryRawMessage
 import com.laughing.telephotos.data.telegram.ScannedTelegramMedia
 import com.laughing.telephotos.data.telegram.TdLibLifecycleState
 import com.laughing.telephotos.data.telegram.TdLibManager
@@ -97,23 +105,35 @@ data class PreparedUploadBatch(
   val pendingCount: Int,
 )
 
+data class BackfillHistoryResult(
+  val fetchedCount: Int,
+  val addedCount: Int,
+  val reachedHistoryEnd: Boolean,
+  val backfillState: BackfillState = if (reachedHistoryEnd) BackfillState.CONFIRMED_END else BackfillState.HAS_MORE,
+)
+
 class VaultRepository(
   private val context: Context,
+  private val database: TelePhotosDatabase? = null,
   private val mediaDao: MediaDao,
   private val albumDao: AlbumDao,
   private val syncTargetDao: SyncTargetDao,
   private val tdLibManager: TdLibManager,
   private val settingsPreferences: SettingsPreferences,
   private val networkAlertCoordinator: NetworkAlertCoordinator = NetworkAlertCoordinator(),
+  private val syncCoordinator: SyncCoordinator = SyncCoordinator(),
 ) {
 
   private val mediaStoreScanMutex = Mutex()
+  @Volatile private var hasScannedDevicePhotosInSession = false
+  @Volatile private var hasScannedDeviceVideosInSession = false
 
   val authState: StateFlow<TelegramAuthState> = tdLibManager.authState
   val connectionStatus: StateFlow<TelegramConnectionStatus> = tdLibManager.connectionStatus
   val lifecycleState: StateFlow<TdLibLifecycleState> = tdLibManager.lifecycleState
   val floodWaitState: StateFlow<FloodWaitState?> = tdLibManager.floodWaitState
   val networkInterruptionAlert: StateFlow<NetworkInterruptionAlert?> = networkAlertCoordinator.activeAlert
+  val topicSyncStates: StateFlow<Map<TopicSyncKey, TopicSyncUiState>> = syncCoordinator.topicStates
   val photosTimelineFlow: Flow<List<MediaEntity>> = mediaDao.observePhotosTimeline()
   val videosTimelineFlow: Flow<List<MediaEntity>> = mediaDao.observeVideosTimeline()
   val trashedMediaFlow: Flow<List<MediaEntity>> = mediaDao.observeTrashedMedia()
@@ -121,6 +141,15 @@ class VaultRepository(
   val uploadQueueFlow: Flow<List<MediaEntity>> = mediaDao.observeUploadQueue()
   val storageStatsFlow: Flow<StorageStats> = mediaDao.observeStorageStats()
   val lockedTargetFlow: Flow<SyncTargetEntity?> = syncTargetDao.observeTarget()
+
+  private suspend fun <T> runInTransaction(block: suspend () -> T): T {
+    val db = database
+    return if (db != null) db.withTransaction { block() } else block()
+  }
+
+  suspend fun resetStaleTopicSyncStatuses() {
+    albumDao.resetStaleSyncStatuses()
+  }
 
   fun dismissNetworkInterruptionAlert() {
     networkAlertCoordinator.dismissAlert()
@@ -130,7 +159,7 @@ class VaultRepository(
     networkAlertCoordinator.reportFinalFailure(type)
   }
 
-  val manualSyncProgressFlow: Flow<ManualSyncProgressState> =
+  val manualSyncProgressFlow: Flow<ManualSyncProgressState> by lazy {
     WorkManager.getInstance(context)
       .getWorkInfosForUniqueWorkFlow(TelegramUploadWorker.UNIQUE_WORK_NAME)
       .map { infos ->
@@ -149,6 +178,7 @@ class VaultRepository(
           )
         }
       }
+  }
 
   fun observeAlbum(albumId: Long): Flow<AlbumEntity?> = albumDao.observeAlbum(albumId)
 
@@ -184,10 +214,14 @@ class VaultRepository(
       }
 
       val meta = runCatching { MediaHashUtil.extractAndHash(context, uri) }.getOrNull() ?: continue
-      val existing = mediaDao.findByHash(meta.contentHash)
+      val uriString = uri.toString()
+      val existing = mediaDao.findByHash(meta.contentHash) ?: mediaDao.findByLocalUri(uriString)
       if (existing != null) {
         if (existing.localUri == null) {
-          mediaDao.upsert(existing.copy(localUri = uri.toString()))
+          mediaDao.updateLocalUri(existing.id, uriString)
+        }
+        if (existing.contentHash.isNullOrBlank()) {
+          mediaDao.updateContentHash(existing.id, meta.contentHash)
         }
         duplicates++
         continue
@@ -196,7 +230,8 @@ class VaultRepository(
       val status = if (lockedTarget != null) UploadStatus.QUEUED else UploadStatus.LOCAL_ONLY
       val entity = MediaEntity(
         contentHash = meta.contentHash,
-        localUri = uri.toString(),
+        shortHashHint = meta.contentHash.take(16),
+        localUri = uriString,
         fileName = meta.fileName,
         mimeType = meta.mimeType,
         mediaType = meta.mediaType,
@@ -217,26 +252,51 @@ class VaultRepository(
   }
 
   /**
-   * Scans device MediaStore (Images & Videos) and merges with existing Room / Telegram items.
-   * Deduplicates by localUri first and by (fileName, sizeBytes, mediaType) second so
-   * Telegram-synced items and local items never appear twice.
+   * Scans MediaStore at most once per app session per MediaType when entering tabs.
+   * Manual Sync triggers pass force = true via syncDeviceMediaStore(...).
+   */
+  suspend fun syncDeviceMediaStoreIfNeededForSession(mediaType: MediaType): ImportSummary? {
+    val alreadyScanned = when (mediaType) {
+      MediaType.PHOTO -> hasScannedDevicePhotosInSession
+      MediaType.VIDEO -> hasScannedDeviceVideosInSession
+    }
+    if (alreadyScanned) return null
+    return syncDeviceMediaStore(
+      scanPhotos = mediaType == MediaType.PHOTO,
+      scanVideos = mediaType == MediaType.VIDEO,
+      force = false,
+    )
+  }
+
+  /**
+   * Scans device MediaStore (Images & Videos) and merges with existing Room / Telegram items
+   * using lightweight MediaIdentitySummary projections (never loading full entity rows).
    */
   suspend fun syncDeviceMediaStore(
     scanPhotos: Boolean = true,
     scanVideos: Boolean = true,
+    force: Boolean = true,
   ): ImportSummary = mediaStoreScanMutex.withLock {
+    if (!force) {
+      val needPhotos = scanPhotos && !hasScannedDevicePhotosInSession
+      val needVideos = scanVideos && !hasScannedDeviceVideosInSession
+      if (!needPhotos && !needVideos) {
+        return@withLock ImportSummary(0, 0)
+      }
+    }
+
     val deviceEntries = buildList {
       if (scanPhotos) addAll(MediaStoreScanner.scanDeviceImages(context))
       if (scanVideos) addAll(MediaStoreScanner.scanDeviceVideos(context))
     }
 
-    val existingAll = mediaDao.getAllMediaSnapshot()
-    val byLocalUri = HashMap<String, MediaEntity>(existingAll.size)
-    val byNameAndSize = HashMap<String, MutableList<MediaEntity>>(existingAll.size)
-    val knownHashes = HashSet<String>(existingAll.size)
+    val existingAll = mediaDao.getMediaIdentitySummaries()
+    val byLocalUri = HashMap<String, MediaIdentitySummary>(existingAll.size)
+    val byNameAndSize = HashMap<String, MutableList<MediaIdentitySummary>>(existingAll.size)
+    val knownMsKeys = HashSet<String>(existingAll.size)
 
     for (item in existingAll) {
-      knownHashes.add(item.contentHash)
+      item.localMediaStoreKey?.let { knownMsKeys.add(it) }
       item.localUri?.let { byLocalUri[it] = item }
       if (item.sizeBytes > 0L) {
         val key = "${item.mediaType.name}|${item.fileName.lowercase()}|${item.sizeBytes}"
@@ -261,32 +321,42 @@ class VaultRepository(
       }
 
       if (mergeTarget != null) {
-        val updated = mergeTarget.copy(
-          localUri = entry.contentUri,
-          width = if (mergeTarget.width == 0) entry.width else mergeTarget.width,
-          height = if (mergeTarget.height == 0) entry.height else mergeTarget.height,
-          durationSec = if (mergeTarget.durationSec == 0) entry.durationSec else mergeTarget.durationSec,
-          updatedAtEpochMs = System.currentTimeMillis(),
-        )
-        mediaDao.upsert(updated)
-        byLocalUri[entry.contentUri] = updated
-        val bucket = byNameAndSize[matchKey]
-        if (bucket != null) {
-          val idx = bucket.indexOfFirst { it.id == mergeTarget.id }
-          if (idx >= 0) bucket[idx] = updated
+        val fullTarget = mediaDao.getById(mergeTarget.id)
+        if (fullTarget != null) {
+          val updated = fullTarget.copy(
+            localUri = entry.contentUri,
+            width = if (fullTarget.width == 0) entry.width else fullTarget.width,
+            height = if (fullTarget.height == 0) entry.height else fullTarget.height,
+            durationSec = if (fullTarget.durationSec == 0) entry.durationSec else fullTarget.durationSec,
+            updatedAtEpochMs = System.currentTimeMillis(),
+          )
+          mediaDao.upsert(updated)
+          val updatedSummary = mergeTarget.copy(
+            localUri = entry.contentUri,
+            width = updated.width,
+            height = updated.height,
+            durationSec = updated.durationSec,
+          )
+          byLocalUri[entry.contentUri] = updatedSummary
+          val bucket = byNameAndSize[matchKey]
+          if (bucket != null) {
+            val idx = bucket.indexOfFirst { it.id == mergeTarget.id }
+            if (idx >= 0) bucket[idx] = updatedSummary
+          }
+          merged++
+          continue
         }
-        merged++
-        continue
       }
 
-      var candidateHash = "ms_${entry.mediaType.name.lowercase()}_${entry.mediaStoreId}"
-      if (!knownHashes.add(candidateHash)) {
-        candidateHash = "${candidateHash}_${System.nanoTime()}"
-        knownHashes.add(candidateHash)
+      var candidateMsKey = "ms_${entry.mediaType.name.lowercase()}_${entry.mediaStoreId}"
+      if (!knownMsKeys.add(candidateMsKey)) {
+        candidateMsKey = "${candidateMsKey}_${System.nanoTime()}"
+        knownMsKeys.add(candidateMsKey)
       }
 
       val newEntity = MediaEntity(
-        contentHash = candidateHash,
+        contentHash = null,
+        localMediaStoreKey = candidateMsKey,
         localUri = entry.contentUri,
         fileName = entry.fileName,
         mimeType = entry.mimeType,
@@ -298,10 +368,40 @@ class VaultRepository(
         takenAtEpochMs = entry.takenAtEpochMs,
         uploadStatus = UploadStatus.LOCAL_ONLY,
       )
-      mediaDao.insertIgnore(newEntity)
-      byLocalUri[entry.contentUri] = newEntity
-      byNameAndSize.getOrPut(matchKey) { mutableListOf() }.add(newEntity)
-      added++
+      val insertedId = mediaDao.insertIgnore(newEntity)
+      if (insertedId > 0L) {
+        val summary = MediaIdentitySummary(
+          id = insertedId,
+          contentHash = null,
+          localMediaStoreKey = candidateMsKey,
+          telegramFileUniqueId = null,
+          shortHashHint = null,
+          localUri = entry.contentUri,
+          fileName = entry.fileName,
+          mediaType = entry.mediaType,
+          sizeBytes = entry.sizeBytes,
+          width = entry.width,
+          height = entry.height,
+          durationSec = entry.durationSec,
+          takenAtEpochMs = entry.takenAtEpochMs,
+          albumId = null,
+          topicId = null,
+          uploadStatus = UploadStatus.LOCAL_ONLY,
+          telegramChatId = null,
+          telegramMessageId = null,
+          telegramFileId = null,
+          telegramRemoteFileId = null,
+          telegramThumbFileId = null,
+          cachedThumbPath = null,
+          isTrashed = false,
+          syncMode = null,
+          userCaption = null,
+          metadataVersion = 0,
+        )
+        byLocalUri[entry.contentUri] = summary
+        byNameAndSize.getOrPut(matchKey) { mutableListOf() }.add(summary)
+        added++
+      }
     }
 
     // Reconcile files deleted externally from device MediaStore when full permission is active
@@ -322,8 +422,13 @@ class VaultRepository(
       }
     }
     if (staleLocalOnlyIds.isNotEmpty()) {
-      mediaDao.deleteByIds(staleLocalOnlyIds)
+      staleLocalOnlyIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+        mediaDao.deleteByIds(chunk)
+      }
     }
+
+    if (scanPhotos) hasScannedDevicePhotosInSession = true
+    if (scanVideos) hasScannedDeviceVideosInSession = true
 
     ImportSummary(addedCount = added, duplicateSkippedCount = merged)
   }
@@ -887,7 +992,8 @@ class VaultRepository(
   }
 
   /**
-   * Read-only history reconstruction reusing the active TDLib session.
+   * Read-only incremental history reconstruction reusing the active TDLib session.
+   * Only scans unseen messages per topic while bridging via persistent forward cursors.
    */
   suspend fun syncHistoryReadOnly(): Result<Int> = runCatching {
     val target = syncTargetDao.getTarget()
@@ -897,9 +1003,6 @@ class VaultRepository(
       error("Vui lòng đăng nhập Telegram trong Setting trước khi quét chỉ đọc")
     }
 
-    val existingAll = mediaDao.getAllMediaSnapshot()
-    val existingHashes = existingAll.filter { it.uploadStatus == UploadStatus.UPLOADED }
-      .map { it.contentHash }.toHashSet()
     val reconstructedCount = tdLibManager.withActiveSession(markSyncing = true) {
       var totalAdded = 0
       if (target.isForumEnabled) {
@@ -955,13 +1058,13 @@ class VaultRepository(
             }
           }
 
-          val scanned = tdLibManager.scanHistoryReadOnly(
+          totalAdded += syncAlbumIncremental(
+            albumId = albumId,
             chatId = target.chatId,
-            messageThreadId = topic.messageThreadId,
-            limit = 60,
+            threadId = topic.messageThreadId,
+            isTrashTopic = isTrash,
           )
-          totalAdded += ingestScannedItems(scanned, albumId, isTrash, existingHashes)
-          delay(200L)
+          delay(220L)
         }
       } else {
         val streamAlbum = albumDao.getByChatAndThread(target.chatId, 0L)
@@ -974,12 +1077,12 @@ class VaultRepository(
               iconColor = 0x6FB9F0,
             )
           ).let { insertedId -> albumDao.getAlbum(insertedId) }
-        val scanned = tdLibManager.scanHistoryReadOnly(
+        totalAdded += syncAlbumIncremental(
+          albumId = streamAlbum?.id,
           chatId = target.chatId,
-          messageThreadId = target.defaultMessageThreadId,
-          limit = 80,
+          threadId = target.defaultMessageThreadId,
+          isTrashTopic = false,
         )
-        totalAdded += ingestScannedItems(scanned, streamAlbum?.id, false, existingHashes)
       }
       totalAdded
     }
@@ -987,14 +1090,14 @@ class VaultRepository(
     pruneSystemTopicAlbums()
     settingsPreferences.updateLastHistorySync(System.currentTimeMillis())
     settingsPreferences.setLastSyncStatusMessage(
-      "Đã quét chỉ đọc xong ($reconstructedCount mục mới)"
+      "Đã quét gia tăng xong ($reconstructedCount mục mới)"
     )
     reconstructedCount
   }
 
   /**
-   * Refreshes Album topics and pre-existing Telegram photos/videos/documents (including native
-   * MessagePhoto without #tele_anh_meta captions) directly for the Album tab or AlbumDetailScreen.
+   * Refreshes Album topics and incremental new messages when explicitly requested via Refresh or Sync.
+   * Serialized per-topic via SyncCoordinator; bridges large catch-ups cleanly across calls.
    */
   suspend fun syncAlbumsFromTelegram(specificAlbumId: Long? = null): Result<Int> = runCatching {
     val target = syncTargetDao.getTarget()
@@ -1004,22 +1107,17 @@ class VaultRepository(
       error("Vui lòng đăng nhập Telegram trong Setting")
     }
 
-    val existingHashes = mediaDao.getAllMediaSnapshot()
-      .filter { it.uploadStatus == UploadStatus.UPLOADED }
-      .map { it.contentHash }
-      .toHashSet()
-
     val addedCount = tdLibManager.withActiveSession(markSyncing = true) {
       var totalAdded = 0
       if (specificAlbumId != null) {
         val album = albumDao.getAlbum(specificAlbumId) ?: return@withActiveSession 0
         val threadId = album.messageThreadId.takeIf { target.isForumEnabled && it != 0L }
-        val scanned = tdLibManager.scanHistoryReadOnly(
+        totalAdded += syncAlbumIncremental(
+          albumId = album.id,
           chatId = target.chatId,
-          messageThreadId = threadId,
-          limit = 80,
+          threadId = threadId,
+          isTrashTopic = album.isTrashTopic,
         )
-        totalAdded += ingestScannedItems(scanned, album.id, album.isTrashTopic, existingHashes)
       } else if (target.isForumEnabled) {
         val core = tdLibManager.ensureThreeCoreTopics(target.chatId)
         core.photosThreadId?.let {
@@ -1069,13 +1167,13 @@ class VaultRepository(
                 iconColor = topic.iconColor,
               )
             )
-          val scanned = tdLibManager.scanHistoryReadOnly(
+          totalAdded += syncAlbumIncremental(
+            albumId = albumId,
             chatId = target.chatId,
-            messageThreadId = topic.messageThreadId,
-            limit = 60,
+            threadId = topic.messageThreadId,
+            isTrashTopic = false,
           )
-          totalAdded += ingestScannedItems(scanned, albumId, false, existingHashes)
-          delay(150L)
+          delay(220L)
         }
       } else {
         val streamAlbumId = albumDao.getByChatAndThread(target.chatId, 0L)?.id
@@ -1088,12 +1186,12 @@ class VaultRepository(
               iconColor = 0x6FB9F0,
             )
           )
-        val scanned = tdLibManager.scanHistoryReadOnly(
+        totalAdded += syncAlbumIncremental(
+          albumId = streamAlbumId,
           chatId = target.chatId,
-          messageThreadId = target.defaultMessageThreadId,
-          limit = 80,
+          threadId = target.defaultMessageThreadId,
+          isTrashTopic = false,
         )
-        totalAdded += ingestScannedItems(scanned, streamAlbumId, false, existingHashes)
       }
       totalAdded
     }
@@ -1103,26 +1201,147 @@ class VaultRepository(
   }
 
   /**
-   * Fast read-only pull for a specific MediaType topic ("Ảnh" or "Video") called within
-   * an already-open TDLib session before uploading local items, matching existing Telegram backups.
+   * Manual paced older-history backfill for a single Album / Forum Topic.
+   * Uses conservative end detection so locally cached short pages remain retryable.
+   */
+  suspend fun backfillOlderAlbumHistory(albumId: Long): Result<BackfillHistoryResult> = runCatching {
+    val target = syncTargetDao.getTarget()
+      ?: error("Chưa khoá đích lưu trữ Telegram")
+    val settings = settingsPreferences.getCurrentSettings()
+    if (!settings.isTelegramLoggedIn) {
+      error("Vui lòng đăng nhập Telegram trong Setting")
+    }
+    val initialAlbum = albumDao.getAlbum(albumId) ?: error("Không tìm thấy Album")
+    if (BackfillState.fromWireName(initialAlbum.backfillState) == BackfillState.CONFIRMED_END) {
+      return@runCatching BackfillHistoryResult(
+        fetchedCount = 0,
+        addedCount = 0,
+        reachedHistoryEnd = true,
+        backfillState = BackfillState.CONFIRMED_END,
+      )
+    }
+
+    val threadId = initialAlbum.messageThreadId.takeIf { target.isForumEnabled && it != 0L }
+    tdLibManager.withActiveSession(markSyncing = true) {
+      backfillOlderAlbumHistoryWithPageSource(
+        albumId = albumId,
+        chatId = target.chatId,
+        threadId = threadId,
+      ) { fromMessageId, limit ->
+        tdLibManager.fetchRawHistoryBatch(
+          chatId = target.chatId,
+          messageThreadId = threadId,
+          fromMessageId = fromMessageId,
+          limit = limit,
+        )
+      }
+    }
+  }
+
+  internal suspend fun backfillOlderAlbumHistoryWithPageSource(
+    albumId: Long,
+    chatId: Long,
+    threadId: Long?,
+    maxPages: Int = 2,
+    pageSize: Int = 25,
+    pageDelayMs: Long = 350L,
+    fetchPage: suspend (fromMessageId: Long, limit: Int) -> List<HistoryRawMessage>,
+  ): BackfillHistoryResult {
+    val syncKey = TopicSyncKey(chatId, threadId ?: 0L)
+    return syncCoordinator.runSerialized(
+      key = syncKey,
+      mode = AlbumSyncStatus.BACKFILLING,
+      albumId = albumId,
+      onPersistStatus = { id, status, error ->
+        albumDao.updateSyncStatus(id, status.name, error)
+      },
+    ) {
+      val album = albumDao.getAlbum(albumId) ?: error("Không tìm thấy Album")
+      if (BackfillState.fromWireName(album.backfillState) == BackfillState.CONFIRMED_END) {
+        return@runSerialized BackfillHistoryResult(
+          fetchedCount = 0,
+          addedCount = 0,
+          reachedHistoryEnd = true,
+          backfillState = BackfillState.CONFIRMED_END,
+        )
+      }
+
+      val dbMinMsgId = mediaDao.getMinTelegramMessageId(chatId, album.id, threadId ?: 0L) ?: 0L
+      val beforeMessageId = listOfNotNull(
+        album.oldestMessageId.takeIf { it > 0L },
+        dbMinMsgId.takeIf { it > 0L },
+      ).minOrNull() ?: 0L
+
+      val page = HistoryPaginationEngine.fetchOlderBackfill(
+        beforeMessageId = beforeMessageId,
+        maxPages = maxPages,
+        pageSize = pageSize,
+        pageDelayMs = pageDelayMs,
+        fetchPage = fetchPage,
+      )
+
+      val newBackfillState = when (page.endSignal) {
+        HistoryEndSignal.CONFIRMED_CREATION_END -> BackfillState.CONFIRMED_END
+        HistoryEndSignal.STALLED_CURSOR,
+        HistoryEndSignal.UNCERTAIN_EMPTY_OR_SHORT -> BackfillState.LIKELY_END_RETRYABLE
+        HistoryEndSignal.NONE,
+        HistoryEndSignal.REACHED_KNOWN_CHECKPOINT -> BackfillState.HAS_MORE
+      }
+
+      val txResult = runInTransaction {
+        val latestAlbum = albumDao.getAlbum(albumId) ?: album
+        val ingestResult = ingestScannedItems(page.items, latestAlbum.id, latestAlbum.isTrashTopic)
+        val refreshedDbMin = mediaDao.getMinTelegramMessageId(chatId, latestAlbum.id, threadId ?: 0L) ?: 0L
+        val newOldest = listOfNotNull(
+          beforeMessageId.takeIf { it > 0L },
+          page.lowestMessageId.takeIf { it > 0L },
+          refreshedDbMin.takeIf { it > 0L },
+        ).minOrNull() ?: 0L
+        val newLatest = if (latestAlbum.pendingForwardCursor > 0L) {
+          latestAlbum.latestMessageId
+        } else {
+          maxOf(latestAlbum.latestMessageId, page.highestMessageId)
+        }
+        val nowMs = System.currentTimeMillis()
+        albumDao.updateSyncCheckpoints(
+          albumId = latestAlbum.id,
+          latestMessageId = newLatest,
+          oldestMessageId = newOldest,
+          backfillExhausted = newBackfillState == BackfillState.CONFIRMED_END,
+          lastSyncedAtEpochMs = nowMs,
+          backfillState = newBackfillState.name,
+          lastBackfillAtEpochMs = nowMs,
+        )
+        ingestResult
+      }
+
+      fetchQuickThumbnailsAfterCommit(albumId, txResult.pendingThumbs)
+
+      BackfillHistoryResult(
+        fetchedCount = page.items.size,
+        addedCount = txResult.addedCount,
+        reachedHistoryEnd = newBackfillState == BackfillState.CONFIRMED_END,
+        backfillState = newBackfillState,
+      )
+    }
+  }
+
+  /**
+   * Fast incremental read-only pull for a specific MediaType topic ("Ảnh" or "Video") called within
+   * an already-open TDLib session before uploading local items.
    */
   suspend fun syncActiveTabHistoryWhileConnected(
     target: SyncTargetEntity,
     filterMediaType: MediaType?,
   ): Int {
-    val existingHashes = mediaDao.getAllMediaSnapshot()
-      .filter { it.uploadStatus == UploadStatus.UPLOADED }
-      .map { it.contentHash }
-      .toHashSet()
-
     if (!target.isForumEnabled) {
       val streamAlbumId = albumDao.getByChatAndThread(target.chatId, 0L)?.id
-      val scanned = tdLibManager.scanHistoryReadOnly(
+      return syncAlbumIncremental(
+        albumId = streamAlbumId,
         chatId = target.chatId,
-        messageThreadId = target.defaultMessageThreadId,
-        limit = 60,
+        threadId = target.defaultMessageThreadId,
+        isTrashTopic = false,
       )
-      return ingestScannedItems(scanned, streamAlbumId, false, existingHashes)
     }
 
     val core = tdLibManager.ensureThreeCoreTopics(target.chatId)
@@ -1140,8 +1359,12 @@ class VaultRepository(
           title = TelegramPolicyGuard.PHOTOS_TOPIC_TITLE,
           iconColor = 0x6FB9F0,
         )
-        val scannedPhotos = tdLibManager.scanHistoryReadOnly(target.chatId, pTopic, limit = 60)
-        added += ingestScannedItems(scannedPhotos, photosAlbumId, false, existingHashes)
+        added += syncAlbumIncremental(
+          albumId = photosAlbumId,
+          chatId = target.chatId,
+          threadId = pTopic,
+          isTrashTopic = false,
+        )
       }
     }
     if (filterMediaType == null || filterMediaType == MediaType.VIDEO) {
@@ -1153,42 +1376,273 @@ class VaultRepository(
           title = TelegramPolicyGuard.VIDEOS_TOPIC_TITLE,
           iconColor = 0xCB86DB,
         )
-        val scannedVideos = tdLibManager.scanHistoryReadOnly(target.chatId, vTopic, limit = 60)
-        added += ingestScannedItems(scannedVideos, videosAlbumId, false, existingHashes)
+        added += syncAlbumIncremental(
+          albumId = videosAlbumId,
+          chatId = target.chatId,
+          threadId = vTopic,
+          isTrashTopic = false,
+        )
       }
     }
     return added
+  }
+
+  private suspend fun syncAlbumIncremental(
+    albumId: Long?,
+    chatId: Long,
+    threadId: Long?,
+    isTrashTopic: Boolean,
+  ): Int {
+    if (!tdLibManager.isSessionReady()) {
+      tdLibManager.ensureConnected().getOrThrow()
+    }
+    return syncAlbumIncrementalWithPageSource(
+      albumId = albumId,
+      chatId = chatId,
+      threadId = threadId,
+      isTrashTopic = isTrashTopic,
+    ) { fromMessageId, limit ->
+      tdLibManager.fetchRawHistoryBatch(
+        chatId = chatId,
+        messageThreadId = threadId,
+        fromMessageId = fromMessageId,
+        limit = limit,
+      )
+    }
+  }
+
+  internal suspend fun syncAlbumIncrementalWithPageSource(
+    albumId: Long?,
+    chatId: Long,
+    threadId: Long?,
+    isTrashTopic: Boolean,
+    maxPages: Int = 10,
+    pageSize: Int = 30,
+    pageDelayMs: Long = 250L,
+    fetchPage: suspend (fromMessageId: Long, limit: Int) -> List<HistoryRawMessage>,
+  ): Int {
+    val syncKey = TopicSyncKey(chatId, threadId ?: 0L)
+    return syncCoordinator.runSerialized(
+      key = syncKey,
+      mode = AlbumSyncStatus.SYNCING,
+      albumId = albumId,
+      onPersistStatus = { id, status, error ->
+        albumDao.updateSyncStatus(id, status.name, error)
+      },
+    ) {
+      val album = albumId?.let { albumDao.getAlbum(it) }
+      val dbMaxMsgId = mediaDao.getMaxTelegramMessageId(chatId, albumId, threadId ?: 0L) ?: 0L
+      val activePendingCursor = album?.pendingForwardCursor ?: 0L
+      val activePendingHighWater = album?.pendingForwardHighWaterMark ?: 0L
+
+      // CRITICAL: While a forward bridge is active, never raise sinceMessageId to dbMaxMsgId
+      // (the head batch is already in DB, while the gap down to committed latestMessageId is still open).
+      val committedSince = if (activePendingCursor > 0L) {
+        album?.latestMessageId ?: 0L
+      } else {
+        maxOf(album?.latestMessageId ?: 0L, dbMaxMsgId)
+      }
+
+      val page = HistoryPaginationEngine.fetchIncrementalForward(
+        sinceMessageId = committedSince,
+        startFromMessageId = activePendingCursor,
+        maxPages = maxPages,
+        pageSize = pageSize,
+        pageDelayMs = pageDelayMs,
+        fetchPage = fetchPage,
+      )
+
+      val txResult = runInTransaction {
+        val latestAlbum = albumId?.let { albumDao.getAlbum(it) }
+        val ingestResult = ingestScannedItems(page.items, albumId, isTrashTopic)
+
+        if (albumId != null) {
+          val refreshedDbMin = mediaDao.getMinTelegramMessageId(chatId, albumId, threadId ?: 0L) ?: 0L
+          val refreshedDbMax = mediaDao.getMaxTelegramMessageId(chatId, albumId, threadId ?: 0L) ?: 0L
+          val currentLatest = latestAlbum?.latestMessageId ?: committedSince
+          val currentPendingHighWater = maxOf(
+            latestAlbum?.pendingForwardHighWaterMark ?: activePendingHighWater,
+            page.highestMessageId,
+          )
+          val updatedOldest = listOfNotNull(
+            latestAlbum?.oldestMessageId?.takeIf { it > 0L },
+            page.lowestMessageId.takeIf { it > 0L },
+            refreshedDbMin.takeIf { it > 0L },
+          ).minOrNull() ?: 0L
+
+          val updatedLatest: Long
+          val nextPendingCursor: Long
+          val nextPendingHighWater: Long
+          var nextBackfillState = BackfillState.fromWireName(latestAlbum?.backfillState)
+
+          when {
+            page.hitKnownCheckpoint || page.reachedHistoryEnd -> {
+              // Contiguous bridge down to previous committed checkpoint (or topic creation)!
+              updatedLatest = maxOf(currentLatest, currentPendingHighWater, refreshedDbMax)
+              nextPendingCursor = 0L
+              nextPendingHighWater = 0L
+              if (page.reachedHistoryEnd) {
+                nextBackfillState = BackfillState.CONFIRMED_END
+              }
+            }
+            committedSince == 0L -> {
+              // Initial scan on empty topic: commit top water mark; older messages (< oldest) load via backfill.
+              updatedLatest = maxOf(currentPendingHighWater, refreshedDbMax)
+              nextPendingCursor = 0L
+              nextPendingHighWater = 0L
+            }
+            page.endSignal == HistoryEndSignal.NONE && page.lowestMessageId > 0L -> {
+              // Bounded maxPages hit before bridging back to committedSince: save continuation cursor
+              // and leave committed latestMessageId UNCHANGED to prevent gap starvation or infinite loops.
+              updatedLatest = currentLatest
+              nextPendingCursor = page.lowestMessageId
+              nextPendingHighWater = currentPendingHighWater
+            }
+            page.endSignal == HistoryEndSignal.STALLED_CURSOR && currentPendingHighWater > 0L -> {
+              // Previous checkpoint message no longer exists on Telegram; bridge cleanly to top.
+              updatedLatest = maxOf(currentLatest, currentPendingHighWater)
+              nextPendingCursor = 0L
+              nextPendingHighWater = 0L
+            }
+            else -> {
+              // Unexpected short/empty response mid-bridge: preserve continuation state for next retry.
+              updatedLatest = currentLatest
+              nextPendingCursor = activePendingCursor
+              nextPendingHighWater = if (activePendingCursor > 0L) currentPendingHighWater else 0L
+            }
+          }
+
+          albumDao.updateSyncCheckpoints(
+            albumId = albumId,
+            latestMessageId = updatedLatest,
+            oldestMessageId = updatedOldest,
+            backfillExhausted = nextBackfillState == BackfillState.CONFIRMED_END,
+            lastSyncedAtEpochMs = System.currentTimeMillis(),
+            pendingForwardCursor = nextPendingCursor,
+            pendingForwardHighWaterMark = nextPendingHighWater,
+            backfillState = nextBackfillState.name,
+          )
+        }
+        ingestResult
+      }
+
+      fetchQuickThumbnailsAfterCommit(albumId, txResult.pendingThumbs)
+      txResult.addedCount
+    }
+  }
+
+  suspend fun bumpAlbumLatestMessageId(albumId: Long?, messageId: Long) {
+    if (albumId == null || messageId <= 0L) return
+    runInTransaction {
+      val album = albumDao.getAlbum(albumId) ?: return@runInTransaction
+      val updatedOldest = if (album.oldestMessageId == 0L) {
+        messageId
+      } else {
+        minOf(album.oldestMessageId, messageId)
+      }
+      if (album.pendingForwardCursor > 0L) {
+        // Active unbridged forward gap exists: advance pending high-water mark, never committed latestMessageId.
+        albumDao.updateSyncCheckpoints(
+          albumId = albumId,
+          latestMessageId = album.latestMessageId,
+          oldestMessageId = updatedOldest,
+          backfillExhausted = album.backfillExhausted,
+          lastSyncedAtEpochMs = System.currentTimeMillis(),
+          pendingForwardHighWaterMark = maxOf(album.pendingForwardHighWaterMark, messageId),
+        )
+      } else {
+        albumDao.updateSyncCheckpoints(
+          albumId = albumId,
+          latestMessageId = maxOf(album.latestMessageId, messageId),
+          oldestMessageId = updatedOldest,
+          backfillExhausted = album.backfillExhausted,
+          lastSyncedAtEpochMs = System.currentTimeMillis(),
+        )
+      }
+    }
+  }
+
+  private data class IngestResult(
+    val addedCount: Int,
+    val pendingThumbs: List<Pair<Long, Int>>,
+  )
+
+  private suspend fun fetchQuickThumbnailsAfterCommit(
+    albumId: Long?,
+    pendingThumbs: List<Pair<Long, Int>>,
+  ) {
+    if (pendingThumbs.isEmpty()) return
+    var coverNeeded = albumId?.let { albumDao.getAlbum(it)?.coverUri == null } ?: false
+    for ((mediaId, thumbFileId) in pendingThumbs) {
+      val path = tdLibManager.downloadThumbnailQuick(thumbFileId) ?: continue
+      mediaDao.updateThumbInfo(mediaId, thumbFileId, path)
+      if (coverNeeded && albumId != null) {
+        albumDao.updateCoverUri(albumId, path)
+        coverNeeded = false
+      }
+    }
   }
 
   private suspend fun ingestScannedItems(
     scanned: List<ScannedTelegramMedia>,
     albumId: Long?,
     isTrashTopic: Boolean,
-    existingHashes: MutableSet<String>,
-  ): Int {
+  ): IngestResult {
+    if (scanned.isEmpty()) return IngestResult(0, emptyList())
+
     var added = 0
-    var thumbFetchCount = 0
+    val pendingThumbs = mutableListOf<Pair<Long, Int>>()
     val maxQuickThumbsPerBatch = 24
-    val localSnapshot = mediaDao.getAllMediaSnapshot()
-    val byNameSize = HashMap<String, MediaEntity>()
-    val byMessageKey = HashMap<String, MediaEntity>()
-    val byShortHashPrefix = HashMap<String, MediaEntity>()
+
+    // 1. Targeted lookup ONLY for Telegram message IDs present in this page batch
+    val byMessageKey = HashMap<Pair<Long, Long>, MediaEntity>(scanned.size)
+    for ((chatId, itemsForChat) in scanned.groupBy { it.chatId }) {
+      val msgIds = itemsForChat.map { it.messageId }.distinct().filter { it > 0L }
+      msgIds.chunked(SQLITE_BIND_CHUNK_SIZE).forEach { chunk ->
+        mediaDao.findByChatAndMessageIds(chatId, chunk).forEach { existing ->
+          val eChat = existing.telegramChatId
+          val eMsg = existing.telegramMessageId
+          if (eChat != null && eMsg != null) {
+            byMessageKey[eChat to eMsg] = existing
+          }
+        }
+      }
+    }
+
+    // 2. Targeted lookup ONLY over unbound local items (telegramMessageId IS NULL)
+    val unboundLocal = mediaDao.getUnboundLocalMedia()
+    val unboundByHash = HashMap<String, MediaEntity>()
+    val unboundByShortHintAndMeta = HashMap<String, MediaEntity>()
+    val unboundByNameSize = HashMap<String, MediaEntity>()
+    for (local in unboundLocal) {
+      local.contentHash?.takeIf { it.isNotBlank() }?.let { h ->
+        unboundByHash.putIfAbsent(h, local)
+      }
+      val hint = local.shortHashHint ?: local.contentHash?.take(16)
+      if (!hint.isNullOrBlank() && local.sizeBytes > 0L) {
+        unboundByShortHintAndMeta.putIfAbsent("${hint}|${local.mediaType.name}|${local.sizeBytes}", local)
+      }
+      if (local.sizeBytes > 0L) {
+        unboundByNameSize.putIfAbsent("${local.mediaType.name}|${local.fileName.lowercase()}|${local.sizeBytes}", local)
+      }
+    }
+
     var albumCoverNeeded = albumId?.let { id -> albumDao.getAlbum(id)?.coverUri == null } ?: false
 
-    for (m in localSnapshot) {
-      if (m.sizeBytes > 0L) {
-        byNameSize["${m.mediaType.name}|${m.fileName.lowercase()}|${m.sizeBytes}"] = m
+    fun removeFromUnboundMaps(local: MediaEntity) {
+      local.contentHash?.let { unboundByHash.remove(it, local) }
+      val hint = local.shortHashHint ?: local.contentHash?.take(16)
+      if (!hint.isNullOrBlank() && local.sizeBytes > 0L) {
+        unboundByShortHintAndMeta.remove("${hint}|${local.mediaType.name}|${local.sizeBytes}", local)
       }
-      if (m.telegramChatId != null && m.telegramMessageId != null) {
-        byMessageKey["${m.telegramChatId}_${m.telegramMessageId}"] = m
-      }
-      if (m.contentHash.length >= 12 && !m.contentHash.startsWith("ms_") && !m.contentHash.startsWith("tg_")) {
-        byShortHashPrefix[m.contentHash.take(16)] = m
+      if (local.sizeBytes > 0L) {
+        unboundByNameSize.remove("${local.mediaType.name}|${local.fileName.lowercase()}|${local.sizeBytes}", local)
       }
     }
 
     for (item in scanned) {
-      val msgMatch = byMessageKey["${item.chatId}_${item.messageId}"]
+      val msgKey = item.chatId to item.messageId
+      val msgMatch = byMessageKey[msgKey]
       if (msgMatch != null) {
         if (item.fileId != msgMatch.telegramFileId ||
           item.remoteFileId != msgMatch.telegramRemoteFileId ||
@@ -1201,6 +1655,7 @@ class VaultRepository(
             thumbFileId = item.thumbFileId,
           )
         }
+        persistParsedMetadataIfNeeded(msgMatch, item)
         val needsAlbumOrTopic = !isTrashTopic &&
           ((albumId != null && msgMatch.albumId == null) ||
             (item.topicId != null && msgMatch.topicId == null))
@@ -1210,6 +1665,13 @@ class VaultRepository(
             albumId = msgMatch.albumId ?: albumId,
             topicId = msgMatch.topicId ?: item.topicId,
           )
+        }
+        if (msgMatch.localUri == null &&
+          !MediaStoreScanner.isUsableLocalFile(msgMatch.cachedThumbPath) &&
+          item.thumbFileId != null &&
+          pendingThumbs.size < maxQuickThumbsPerBatch
+        ) {
+          pendingThumbs.add(msgMatch.id to item.thumbFileId)
         }
         if (albumCoverNeeded && albumId != null) {
           val coverCandidate = msgMatch.localUri ?: msgMatch.cachedThumbPath
@@ -1221,154 +1683,129 @@ class VaultRepository(
         continue
       }
 
-      val prefixMatch = if (item.contentHash.length in 12..31) byShortHashPrefix[item.contentHash.take(16)] else null
-      val existingByHash = prefixMatch ?: mediaDao.findByHash(item.contentHash)
-      if (existingByHash != null) {
-        if (existingByHash.uploadStatus != UploadStatus.UPLOADED) {
-          mediaDao.markUploaded(
-            id = existingByHash.id,
-            chatId = item.chatId,
-            messageId = item.messageId,
-            fileId = item.fileId,
-            remoteFileId = item.remoteFileId,
-            topicId = item.topicId ?: existingByHash.topicId,
-            thumbFileId = item.thumbFileId,
-            albumId = if (!isTrashTopic) existingByHash.albumId ?: albumId else existingByHash.albumId,
-          )
-        } else if (item.fileId != existingByHash.telegramFileId ||
-          item.remoteFileId != existingByHash.telegramRemoteFileId ||
-          item.thumbFileId != existingByHash.telegramThumbFileId
-        ) {
-          mediaDao.updateTelegramFileRefs(
-            id = existingByHash.id,
-            fileId = item.fileId,
-            remoteFileId = item.remoteFileId,
-            thumbFileId = item.thumbFileId,
-          )
+      // Check unbound local-only/queued rows ONLY (never collapse two distinct Telegram messages)
+      val localMatch = item.fullContentHash?.let { unboundByHash[it] }
+        ?: item.shortHashHint?.takeIf { item.sizeBytes > 0L }?.let { hint ->
+          unboundByShortHintAndMeta["${hint}|${item.mediaType.name}|${item.sizeBytes}"]
         }
-        val needsAlbumOrTopic = !isTrashTopic &&
-          ((albumId != null && existingByHash.albumId == null) ||
-            (item.topicId != null && existingByHash.topicId == null))
-        if (needsAlbumOrTopic) {
-          mediaDao.assignToAlbum(
-            ids = listOf(existingByHash.id),
-            albumId = existingByHash.albumId ?: albumId,
-            topicId = existingByHash.topicId ?: item.topicId,
-          )
+        ?: if (item.sizeBytes > 0L) {
+          unboundByNameSize["${item.mediaType.name}|${item.fileName.lowercase()}|${item.sizeBytes}"]
+        } else {
+          null
         }
-        var currentThumb = existingByHash.cachedThumbPath
-        if (existingByHash.localUri == null &&
-          !MediaStoreScanner.isUsableLocalFile(currentThumb) &&
+
+      if (localMatch != null) {
+        removeFromUnboundMaps(localMatch)
+        val nowMs = System.currentTimeMillis()
+        mediaDao.markUploaded(
+          id = localMatch.id,
+          chatId = item.chatId,
+          messageId = item.messageId,
+          fileId = item.fileId,
+          remoteFileId = item.remoteFileId,
+          topicId = item.topicId ?: localMatch.topicId,
+          thumbFileId = item.thumbFileId,
+          albumId = if (!isTrashTopic) localMatch.albumId ?: albumId else localMatch.albumId,
+          syncMode = item.syncMode,
+          telegramFileUniqueId = item.telegramFileUniqueId,
+          shortHashHint = item.shortHashHint,
+          metadataVersion = item.metadataVersion.takeIf { it > 0 },
+          metadataParsedAtEpochMs = if (item.metadataVersion > 0) nowMs else null,
+        )
+        if (localMatch.contentHash.isNullOrBlank() && !item.fullContentHash.isNullOrBlank()) {
+          mediaDao.updateContentHash(localMatch.id, item.fullContentHash)
+        }
+        persistParsedMetadataIfNeeded(localMatch, item)
+        if (localMatch.localUri == null &&
+          !MediaStoreScanner.isUsableLocalFile(localMatch.cachedThumbPath) &&
           item.thumbFileId != null &&
-          thumbFetchCount < maxQuickThumbsPerBatch
+          pendingThumbs.size < maxQuickThumbsPerBatch
         ) {
-          thumbFetchCount++
-          tdLibManager.downloadThumbnailQuick(item.thumbFileId)?.let { thumbPath ->
-            currentThumb = thumbPath
-            mediaDao.updateThumbInfo(existingByHash.id, item.thumbFileId, thumbPath)
-          }
+          pendingThumbs.add(localMatch.id to item.thumbFileId)
         }
         if (albumCoverNeeded && albumId != null) {
-          val coverCandidate = existingByHash.localUri ?: currentThumb
+          val coverCandidate = localMatch.localUri ?: localMatch.cachedThumbPath
           if (!coverCandidate.isNullOrBlank()) {
             albumDao.updateCoverUri(albumId, coverCandidate)
             albumCoverNeeded = false
           }
         }
-        existingHashes.add(item.contentHash)
-        continue
-      }
-
-      if (existingHashes.contains(item.contentHash)) continue
-
-      // Deduplicate against MediaStore items matched by (mediaType, fileName, sizeBytes)
-      val nameSizeKey = "${item.mediaType.name}|${item.fileName.lowercase()}|${item.sizeBytes}"
-      val existingLocalMatch = if (item.sizeBytes > 0L) byNameSize[nameSizeKey] else null
-      if (existingLocalMatch != null) {
-        if (existingLocalMatch.uploadStatus != UploadStatus.UPLOADED) {
-          mediaDao.markUploaded(
-            id = existingLocalMatch.id,
-            chatId = item.chatId,
-            messageId = item.messageId,
-            fileId = item.fileId,
-            remoteFileId = item.remoteFileId,
-            topicId = item.topicId ?: existingLocalMatch.topicId,
-            thumbFileId = item.thumbFileId,
-            albumId = if (!isTrashTopic) existingLocalMatch.albumId ?: albumId else existingLocalMatch.albumId,
-          )
-          if (existingLocalMatch.contentHash.startsWith("ms_") || item.contentHash.length >= 32) {
-            mediaDao.updateContentHash(existingLocalMatch.id, item.contentHash)
-          }
-        } else if (item.fileId != existingLocalMatch.telegramFileId ||
-          item.remoteFileId != existingLocalMatch.telegramRemoteFileId ||
-          item.thumbFileId != existingLocalMatch.telegramThumbFileId
-        ) {
-          mediaDao.updateTelegramFileRefs(
-            id = existingLocalMatch.id,
-            fileId = item.fileId,
-            remoteFileId = item.remoteFileId,
-            thumbFileId = item.thumbFileId,
-          )
-        }
-        val needsAlbumOrTopic = !isTrashTopic &&
-          ((albumId != null && existingLocalMatch.albumId == null) ||
-            (item.topicId != null && existingLocalMatch.topicId == null))
-        if (needsAlbumOrTopic) {
-          mediaDao.assignToAlbum(
-            ids = listOf(existingLocalMatch.id),
-            albumId = existingLocalMatch.albumId ?: albumId,
-            topicId = existingLocalMatch.topicId ?: item.topicId,
-          )
-        }
-        if (albumCoverNeeded && albumId != null) {
-          val coverCandidate = existingLocalMatch.localUri ?: existingLocalMatch.cachedThumbPath
-          if (!coverCandidate.isNullOrBlank()) {
-            albumDao.updateCoverUri(albumId, coverCandidate)
-            albumCoverNeeded = false
-          }
-        }
-        existingHashes.add(item.contentHash)
+        byMessageKey[msgKey] = localMatch.copy(
+          telegramChatId = item.chatId,
+          telegramMessageId = item.messageId,
+          uploadStatus = UploadStatus.UPLOADED,
+        )
         continue
       }
 
       val isTrashed = item.isTrashed || isTrashTopic
-      val downloadedThumbPath = if (item.thumbFileId != null && thumbFetchCount < maxQuickThumbsPerBatch) {
-        thumbFetchCount++
-        tdLibManager.downloadThumbnailQuick(item.thumbFileId)
-      } else {
-        null
-      }
-      mediaDao.insertIgnore(
-        MediaEntity(
-          contentHash = item.contentHash,
-          localUri = null,
-          fileName = item.fileName,
-          mimeType = item.mimeType,
-          mediaType = item.mediaType,
-          sizeBytes = item.sizeBytes,
-          durationSec = item.durationSec,
-          takenAtEpochMs = item.takenAtEpochMs,
-          albumId = albumId,
-          topicId = item.topicId,
-          uploadStatus = UploadStatus.UPLOADED,
-          telegramChatId = item.chatId,
-          telegramMessageId = item.messageId,
-          telegramFileId = item.fileId,
-          telegramRemoteFileId = item.remoteFileId,
-          telegramThumbFileId = item.thumbFileId,
-          cachedThumbPath = downloadedThumbPath,
-          isTrashed = isTrashed,
-          trashedAtEpochMs = if (isTrashed) System.currentTimeMillis() else null,
-        )
+      val nowMs = System.currentTimeMillis()
+      val newEntity = MediaEntity(
+        contentHash = item.fullContentHash,
+        localUri = null,
+        fileName = item.fileName,
+        mimeType = item.mimeType,
+        mediaType = item.mediaType,
+        sizeBytes = item.sizeBytes,
+        durationSec = item.durationSec,
+        takenAtEpochMs = item.takenAtEpochMs,
+        albumId = albumId,
+        topicId = item.topicId,
+        uploadStatus = UploadStatus.UPLOADED,
+        telegramChatId = item.chatId,
+        telegramMessageId = item.messageId,
+        telegramFileId = item.fileId,
+        telegramRemoteFileId = item.remoteFileId,
+        telegramThumbFileId = item.thumbFileId,
+        cachedThumbPath = null,
+        isTrashed = isTrashed,
+        trashedAtEpochMs = if (isTrashed) nowMs else null,
+        syncMode = item.syncMode,
+        userCaption = item.userCaption,
+        telegramFileUniqueId = item.telegramFileUniqueId,
+        shortHashHint = item.shortHashHint,
+        metadataVersion = item.metadataVersion,
+        metadataParsedAtEpochMs = if (item.metadataVersion > 0) nowMs else null,
       )
-      if (albumCoverNeeded && albumId != null && !downloadedThumbPath.isNullOrBlank()) {
-        albumDao.updateCoverUri(albumId, downloadedThumbPath)
-        albumCoverNeeded = false
+      val insertedId = mediaDao.insertIgnore(newEntity)
+      if (insertedId > 0L) {
+        byMessageKey[msgKey] = newEntity.copy(id = insertedId)
+        if (item.thumbFileId != null && pendingThumbs.size < maxQuickThumbsPerBatch) {
+          pendingThumbs.add(insertedId to item.thumbFileId)
+        }
+        added++
       }
-      existingHashes.add(item.contentHash)
-      added++
     }
-    return added
+    return IngestResult(addedCount = added, pendingThumbs = pendingThumbs)
+  }
+
+  private suspend fun persistParsedMetadataIfNeeded(
+    existing: MediaEntity,
+    scanned: ScannedTelegramMedia,
+  ) {
+    val shouldUpdateTimestamp = scanned.takenAtEpochMs > 0L && (
+      existing.takenAtEpochMs <= 0L ||
+        (existing.localUri == null && kotlin.math.abs(scanned.takenAtEpochMs - existing.takenAtEpochMs) > 60_000L)
+      )
+    val resolvedTimestamp = if (shouldUpdateTimestamp) scanned.takenAtEpochMs else existing.takenAtEpochMs
+    val needsSyncMode = existing.syncMode == null && scanned.syncMode != null
+    val needsCaption = existing.userCaption.isNullOrBlank() && !scanned.userCaption.isNullOrBlank()
+    val needsShortHint = existing.shortHashHint.isNullOrBlank() && !scanned.shortHashHint.isNullOrBlank()
+    val needsUniqueId = existing.telegramFileUniqueId.isNullOrBlank() && !scanned.telegramFileUniqueId.isNullOrBlank()
+    val needsVersionBump = scanned.metadataVersion > existing.metadataVersion
+
+    if (shouldUpdateTimestamp || needsSyncMode || needsCaption || needsShortHint || needsUniqueId || needsVersionBump) {
+      mediaDao.updateCachedMetadata(
+        id = existing.id,
+        takenAtEpochMs = resolvedTimestamp,
+        syncMode = if (existing.syncMode == null) scanned.syncMode else null,
+        userCaption = if (existing.userCaption.isNullOrBlank()) scanned.userCaption else null,
+        shortHashHint = scanned.shortHashHint,
+        telegramFileUniqueId = scanned.telegramFileUniqueId,
+        metadataVersion = maxOf(existing.metadataVersion, scanned.metadataVersion),
+        metadataParsedAtEpochMs = System.currentTimeMillis(),
+      )
+    }
   }
 
   fun downloadMediaOnDemand(media: MediaEntity): Flow<FileDownloadProgress> =
@@ -1805,10 +2242,13 @@ class VaultRepository(
     )
   }
 
-  fun buildDocumentCaption(media: MediaEntity): String {
+  fun buildDocumentCaption(
+    media: MediaEntity,
+    uploadMode: TelegramUploadMode? = null,
+  ): String {
     return TelegramCaptionMetadata.buildCaption(
       TelegramCaptionPayload(
-        contentHash = media.contentHash,
+        contentHash = media.contentHash.orEmpty(),
         takenAtEpochMs = media.takenAtEpochMs,
         durationSec = media.durationSec,
         topicId = media.topicId,
@@ -1816,6 +2256,8 @@ class VaultRepository(
         fileName = media.fileName,
         mediaKind = if (media.mediaType == MediaType.VIDEO) "VIDEO" else "PHOTO",
         sizeBytes = media.sizeBytes,
+        syncMode = uploadMode?.name ?: media.syncMode,
+        userCaption = media.userCaption,
       )
     )
   }

@@ -18,6 +18,35 @@ data class StorageStats(
   val freeableBytes: Long = 0L,
 )
 
+data class MediaIdentitySummary(
+  val id: Long,
+  val contentHash: String?,
+  val localMediaStoreKey: String?,
+  val telegramFileUniqueId: String?,
+  val shortHashHint: String?,
+  val localUri: String?,
+  val fileName: String,
+  val mediaType: MediaType,
+  val sizeBytes: Long,
+  val width: Int,
+  val height: Int,
+  val durationSec: Int,
+  val takenAtEpochMs: Long,
+  val albumId: Long?,
+  val topicId: Long?,
+  val uploadStatus: UploadStatus,
+  val telegramChatId: Long?,
+  val telegramMessageId: Long?,
+  val telegramFileId: Int?,
+  val telegramRemoteFileId: String?,
+  val telegramThumbFileId: Int?,
+  val cachedThumbPath: String?,
+  val isTrashed: Boolean,
+  val syncMode: String?,
+  val userCaption: String?,
+  val metadataVersion: Int,
+)
+
 @Dao
 interface MediaDao {
 
@@ -142,6 +171,53 @@ interface MediaDao {
 
   @Query(
     """
+    SELECT id, contentHash, localMediaStoreKey, telegramFileUniqueId, shortHashHint,
+           localUri, fileName, mediaType, sizeBytes, width, height, durationSec,
+           takenAtEpochMs, albumId, topicId, uploadStatus, telegramChatId, telegramMessageId,
+           telegramFileId, telegramRemoteFileId, telegramThumbFileId, cachedThumbPath,
+           isTrashed, syncMode, userCaption, metadataVersion
+    FROM media_items
+    """
+  )
+  suspend fun getMediaIdentitySummaries(): List<MediaIdentitySummary>
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE telegramChatId = :chatId
+      AND telegramMessageId IN (:messageIds)
+    """
+  )
+  suspend fun findByChatAndMessageIds(chatId: Long, messageIds: List<Long>): List<MediaEntity>
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE telegramChatId = :chatId
+      AND telegramMessageId = :messageId
+    LIMIT 1
+    """
+  )
+  suspend fun findByChatAndMessageId(chatId: Long, messageId: Long): MediaEntity?
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE telegramMessageId IS NULL
+    """
+  )
+  suspend fun getUnboundLocalMedia(): List<MediaEntity>
+
+  @Query(
+    """
+    SELECT * FROM media_items
+    WHERE contentHash IN (:hashes)
+    """
+  )
+  suspend fun findByContentHashes(hashes: List<String>): List<MediaEntity>
+
+  @Query(
+    """
     SELECT * FROM media_items
     WHERE uploadStatus = 'QUEUED'
       AND isTrashed = 0
@@ -223,10 +299,16 @@ interface MediaDao {
   @Query("SELECT * FROM media_items WHERE contentHash = :hash LIMIT 1")
   suspend fun findByHash(hash: String): MediaEntity?
 
+  @Query("SELECT * FROM media_items WHERE localUri = :localUri LIMIT 1")
+  suspend fun findByLocalUri(localUri: String): MediaEntity?
+
   @Query("SELECT * FROM media_items WHERE contentHash = :hash AND uploadStatus = 'UPLOADED' LIMIT 1")
   suspend fun findUploadedByHash(hash: String): MediaEntity?
 
-  @Query("SELECT contentHash FROM media_items WHERE uploadStatus = 'UPLOADED'")
+  @Query("SELECT * FROM media_items WHERE telegramFileUniqueId = :uniqueId AND uploadStatus = 'UPLOADED' LIMIT 1")
+  suspend fun findUploadedByTelegramUniqueId(uniqueId: String): MediaEntity?
+
+  @Query("SELECT contentHash FROM media_items WHERE uploadStatus = 'UPLOADED' AND contentHash IS NOT NULL")
   suspend fun getAllUploadedHashes(): List<String>
 
   @Query("SELECT * FROM media_items WHERE id IN (:ids)")
@@ -287,12 +369,17 @@ interface MediaDao {
     UPDATE media_items
     SET uploadStatus = 'UPLOADED',
         telegramChatId = :chatId,
-        telegramMessageId = :messageId,
+        telegramMessageId = NULLIF(:messageId, 0),
         telegramFileId = :fileId,
         telegramRemoteFileId = :remoteFileId,
         topicId = :topicId,
         albumId = COALESCE(:albumId, albumId),
         telegramThumbFileId = COALESCE(:thumbFileId, telegramThumbFileId),
+        syncMode = COALESCE(:syncMode, syncMode),
+        telegramFileUniqueId = COALESCE(:telegramFileUniqueId, telegramFileUniqueId),
+        shortHashHint = COALESCE(:shortHashHint, shortHashHint),
+        metadataVersion = CASE WHEN :metadataVersion IS NOT NULL AND :metadataVersion > metadataVersion THEN :metadataVersion ELSE metadataVersion END,
+        metadataParsedAtEpochMs = COALESCE(:metadataParsedAtEpochMs, metadataParsedAtEpochMs),
         lastError = NULL,
         updatedAtEpochMs = :updatedAt
     WHERE id = :id
@@ -307,8 +394,87 @@ interface MediaDao {
     topicId: Long?,
     thumbFileId: Int? = null,
     albumId: Long? = null,
+    syncMode: String? = null,
+    telegramFileUniqueId: String? = null,
+    shortHashHint: String? = null,
+    metadataVersion: Int? = null,
+    metadataParsedAtEpochMs: Long? = null,
     updatedAt: Long = System.currentTimeMillis(),
   )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET localUri = COALESCE(localUri, :localUri),
+        width = CASE WHEN width <= 0 THEN :width ELSE width END,
+        height = CASE WHEN height <= 0 THEN :height ELSE height END,
+        durationSec = CASE WHEN durationSec <= 0 THEN :durationSec ELSE durationSec END,
+        albumId = COALESCE(albumId, :albumId),
+        topicId = COALESCE(topicId, :topicId),
+        contentHash = COALESCE(contentHash, :contentHash),
+        updatedAtEpochMs = :updatedAt
+    WHERE id = :targetId
+    """
+  )
+  suspend fun mergeLocalDetailsIntoUploaded(
+    targetId: Long,
+    localUri: String?,
+    width: Int,
+    height: Int,
+    durationSec: Int,
+    albumId: Long?,
+    topicId: Long?,
+    contentHash: String?,
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    UPDATE media_items
+    SET takenAtEpochMs = :takenAtEpochMs,
+        syncMode = COALESCE(:syncMode, syncMode),
+        userCaption = COALESCE(:userCaption, userCaption),
+        shortHashHint = COALESCE(:shortHashHint, shortHashHint),
+        telegramFileUniqueId = COALESCE(:telegramFileUniqueId, telegramFileUniqueId),
+        metadataVersion = CASE WHEN :metadataVersion > metadataVersion THEN :metadataVersion ELSE metadataVersion END,
+        metadataParsedAtEpochMs = COALESCE(:metadataParsedAtEpochMs, metadataParsedAtEpochMs),
+        updatedAtEpochMs = :updatedAt
+    WHERE id = :id
+    """
+  )
+  suspend fun updateCachedMetadata(
+    id: Long,
+    takenAtEpochMs: Long,
+    syncMode: String?,
+    userCaption: String?,
+    shortHashHint: String? = null,
+    telegramFileUniqueId: String? = null,
+    metadataVersion: Int = 4,
+    metadataParsedAtEpochMs: Long? = System.currentTimeMillis(),
+    updatedAt: Long = System.currentTimeMillis(),
+  )
+
+  @Query(
+    """
+    SELECT MAX(telegramMessageId) FROM media_items
+    WHERE telegramChatId = :chatId
+      AND telegramMessageId IS NOT NULL
+      AND telegramMessageId > 0
+      AND (:albumId IS NULL OR albumId = :albumId OR (:threadId > 0 AND topicId = :threadId))
+    """
+  )
+  suspend fun getMaxTelegramMessageId(chatId: Long, albumId: Long?, threadId: Long): Long?
+
+  @Query(
+    """
+    SELECT MIN(telegramMessageId) FROM media_items
+    WHERE telegramChatId = :chatId
+      AND telegramMessageId IS NOT NULL
+      AND telegramMessageId > 0
+      AND (:albumId IS NULL OR albumId = :albumId OR (:threadId > 0 AND topicId = :threadId))
+    """
+  )
+  suspend fun getMinTelegramMessageId(chatId: Long, albumId: Long?, threadId: Long): Long?
 
   @Query(
     """
@@ -569,7 +735,7 @@ interface MediaDao {
   )
 
   @Query("UPDATE media_items SET contentHash = :contentHash WHERE id = :id")
-  suspend fun updateContentHash(id: Long, contentHash: String)
+  suspend fun updateContentHash(id: Long, contentHash: String?)
 
   @Query("UPDATE media_items SET localUri = :localUri, updatedAtEpochMs = :updatedAt WHERE id = :id")
   suspend fun updateLocalUri(

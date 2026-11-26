@@ -21,7 +21,12 @@ enum class UploadStatus(val labelVi: String) {
 @Entity(
   tableName = "media_items",
   indices = [
-    Index(value = ["contentHash"], unique = true),
+    Index(value = ["contentHash"]),
+    Index(value = ["localMediaStoreKey"]),
+    Index(value = ["telegramFileUniqueId"]),
+    Index(value = ["shortHashHint"]),
+    Index(value = ["localUri"]),
+    Index(value = ["telegramChatId", "telegramMessageId"], unique = true),
     Index(value = ["isTrashed", "takenAtEpochMs"]),
     Index(value = ["albumId", "isTrashed"]),
     Index(value = ["uploadStatus"]),
@@ -29,7 +34,7 @@ enum class UploadStatus(val labelVi: String) {
 )
 data class MediaEntity(
   @PrimaryKey(autoGenerate = true) val id: Long = 0L,
-  val contentHash: String,
+  val contentHash: String? = null,
   val localUri: String? = null,
   val fileName: String,
   val mimeType: String,
@@ -56,4 +61,11 @@ data class MediaEntity(
   val trashTopicMessageId: Long? = null,
   val lastError: String? = null,
   val updatedAtEpochMs: Long = System.currentTimeMillis(),
+  val syncMode: String? = null,
+  val userCaption: String? = null,
+  val localMediaStoreKey: String? = null,
+  val telegramFileUniqueId: String? = null,
+  val shortHashHint: String? = null,
+  val metadataVersion: Int = 0,
+  val metadataParsedAtEpochMs: Long? = null,
 )

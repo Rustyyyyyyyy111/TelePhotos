@@ -54,6 +54,8 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.laughing.telephotos.core.MediaStoreScanner
 import com.laughing.telephotos.data.local.MediaType
+import com.laughing.telephotos.data.repository.TopicSyncKey
+import com.laughing.telephotos.data.repository.TopicSyncUiState
 import com.laughing.telephotos.data.telegram.TelegramAuthState
 import com.laughing.telephotos.ui.screens.AlbumDetailScreen
 import com.laughing.telephotos.ui.screens.AlbumsScreen
@@ -148,6 +150,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
   val floodWaitRemainingSec by viewModel.floodWaitRemainingSec.collectAsStateWithLifecycle()
   val manualSyncProgress by viewModel.manualSyncProgress.collectAsStateWithLifecycle()
   val networkInterruptionAlert by viewModel.networkInterruptionAlert.collectAsStateWithLifecycle()
+  val topicSyncStates by viewModel.topicSyncStates.collectAsStateWithLifecycle()
   val hasPromptedMediaPermission by viewModel.hasPromptedMediaPermission.collectAsStateWithLifecycle()
   val cacheSizeBytes by viewModel.cacheSizeBytes.collectAsStateWithLifecycle()
   val pendingSystemUriRequest by viewModel.pendingSystemUriRequest.collectAsStateWithLifecycle()
@@ -299,7 +302,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 hasMediaPermission = hasPhotoPerm,
                 hasPromptedPermission = hasPromptedMediaPermission,
                 onPermissionPrompted = viewModel::markMediaPermissionPrompted,
-                onDevicePermissionGranted = viewModel::syncDevicePhotos,
+                onDevicePermissionGranted = viewModel::ensureSessionPhotosScanned,
                 onMediaClick = { media ->
                   navController.navigate(MediaViewerRoute(media.id, MediaCollectionScope.PHOTOS))
                 },
@@ -349,7 +352,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 hasMediaPermission = hasVideoPerm,
                 hasPromptedPermission = hasPromptedMediaPermission,
                 onPermissionPrompted = viewModel::markMediaPermissionPrompted,
-                onDevicePermissionGranted = viewModel::syncDeviceVideos,
+                onDevicePermissionGranted = viewModel::ensureSessionVideosScanned,
                 onMediaClick = { media ->
                   navController.navigate(MediaViewerRoute(media.id, MediaCollectionScope.VIDEOS))
                 },
@@ -376,12 +379,18 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 .collectAsStateWithLifecycle(initialValue = emptyList())
               val albumVideos by viewModel.observeAlbumVideos(route.albumId)
                 .collectAsStateWithLifecycle(initialValue = emptyList())
+              val topicKey = TopicSyncKey(
+                chatId = album?.chatId ?: lockedTarget?.chatId ?: 0L,
+                messageThreadId = album?.messageThreadId ?: 0L,
+              )
+              val topicSyncState = topicSyncStates[topicKey] ?: TopicSyncUiState()
               AlbumDetailScreen(
                 album = album,
                 photos = albumPhotos,
                 videos = albumVideos,
                 isLoggedIn = isLoggedIn,
                 isBusy = isBusy,
+                topicSyncState = topicSyncState,
                 onBack = { navController.popBackStack() },
                 onMediaClick = { media, isVideoTab ->
                   navController.navigate(
@@ -395,6 +404,7 @@ fun TelePhotosApp(viewModel: TelePhotosViewModel) {
                 onImportIntoAlbum = { uris -> viewModel.importSelectedMedia(uris, route.albumId) },
                 onMoveSelectedToTrash = viewModel::moveMediaIdsToTrash,
                 onRefreshAlbum = { viewModel.syncAlbumsFromTelegram(specificAlbumId = route.albumId, silent = false) },
+                onLoadOlderHistory = { viewModel.backfillOlderAlbumHistory(route.albumId) },
               )
             }
 

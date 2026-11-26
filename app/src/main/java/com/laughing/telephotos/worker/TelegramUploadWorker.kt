@@ -5,17 +5,25 @@ import android.net.Uri
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import androidx.room.withTransaction
 import com.laughing.telephotos.TelePhotosApplication
 import com.laughing.telephotos.core.MediaHashUtil
 import com.laughing.telephotos.core.NetworkOperationType
 import com.laughing.telephotos.core.NetworkRetryPolicy
 import com.laughing.telephotos.core.NetworkRetryTracker
 import com.laughing.telephotos.core.RetryDecision
+import com.laughing.telephotos.core.TelegramCaptionMetadata
+import com.laughing.telephotos.data.local.MediaDao
+import com.laughing.telephotos.data.local.MediaEntity
 import com.laughing.telephotos.data.local.MediaType
+import com.laughing.telephotos.data.local.SyncTargetEntity
+import com.laughing.telephotos.data.local.TelePhotosDatabase
 import com.laughing.telephotos.data.local.UploadStatus
+import com.laughing.telephotos.data.repository.VaultRepository
 import com.laughing.telephotos.data.telegram.FloodWaitException
 import com.laughing.telephotos.data.telegram.PendingUploadInterruptedException
 import com.laughing.telephotos.data.telegram.TelegramUploadMode
+import kotlinx.coroutines.CancellationException
 import kotlin.random.Random
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -199,11 +207,33 @@ class TelegramUploadWorker(
             KEY_TOTAL_COUNT to 1,
           )
         )
-        runCatching {
+        try {
           repo.syncActiveTabHistoryWhileConnected(
             target = syncTargetDao.getTarget() ?: initialTarget,
             filterMediaType = filterMediaType,
           )
+        } catch (flood: FloodWaitException) {
+          repo.handleFloodWait(flood)
+          val remainingMs = (flood.unlockAtEpochMs - System.currentTimeMillis()).coerceAtLeast(1_000L)
+          if (flood.retryAfterSeconds <= SHORT_FLOOD_WAIT_MAX_SEC) {
+            val unlocked = suspendForFloodWait(
+              unlockAtEpochMs = flood.unlockAtEpochMs,
+              currentFileName = "Tạm khoá hàng đợi",
+              completedCount = 0,
+              totalCount = 1,
+            )
+            if (!unlocked || isStopped) return Result.success()
+            tdLib.clearFloodWait()
+            requeueFloodWaitPaused(repo, mediaDao, filterMediaType, isSelectedBatch, selectedBatchIds)
+          } else {
+            hitFloodWaitRescheduled = true
+            repo.scheduleUploadAfterFloodWait(remainingMs, filterMediaType, isSelectedBatch, uploadMode)
+            return Result.success()
+          }
+        } catch (cancel: CancellationException) {
+          throw cancel
+        } catch (_: Throwable) {
+          // Best-effort pre-upload history sync
         }
       }
 
@@ -247,27 +277,23 @@ class TelegramUploadWorker(
         } ?: break
         val currentTarget = syncTargetDao.getTarget() ?: initialTarget
 
-        // 2-layer deduplication guard: skip if hash was already uploaded
-        val alreadyUploaded = mediaDao.findUploadedByHash(nextItem.contentHash)
-        if (alreadyUploaded != null && alreadyUploaded.id != nextItem.id) {
-          val dest = runCatching { repo.resolveUploadDestination(nextItem, currentTarget) }.getOrNull()
-          val resolvedAlbumId = nextItem.albumId ?: alreadyUploaded.albumId ?: dest?.albumId
-          val resolvedTopicId = alreadyUploaded.topicId ?: nextItem.topicId ?: dest?.topicId
-          if (alreadyUploaded.localUri == null && nextItem.localUri != null) {
-            mediaDao.updateLocalUri(alreadyUploaded.id, nextItem.localUri)
-            mediaDao.deleteByIds(listOf(nextItem.id))
-          } else {
-            mediaDao.markUploaded(
-              id = nextItem.id,
-              chatId = alreadyUploaded.telegramChatId ?: currentTarget.chatId,
-              messageId = alreadyUploaded.telegramMessageId ?: 0L,
-              fileId = alreadyUploaded.telegramFileId,
-              remoteFileId = alreadyUploaded.telegramRemoteFileId,
-              topicId = resolvedTopicId,
-              thumbFileId = alreadyUploaded.telegramThumbFileId,
-              albumId = resolvedAlbumId,
-            )
+        // 2-layer deduplication guard: skip if hash or fileUniqueId was already uploaded (transactional merge)
+        val existingHash = nextItem.contentHash
+          ?.takeIf { it.isNotBlank() && !it.startsWith("ms_") && !it.startsWith("tg_") }
+        val alreadyUploaded = existingHash?.let { mediaDao.findUploadedByHash(it) }
+          ?: nextItem.telegramFileUniqueId?.takeIf { it.isNotBlank() }?.let {
+            mediaDao.findUploadedByTelegramUniqueId(it)
           }
+        if (alreadyUploaded != null && alreadyUploaded.id != nextItem.id) {
+          mergeDuplicateUploadAndDeleteLocal(
+            db = db,
+            mediaDao = mediaDao,
+            repo = repo,
+            duplicateItem = nextItem,
+            alreadyUploaded = alreadyUploaded,
+            currentTarget = currentTarget,
+            resolvedContentHash = existingHash,
+          )
           retryTracker.reset()
           completed++
           continue
@@ -308,29 +334,20 @@ class TelegramUploadWorker(
           )
 
           var effectiveItem = nextItem
-          if (nextItem.contentHash.startsWith("ms_")) {
+          if (nextItem.contentHash.isNullOrBlank() || nextItem.contentHash.startsWith("ms_")) {
             val trueHash = runCatching { MediaHashUtil.computeFileSha256(stagingFile) }.getOrNull()
             if (!trueHash.isNullOrBlank()) {
               val uploadedDup = mediaDao.findUploadedByHash(trueHash)
               if (uploadedDup != null && uploadedDup.id != nextItem.id) {
-                val dest = runCatching { repo.resolveUploadDestination(nextItem, currentTarget) }.getOrNull()
-                val resolvedAlbumId = nextItem.albumId ?: uploadedDup.albumId ?: dest?.albumId
-                val resolvedTopicId = uploadedDup.topicId ?: nextItem.topicId ?: dest?.topicId
-                if (uploadedDup.localUri == null && nextItem.localUri != null) {
-                  mediaDao.updateLocalUri(uploadedDup.id, nextItem.localUri)
-                  mediaDao.deleteByIds(listOf(nextItem.id))
-                } else {
-                  mediaDao.markUploaded(
-                    id = nextItem.id,
-                    chatId = uploadedDup.telegramChatId ?: currentTarget.chatId,
-                    messageId = uploadedDup.telegramMessageId ?: 0L,
-                    fileId = uploadedDup.telegramFileId,
-                    remoteFileId = uploadedDup.telegramRemoteFileId,
-                    topicId = resolvedTopicId,
-                    thumbFileId = uploadedDup.telegramThumbFileId,
-                    albumId = resolvedAlbumId,
-                  )
-                }
+                mergeDuplicateUploadAndDeleteLocal(
+                  db = db,
+                  mediaDao = mediaDao,
+                  repo = repo,
+                  duplicateItem = nextItem,
+                  alreadyUploaded = uploadedDup,
+                  currentTarget = currentTarget,
+                  resolvedContentHash = trueHash,
+                )
                 completed++
                 itemHandled = true
                 setProgress(
@@ -341,9 +358,12 @@ class TelegramUploadWorker(
                   )
                 )
                 continue
-              } else if (mediaDao.findByHash(trueHash) == null) {
+              } else {
                 mediaDao.updateContentHash(nextItem.id, trueHash)
-                effectiveItem = nextItem.copy(contentHash = trueHash)
+                effectiveItem = nextItem.copy(
+                  contentHash = trueHash,
+                  shortHashHint = trueHash.take(16),
+                )
               }
             }
           }
@@ -365,7 +385,8 @@ class TelegramUploadWorker(
               val resolvedTopicId = dest.topicId
               val resolvedAlbumId = dest.albumId ?: effectiveItem.albumId
               val caption = repo.buildDocumentCaption(
-                effectiveItem.copy(topicId = resolvedTopicId, albumId = resolvedAlbumId)
+                media = effectiveItem.copy(topicId = resolvedTopicId, albumId = resolvedAlbumId),
+                uploadMode = uploadMode,
               )
 
               val sent = when (uploadMode) {
@@ -421,7 +442,15 @@ class TelegramUploadWorker(
                 topicId = finalTopicId,
                 thumbFileId = sent.thumbFileId,
                 albumId = resolvedAlbumId,
+                syncMode = uploadMode.name,
+                telegramFileUniqueId = sent.fileUniqueId,
+                shortHashHint = effectiveItem.contentHash
+                  ?.takeIf { it.isNotBlank() && !it.startsWith("ms_") && !it.startsWith("tg_") }
+                  ?.take(16),
+                metadataVersion = TelegramCaptionMetadata.CURRENT_METADATA_VERSION,
+                metadataParsedAtEpochMs = System.currentTimeMillis(),
               )
+              repo.bumpAlbumLatestMessageId(resolvedAlbumId, sent.messageId)
               repo.updateAlbumCoverIfMissing(resolvedAlbumId, effectiveItem.localUri)
               retryTracker.reset()
               completed++
@@ -580,6 +609,41 @@ class TelegramUploadWorker(
       delay(minOf(1_000L, remainingMs))
     }
     return false
+  }
+
+  private suspend fun mergeDuplicateUploadAndDeleteLocal(
+    db: com.laughing.telephotos.data.local.TelePhotosDatabase,
+    mediaDao: com.laughing.telephotos.data.local.MediaDao,
+    repo: com.laughing.telephotos.data.repository.VaultRepository,
+    duplicateItem: com.laughing.telephotos.data.local.MediaEntity,
+    alreadyUploaded: com.laughing.telephotos.data.local.MediaEntity,
+    currentTarget: com.laughing.telephotos.data.local.SyncTargetEntity,
+    resolvedContentHash: String?,
+  ) {
+    val dest = runCatching { repo.resolveUploadDestination(duplicateItem, currentTarget) }.getOrNull()
+    val resolvedAlbumId = alreadyUploaded.albumId ?: duplicateItem.albumId ?: dest?.albumId
+    val resolvedTopicId = alreadyUploaded.topicId ?: duplicateItem.topicId ?: dest?.topicId
+    val cleanHash = resolvedContentHash
+      ?.takeIf { it.isNotBlank() && !it.startsWith("ms_") && !it.startsWith("tg_") }
+    db.withTransaction {
+      if (alreadyUploaded.localUri?.contains("/picker") == true &&
+        duplicateItem.localUri != null &&
+        !duplicateItem.localUri.contains("/picker")
+      ) {
+        mediaDao.updateLocalUri(alreadyUploaded.id, duplicateItem.localUri)
+      }
+      mediaDao.mergeLocalDetailsIntoUploaded(
+        targetId = alreadyUploaded.id,
+        localUri = duplicateItem.localUri,
+        width = duplicateItem.width,
+        height = duplicateItem.height,
+        durationSec = duplicateItem.durationSec,
+        albumId = resolvedAlbumId,
+        topicId = resolvedTopicId,
+        contentHash = cleanHash,
+      )
+      mediaDao.deleteByIds(listOf(duplicateItem.id))
+    }
   }
 
   private suspend fun requeueFloodWaitPaused(
