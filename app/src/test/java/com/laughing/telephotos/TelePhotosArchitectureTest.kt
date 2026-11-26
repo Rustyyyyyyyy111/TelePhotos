@@ -359,12 +359,12 @@ class TelePhotosArchitectureTest {
       assertEquals(851L, afterRun1.pendingForwardCursor)
       assertEquals(1150L, afterRun1.pendingForwardHighWaterMark)
 
-      // Calling bumpAlbumLatestMessageId mid-bridge must NOT advance committed latestMessageId!
+      // Calling bumpAlbumLatestMessageId after a local upload must NOT advance scan-verified checkpoints!
       repo.bumpAlbumLatestMessageId(albumId, 1151L)
       val afterBump = albumDao.getAlbum(albumId)!!
       assertEquals(100L, afterBump.latestMessageId)
       assertEquals(851L, afterBump.pendingForwardCursor)
-      assertEquals(1151L, afterBump.pendingForwardHighWaterMark)
+      assertEquals(1150L, afterBump.pendingForwardHighWaterMark)
 
       // Simulate transient crash mid-run #2: pendingForwardCursor stays 851L
       val crashErr = runCatching {
@@ -431,7 +431,7 @@ class TelePhotosArchitectureTest {
       val finalAlbum = albumDao.getAlbum(albumId)!!
       assertEquals(0L, finalAlbum.pendingForwardCursor)
       assertEquals(0L, finalAlbum.pendingForwardHighWaterMark)
-      assertEquals(1151L, finalAlbum.latestMessageId)
+      assertEquals(1150L, finalAlbum.latestMessageId)
 
       // Every single message ID 100..1150 must exist exactly once (1,051 rows total)
       val storedIds = mediaDao.getAllMediaSnapshot().mapNotNull { it.telegramMessageId }.sorted()
@@ -814,5 +814,411 @@ class TelePhotosArchitectureTest {
     composeTestRule.onNodeWithTag("album_sync_retry_button").assertIsDisplayed().performClick()
     assertEquals(1, retryCount)
     composeTestRule.onNodeWithText("Đã tải hết lịch sử chủ đề này").assertIsDisplayed()
+  }
+
+  @Test
+  fun `stalled cursor mid-bridge preserves pending bridge marks retryable error and resumes cleanly`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    app.syncCoordinator.clearAllInMemoryStates()
+    val db = Room.inMemoryDatabaseBuilder(app, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val repo = createRepo(app, db)
+      val albumDao = db.albumDao()
+      val mediaDao = db.mediaDao()
+      val albumId = albumDao.upsert(
+        AlbumEntity(
+          title = "Bridge Stall",
+          chatId = -2001L,
+          messageThreadId = 11L,
+          latestMessageId = 100L,
+          oldestMessageId = 50L,
+          pendingForwardCursor = 351L,
+          pendingForwardHighWaterMark = 1150L,
+        )
+      )
+
+      // Run 1: Page 1 returns 350..321, Page 2 stalls on 321 without reaching 100
+      var pageCalls = 0
+      val stallErr = runCatching {
+        repo.syncAlbumIncrementalWithPageSource(
+          albumId = albumId,
+          chatId = -2001L,
+          threadId = 11L,
+          isTrashTopic = false,
+          maxPages = 5,
+          pageSize = 30,
+          pageDelayMs = 0L,
+        ) { fromId, _ ->
+          pageCalls++
+          when (pageCalls) {
+            1 -> (350L downTo 321L).map { id ->
+              HistoryRawMessage(id, isCreationMarker = false, media = fakeScannedMedia(-2001L, id, 11L))
+            }
+            else -> listOf(
+              HistoryRawMessage(321L, isCreationMarker = false, media = fakeScannedMedia(-2001L, 321L, 11L))
+            )
+          }
+        }
+      }.exceptionOrNull()
+
+      assertTrue(stallErr is IllegalStateException)
+      assertEquals(2, pageCalls) // Stopped cleanly on STALLED_CURSOR, no infinite loop
+
+      val afterStall = albumDao.getAlbum(albumId)!!
+      assertEquals(100L, afterStall.latestMessageId) // Never jumped across unscanned gap
+      assertEquals(321L, afterStall.pendingForwardCursor) // Saved progressed lower cursor
+      assertEquals(1150L, afterStall.pendingForwardHighWaterMark) // High-water preserved
+      assertFalse(afterStall.backfillExhausted)
+      assertEquals(AlbumSyncStatus.ERROR.name, afterStall.syncStatus)
+      assertEquals(30, mediaDao.getAllMediaSnapshot().size) // Pre-stall batch committed atomically
+
+      // Run 2: Immediate stall at 321 still keeps pendingForwardCursor=321 and high-water=1150
+      val immediateStallErr = runCatching {
+        repo.syncAlbumIncrementalWithPageSource(
+          albumId = albumId,
+          chatId = -2001L,
+          threadId = 11L,
+          isTrashTopic = false,
+          maxPages = 5,
+          pageSize = 30,
+          pageDelayMs = 0L,
+        ) { _, _ -> emptyList() }
+      }.exceptionOrNull()
+      assertTrue(immediateStallErr is IllegalStateException)
+      val afterImmediateStall = albumDao.getAlbum(albumId)!!
+      assertEquals(100L, afterImmediateStall.latestMessageId)
+      assertEquals(321L, afterImmediateStall.pendingForwardCursor)
+      assertEquals(1150L, afterImmediateStall.pendingForwardHighWaterMark)
+      assertTrue(repo.hasPendingForwardBridge(albumId))
+
+      // Run 3: Retry completes bridge 320..100 and clears error + bridge state
+      val resumedCursors = mutableListOf<Long>()
+      val addedOnRetry = repo.syncAlbumIncrementalWithPageSource(
+        albumId = albumId,
+        chatId = -2001L,
+        threadId = 11L,
+        isTrashTopic = false,
+        maxPages = 10,
+        pageSize = 30,
+        pageDelayMs = 0L,
+      ) { fromId, limit ->
+        resumedCursors.add(fromId)
+        val start = if (fromId == 0L) 320L else fromId - 1L
+        (start downTo 100L).take(limit).map { id ->
+          HistoryRawMessage(id, isCreationMarker = false, media = fakeScannedMedia(-2001L, id, 11L))
+        }
+      }
+      assertEquals(321L, resumedCursors.first())
+      assertEquals(220, addedOnRetry) // 320 down to 101
+
+      val recovered = albumDao.getAlbum(albumId)!!
+      assertEquals(1150L, recovered.latestMessageId)
+      assertEquals(0L, recovered.pendingForwardCursor)
+      assertEquals(0L, recovered.pendingForwardHighWaterMark)
+      assertEquals(AlbumSyncStatus.IDLE.name, recovered.syncStatus)
+      assertFalse(repo.hasPendingForwardBridge(albumId))
+    } finally {
+      app.syncCoordinator.clearAllInMemoryStates()
+      db.close()
+    }
+  }
+
+  @Test
+  fun `local upload during active bridge or normal state does not advance scan checkpoint over external messages`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    val db = Room.inMemoryDatabaseBuilder(app, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val repo = createRepo(app, db)
+      val albumDao = db.albumDao()
+      val mediaDao = db.mediaDao()
+      val albumId = albumDao.upsert(
+        AlbumEntity(
+          title = "Upload Isolation",
+          chatId = -2002L,
+          messageThreadId = 12L,
+          latestMessageId = 100L,
+          oldestMessageId = 50L,
+          pendingForwardCursor = 351L,
+          pendingForwardHighWaterMark = 1150L,
+        )
+      )
+
+      // Local upload finishes at messageId = 1152 while external message 1151 exists unseen on Telegram
+      val queuedId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = "local_upload_hash_1152",
+          localUri = "content://media/external/images/media/1152",
+          fileName = "UPLOAD_1152.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 4096L,
+          takenAtEpochMs = 200_000L,
+          albumId = albumId,
+          topicId = 12L,
+          uploadStatus = UploadStatus.QUEUED,
+        )
+      )
+      mediaDao.markUploaded(
+        id = queuedId,
+        chatId = -2002L,
+        messageId = 1152L,
+        fileId = 1152,
+        remoteFileId = "remote_1152",
+        topicId = 12L,
+        thumbFileId = null,
+        albumId = albumId,
+        syncMode = TelegramUploadMode.HD_MEDIA.name,
+        telegramFileUniqueId = "uniq_1152",
+        shortHashHint = "local_upload_has",
+        metadataVersion = TelegramCaptionMetadata.CURRENT_METADATA_VERSION,
+        metadataParsedAtEpochMs = System.currentTimeMillis(),
+      )
+      repo.bumpAlbumLatestMessageId(albumId, 1152L)
+
+      // Neither latestMessageId nor pendingForwardHighWaterMark may advance to 1152
+      val afterUpload = albumDao.getAlbum(albumId)!!
+      assertEquals(100L, afterUpload.latestMessageId)
+      assertEquals(1150L, afterUpload.pendingForwardHighWaterMark)
+      assertEquals(50L, afterUpload.oldestMessageId)
+
+      // Finish bridging 350..100 -> commits scan-verified 1150 (NOT 1152)
+      repo.syncAlbumIncrementalWithPageSource(
+        albumId = albumId,
+        chatId = -2002L,
+        threadId = 12L,
+        isTrashTopic = false,
+        maxPages = 10,
+        pageSize = 30,
+        pageDelayMs = 0L,
+      ) { fromId, limit ->
+        val start = if (fromId == 0L) 350L else fromId - 1L
+        (start downTo 100L).take(limit).map { id ->
+          HistoryRawMessage(id, isCreationMarker = false, media = fakeScannedMedia(-2002L, id, 12L))
+        }
+      }
+      assertEquals(1150L, albumDao.getAlbum(albumId)!!.latestMessageId)
+
+      // Next head scan starts at committedSince = 1150 and MUST ingest external message 1151!
+      val addedHead = repo.syncAlbumIncrementalWithPageSource(
+        albumId = albumId,
+        chatId = -2002L,
+        threadId = 12L,
+        isTrashTopic = false,
+        maxPages = 5,
+        pageSize = 30,
+        pageDelayMs = 0L,
+      ) { _, _ ->
+        listOf(
+          HistoryRawMessage(1152L, isCreationMarker = false, media = fakeScannedMedia(-2002L, 1152L, 12L)),
+          HistoryRawMessage(1151L, isCreationMarker = false, media = fakeScannedMedia(-2002L, 1151L, 12L)),
+          HistoryRawMessage(1150L, isCreationMarker = false, media = fakeScannedMedia(-2002L, 1150L, 12L)),
+        )
+      }
+      assertEquals(1, addedHead) // Only external 1151 added; 1152 matched idempotently
+      assertNotNull(mediaDao.findByChatAndMessageId(-2002L, 1151L))
+      assertEquals(1152L, albumDao.getAlbum(albumId)!!.latestMessageId)
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `backfill uses album oldestMessageId and ignores isolated lower DB message id`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    val db = Room.inMemoryDatabaseBuilder(app, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val repo = createRepo(app, db)
+      val albumDao = db.albumDao()
+      val mediaDao = db.mediaDao()
+      val albumId = albumDao.upsert(
+        AlbumEntity(
+          title = "Backfill Cursor",
+          chatId = -2003L,
+          messageThreadId = 13L,
+          latestMessageId = 1000L,
+          oldestMessageId = 500L,
+        )
+      )
+
+      // Isolated out-of-order row in media_items at messageId=10 must NOT hijack backfill cursor
+      mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = null,
+          fileName = "outlier_10.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 1024L,
+          takenAtEpochMs = 10_000L,
+          albumId = albumId,
+          topicId = 13L,
+          telegramChatId = -2003L,
+          telegramMessageId = 10L,
+          uploadStatus = UploadStatus.UPLOADED,
+        )
+      )
+
+      val requestedFromIds = mutableListOf<Long>()
+      val res = repo.backfillOlderAlbumHistoryWithPageSource(
+        albumId = albumId,
+        chatId = -2003L,
+        threadId = 13L,
+        maxPages = 2,
+        pageSize = 25,
+        pageDelayMs = 0L,
+      ) { fromId, limit ->
+        requestedFromIds.add(fromId)
+        val start = fromId - 1L
+        if (start < 450L) {
+          emptyList()
+        } else {
+          (start downTo maxOf(450L, start - limit + 1L)).map { id ->
+            HistoryRawMessage(id, isCreationMarker = false, media = fakeScannedMedia(-2003L, id, 13L))
+          }
+        }
+      }
+
+      assertEquals(500L, requestedFromIds.first())
+      assertEquals(50, res.addedCount)
+      assertNotNull(mediaDao.findByChatAndMessageId(-2003L, 499L))
+      assertNotNull(mediaDao.findByChatAndMessageId(-2003L, 450L))
+      assertEquals(450L, albumDao.getAlbum(albumId)!!.oldestMessageId)
+      assertEquals(1000L, albumDao.getAlbum(albumId)!!.latestMessageId)
+    } finally {
+      db.close()
+    }
+  }
+
+  @Test
+  fun `getUnboundLocalMedia excludes trashed local rows while preserving restore and upload merge`() = runTest {
+    val app = ApplicationProvider.getApplicationContext<TelePhotosApplication>()
+    val db = Room.inMemoryDatabaseBuilder(app, TelePhotosDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    try {
+      val repo = createRepo(app, db)
+      val albumDao = db.albumDao()
+      val mediaDao = db.mediaDao()
+      val albumId = albumDao.upsert(
+        AlbumEntity(
+          title = "Trash Guard",
+          chatId = -2004L,
+          messageThreadId = 14L,
+        )
+      )
+
+      val trashedHash = "aaaa1111bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444"
+      val activeHash = "bbbb1111cccc2222dddd3333eeee4444bbbb1111cccc2222dddd3333eeee4444"
+
+      val trashedLocalId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = trashedHash,
+          shortHashHint = trashedHash.take(16),
+          localUri = "content://media/external/images/media/9001",
+          fileName = "TRASHED_9001.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 3000L,
+          takenAtEpochMs = 50_000L,
+          previousAlbumId = albumId,
+          previousTopicId = 14L,
+          uploadStatus = UploadStatus.LOCAL_ONLY,
+          isTrashed = true,
+          trashedAtEpochMs = 60_000L,
+        )
+      )
+      val activeLocalId = mediaDao.insertIgnore(
+        MediaEntity(
+          contentHash = activeHash,
+          shortHashHint = activeHash.take(16),
+          localUri = "content://media/external/images/media/9002",
+          fileName = "ACTIVE_9002.jpg",
+          mimeType = "image/jpeg",
+          mediaType = MediaType.PHOTO,
+          sizeBytes = 3200L,
+          takenAtEpochMs = 55_000L,
+          uploadStatus = UploadStatus.QUEUED,
+          isTrashed = false,
+        )
+      )
+
+      val unbound = mediaDao.getUnboundLocalMedia()
+      assertEquals(listOf(activeLocalId), unbound.map { it.id })
+
+      repo.syncAlbumIncrementalWithPageSource(
+        albumId = albumId,
+        chatId = -2004L,
+        threadId = 14L,
+        isTrashTopic = false,
+        pageDelayMs = 0L,
+      ) { _, _ ->
+        listOf(
+          HistoryRawMessage(
+            messageId = 302L,
+            isCreationMarker = false,
+            media = fakeScannedMedia(
+              chatId = -2004L,
+              messageId = 302L,
+              topicId = 14L,
+              shortHashHint = activeHash.take(16),
+              fullContentHash = activeHash,
+            ).copy(fileName = "ACTIVE_9002.jpg", sizeBytes = 3200L),
+          ),
+          HistoryRawMessage(
+            messageId = 301L,
+            isCreationMarker = false,
+            media = fakeScannedMedia(
+              chatId = -2004L,
+              messageId = 301L,
+              topicId = 14L,
+              shortHashHint = trashedHash.take(16),
+              fullContentHash = trashedHash,
+            ).copy(fileName = "TRASHED_9001.jpg", sizeBytes = 3000L),
+          ),
+        )
+      }
+
+      // Trashed row stays trashed & unbound; scanned 301 was inserted separately
+      val stillTrashed = mediaDao.getById(trashedLocalId)!!
+      assertTrue(stillTrashed.isTrashed)
+      assertNull(stillTrashed.telegramMessageId)
+      val scanned301 = mediaDao.findByChatAndMessageId(-2004L, 301L)!!
+      assertFalse(scanned301.id == trashedLocalId)
+      assertFalse(scanned301.isTrashed)
+
+      // Active unbound local row bound to 302
+      val boundActive = mediaDao.getById(activeLocalId)!!
+      assertEquals(302L, boundActive.telegramMessageId)
+      assertEquals(UploadStatus.UPLOADED, boundActive.uploadStatus)
+
+      // Restore from trash and duplicate-upload merge still work as expected
+      mediaDao.restoreFromTrash(trashedLocalId, System.currentTimeMillis())
+      val restored = mediaDao.getById(trashedLocalId)!!
+      assertFalse(restored.isTrashed)
+      assertEquals(albumId, restored.albumId)
+
+      db.withTransaction {
+        mediaDao.mergeLocalDetailsIntoUploaded(
+          targetId = scanned301.id,
+          localUri = restored.localUri,
+          width = 1280,
+          height = 960,
+          durationSec = 0,
+          albumId = albumId,
+          topicId = 14L,
+          contentHash = trashedHash,
+        )
+        mediaDao.deleteByIds(listOf(trashedLocalId))
+      }
+      assertNull(mediaDao.getById(trashedLocalId))
+      assertEquals("content://media/external/images/media/9001", mediaDao.getById(scanned301.id)?.localUri)
+    } finally {
+      db.close()
+    }
   }
 }

@@ -204,6 +204,7 @@ interface MediaDao {
     """
     SELECT * FROM media_items
     WHERE telegramMessageId IS NULL
+      AND isTrashed = 0
     """
   )
   suspend fun getUnboundLocalMedia(): List<MediaEntity>

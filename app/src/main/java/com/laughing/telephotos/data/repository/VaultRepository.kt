@@ -1266,11 +1266,7 @@ class VaultRepository(
         )
       }
 
-      val dbMinMsgId = mediaDao.getMinTelegramMessageId(chatId, album.id, threadId ?: 0L) ?: 0L
-      val beforeMessageId = listOfNotNull(
-        album.oldestMessageId.takeIf { it > 0L },
-        dbMinMsgId.takeIf { it > 0L },
-      ).minOrNull() ?: 0L
+      val beforeMessageId = album.oldestMessageId.takeIf { it > 0L } ?: 0L
 
       val page = HistoryPaginationEngine.fetchOlderBackfill(
         beforeMessageId = beforeMessageId,
@@ -1291,16 +1287,14 @@ class VaultRepository(
       val txResult = runInTransaction {
         val latestAlbum = albumDao.getAlbum(albumId) ?: album
         val ingestResult = ingestScannedItems(page.items, latestAlbum.id, latestAlbum.isTrashTopic)
-        val refreshedDbMin = mediaDao.getMinTelegramMessageId(chatId, latestAlbum.id, threadId ?: 0L) ?: 0L
         val newOldest = listOfNotNull(
           beforeMessageId.takeIf { it > 0L },
           page.lowestMessageId.takeIf { it > 0L },
-          refreshedDbMin.takeIf { it > 0L },
         ).minOrNull() ?: 0L
-        val newLatest = if (latestAlbum.pendingForwardCursor > 0L) {
+        val newLatest = if (latestAlbum.pendingForwardCursor > 0L || latestAlbum.latestMessageId > 0L) {
           latestAlbum.latestMessageId
         } else {
-          maxOf(latestAlbum.latestMessageId, page.highestMessageId)
+          page.highestMessageId
         }
         val nowMs = System.currentTimeMillis()
         albumDao.updateSyncCheckpoints(
@@ -1431,17 +1425,12 @@ class VaultRepository(
       },
     ) {
       val album = albumId?.let { albumDao.getAlbum(it) }
-      val dbMaxMsgId = mediaDao.getMaxTelegramMessageId(chatId, albumId, threadId ?: 0L) ?: 0L
       val activePendingCursor = album?.pendingForwardCursor ?: 0L
       val activePendingHighWater = album?.pendingForwardHighWaterMark ?: 0L
 
-      // CRITICAL: While a forward bridge is active, never raise sinceMessageId to dbMaxMsgId
-      // (the head batch is already in DB, while the gap down to committed latestMessageId is still open).
-      val committedSince = if (activePendingCursor > 0L) {
-        album?.latestMessageId ?: 0L
-      } else {
-        maxOf(album?.latestMessageId ?: 0L, dbMaxMsgId)
-      }
+      // Strictly use the scan-verified checkpoint from albums.latestMessageId so local uploads
+      // in media_items never advance the scan boundary past unseen external Telegram messages.
+      val committedSince = album?.latestMessageId ?: 0L
 
       val page = HistoryPaginationEngine.fetchIncrementalForward(
         sinceMessageId = committedSince,
@@ -1457,8 +1446,6 @@ class VaultRepository(
         val ingestResult = ingestScannedItems(page.items, albumId, isTrashTopic)
 
         if (albumId != null) {
-          val refreshedDbMin = mediaDao.getMinTelegramMessageId(chatId, albumId, threadId ?: 0L) ?: 0L
-          val refreshedDbMax = mediaDao.getMaxTelegramMessageId(chatId, albumId, threadId ?: 0L) ?: 0L
           val currentLatest = latestAlbum?.latestMessageId ?: committedSince
           val currentPendingHighWater = maxOf(
             latestAlbum?.pendingForwardHighWaterMark ?: activePendingHighWater,
@@ -1467,7 +1454,6 @@ class VaultRepository(
           val updatedOldest = listOfNotNull(
             latestAlbum?.oldestMessageId?.takeIf { it > 0L },
             page.lowestMessageId.takeIf { it > 0L },
-            refreshedDbMin.takeIf { it > 0L },
           ).minOrNull() ?: 0L
 
           val updatedLatest: Long
@@ -1478,7 +1464,7 @@ class VaultRepository(
           when {
             page.hitKnownCheckpoint || page.reachedHistoryEnd -> {
               // Contiguous bridge down to previous committed checkpoint (or topic creation)!
-              updatedLatest = maxOf(currentLatest, currentPendingHighWater, refreshedDbMax)
+              updatedLatest = maxOf(currentLatest, currentPendingHighWater)
               nextPendingCursor = 0L
               nextPendingHighWater = 0L
               if (page.reachedHistoryEnd) {
@@ -1486,29 +1472,23 @@ class VaultRepository(
               }
             }
             committedSince == 0L -> {
-              // Initial scan on empty topic: commit top water mark; older messages (< oldest) load via backfill.
-              updatedLatest = maxOf(currentPendingHighWater, refreshedDbMax)
-              nextPendingCursor = 0L
-              nextPendingHighWater = 0L
-            }
-            page.endSignal == HistoryEndSignal.NONE && page.lowestMessageId > 0L -> {
-              // Bounded maxPages hit before bridging back to committedSince: save continuation cursor
-              // and leave committed latestMessageId UNCHANGED to prevent gap starvation or infinite loops.
-              updatedLatest = currentLatest
-              nextPendingCursor = page.lowestMessageId
-              nextPendingHighWater = currentPendingHighWater
-            }
-            page.endSignal == HistoryEndSignal.STALLED_CURSOR && currentPendingHighWater > 0L -> {
-              // Previous checkpoint message no longer exists on Telegram; bridge cleanly to top.
-              updatedLatest = maxOf(currentLatest, currentPendingHighWater)
+              // Initial scan on empty topic: commit scan-verified top water mark; older messages load via backfill.
+              updatedLatest = currentPendingHighWater
               nextPendingCursor = 0L
               nextPendingHighWater = 0L
             }
             else -> {
-              // Unexpected short/empty response mid-bridge: preserve continuation state for next retry.
+              // Unbridged gap (bounded maxPages hit, STALLED_CURSOR, or UNCERTAIN_EMPTY_OR_SHORT):
+              // NEVER commit latestMessageId across an unverified gap and NEVER discard the bridge.
+              val resumeCursor = when {
+                page.lowestMessageId > 0L && (activePendingCursor <= 0L || page.lowestMessageId < activePendingCursor) ->
+                  page.lowestMessageId
+                activePendingCursor > 0L -> activePendingCursor
+                else -> 0L
+              }
               updatedLatest = currentLatest
-              nextPendingCursor = activePendingCursor
-              nextPendingHighWater = if (activePendingCursor > 0L) currentPendingHighWater else 0L
+              nextPendingCursor = resumeCursor
+              nextPendingHighWater = if (resumeCursor > 0L) currentPendingHighWater else 0L
             }
           }
 
@@ -1527,39 +1507,33 @@ class VaultRepository(
       }
 
       fetchQuickThumbnailsAfterCommit(albumId, txResult.pendingThumbs)
+      if (committedSince > 0L &&
+        !page.hitKnownCheckpoint &&
+        !page.reachedHistoryEnd &&
+        (page.endSignal == HistoryEndSignal.STALLED_CURSOR || page.endSignal == HistoryEndSignal.UNCERTAIN_EMPTY_OR_SHORT)
+      ) {
+        throw IllegalStateException("TDLib tạm dừng phân trang khi đồng bộ lịch sử mới — vui lòng thử lại")
+      }
       txResult.addedCount
     }
   }
 
-  suspend fun bumpAlbumLatestMessageId(albumId: Long?, messageId: Long) {
-    if (albumId == null || messageId <= 0L) return
-    runInTransaction {
-      val album = albumDao.getAlbum(albumId) ?: return@runInTransaction
-      val updatedOldest = if (album.oldestMessageId == 0L) {
-        messageId
-      } else {
-        minOf(album.oldestMessageId, messageId)
-      }
-      if (album.pendingForwardCursor > 0L) {
-        // Active unbridged forward gap exists: advance pending high-water mark, never committed latestMessageId.
-        albumDao.updateSyncCheckpoints(
-          albumId = albumId,
-          latestMessageId = album.latestMessageId,
-          oldestMessageId = updatedOldest,
-          backfillExhausted = album.backfillExhausted,
-          lastSyncedAtEpochMs = System.currentTimeMillis(),
-          pendingForwardHighWaterMark = maxOf(album.pendingForwardHighWaterMark, messageId),
-        )
-      } else {
-        albumDao.updateSyncCheckpoints(
-          albumId = albumId,
-          latestMessageId = maxOf(album.latestMessageId, messageId),
-          oldestMessageId = updatedOldest,
-          backfillExhausted = album.backfillExhausted,
-          lastSyncedAtEpochMs = System.currentTimeMillis(),
-        )
-      }
+  suspend fun hasPendingForwardBridge(albumId: Long?): Boolean {
+    return if (albumId != null) {
+      (albumDao.getAlbum(albumId)?.pendingForwardCursor ?: 0L) > 0L
+    } else {
+      albumDao.getAllAlbums().any { !it.isTrashTopic && it.pendingForwardCursor > 0L }
     }
+  }
+
+  /**
+   * Preserved as a compatibility hook for upload workers, but intentionally does NOT mutate
+   * scan-verified checkpoints (`latestMessageId`, `oldestMessageId`, `pendingForwardHighWaterMark`).
+   * Local uploads must never advance forward/backfill cursors across unscanned external messages;
+   * subsequent history scans reconcile `(telegramChatId, telegramMessageId)` idempotently.
+   */
+  suspend fun bumpAlbumLatestMessageId(albumId: Long?, messageId: Long) {
+    // Intentionally a no-op: local uploads are recorded via mediaDao.markUploaded only.
   }
 
   private data class IngestResult(

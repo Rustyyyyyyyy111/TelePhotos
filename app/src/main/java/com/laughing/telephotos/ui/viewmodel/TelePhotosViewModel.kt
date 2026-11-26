@@ -777,10 +777,18 @@ class TelePhotosViewModel(application: Application) : AndroidViewModel(applicati
       withContext(Dispatchers.IO) { repo.syncAlbumsFromTelegram(specificAlbumId) }
         .onSuccess { count ->
           if (!silent) {
-            _statusBanner.value = if (count > 0) {
-              "Đã cập nhật $count mục từ Telegram vào Album"
-            } else {
-              "Album đã đồng bộ mới nhất với Telegram"
+            val bridgePending = withContext(Dispatchers.IO) {
+              repo.hasPendingForwardBridge(specificAlbumId)
+            }
+            _statusBanner.value = when {
+              bridgePending && count > 0 ->
+                "Đã tải $count mục mới — vẫn còn tin nhắn chưa đồng bộ, nhấn Làm mới để tiếp tục"
+              bridgePending ->
+                "Vẫn còn tin nhắn mới chưa đồng bộ hết — nhấn Làm mới để tiếp tục"
+              count > 0 ->
+                "Đã cập nhật $count mục từ Telegram vào Album"
+              else ->
+                "Album đã đồng bộ mới nhất với Telegram"
             }
           }
         }
